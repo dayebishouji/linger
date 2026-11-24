@@ -22,6 +22,7 @@ import {
   teamHubIdentityQueryOptions,
 } from "./room-queries";
 import { RoomSettingsDialog } from "./room-settings-dialog";
+import { RoomMarkdownExport } from "./room-markdown-export";
 import { RoomAvatar } from "./members/room-avatar";
 import { RoomMembersSection } from "./members/room-members-section";
 import { RoomDeleteDialog } from "./room-delete-dialog";
@@ -160,6 +161,11 @@ function RoomSettingsContent({
                 {t(m.shareConversation)}
               </Button>
             ) : null}
+            <RoomMarkdownExport
+              key={room.id}
+              roomId={room.id}
+              tenantId={room.tenant_id}
+            />
             {room.participation === "left" ? (
               <RoomRejoinBanner room={room} />
             ) : (

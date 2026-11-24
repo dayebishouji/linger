@@ -23,6 +23,8 @@ build:assets` to check the initial JS budget.
 - `src/app`: routes, providers, route error boundaries, and global CSS.
 - `src/features/teamhub`: Human API, Session, error, and realtime adapters.
 - `src/features/rooms`: Room routes, Chat, Timeline, the right sidebar (Agent Info, Activity, Thread, Document) and membership UI.
+  The Room settings Markdown export reads the latest message page on demand
+  and downloads the author, timestamp, and original body in page order.
 - `src/features/web-search`: web search backend queries, bundled provider
   logos and the key field. The chat's search key card reads the backend list
   with `include_quota=false`, so it never makes TeamHub call a provider; the

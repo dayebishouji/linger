@@ -11,6 +11,9 @@ export const roomSettingsMessages = defineMessages("roomSettings", {
   members: "Members",
   loadingMembers: "Loading members...",
   shareConversation: "Share conversation",
+  exportRecentMessages: "Export recent messages (.md)",
+  exportRecentMessagesFailed: "Could not export recent messages.",
+  exportRecentMessagesEmpty: "There are no recent messages to export.",
   leaveRoom: "Leave Room",
   leaveDescription:
     "You will stop receiving messages from this room and cannot send messages until you rejoin. Your role, existing access and message history stay the same. You can rejoin at any time.",
