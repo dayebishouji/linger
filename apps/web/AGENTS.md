@@ -24,7 +24,9 @@ build:assets` to check the initial JS budget.
 - `src/features/teamhub`: Human API, Session, error, and realtime adapters.
 - `src/features/rooms`: Room routes, Chat, Timeline, the right sidebar (Agent Info, Activity, Thread, Document) and membership UI.
   The Room settings Markdown export reads the latest message page on demand
-  and downloads the author, timestamp, and original body in page order.
+  and downloads the author, timestamp, and original body in page order. Each
+  body is fenced so its Markdown cannot absorb the next message. The filename
+  includes the Room name when usable, followed by the Room ID.
 - `src/features/web-search`: web search backend queries, bundled provider
   logos and the key field. The chat's search key card reads the backend list
   with `include_quota=false`, so it never makes TeamHub call a provider; the

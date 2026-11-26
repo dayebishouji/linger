@@ -164,6 +164,7 @@ function RoomSettingsContent({
             <RoomMarkdownExport
               key={room.id}
               roomId={room.id}
+              roomName={room.name}
               tenantId={room.tenant_id}
             />
             {room.participation === "left" ? (

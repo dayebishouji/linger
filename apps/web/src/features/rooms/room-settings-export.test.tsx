@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import ReactMarkdown from "react-markdown";
 import { describe, expect, it, vi } from "vitest";
 
 import { TeamHubRuntimeProvider } from "@/features/teamhub/teamhub-runtime";
@@ -13,8 +20,9 @@ const tenantId = "tenant-northstar";
 const roomId = "room-all";
 const messagesPath = "/v0/rooms/{roomId}/messages";
 
-function renderSettings() {
+function renderSettings(roomName = "all") {
   const runtime = createTestTeamHubRuntime();
+  runtime.seed.rooms.find((room) => room.id === roomId)!.name = roomName;
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -53,18 +61,21 @@ function message(
 }
 
 describe("Room Markdown export", () => {
-  it("downloads just the latest page with authors, timestamps and Markdown bodies", async () => {
-    const server = renderSettings();
+  it.each([
+    [
+      "  Planning / R&D: \u9879\u76ee?  ",
+      "Planning-R&D-\u9879\u76ee-room-all.md",
+    ],
+    [" / : ? . ", "room-all.md"],
+  ])("exports only the latest page for Room %j", async (roomName, filename) => {
+    const server = renderSettings(roomName);
+    const firstBody =
+      "**First**\r\n\r\n## Inside the message\n\n```ts\ncut off\n~~~~~  \n";
     server.on("GET", messagesPath, ({ query }) => {
       expect([...query]).toEqual([["limit", "50"]]);
       return {
         items: [
-          message(
-            "first",
-            "A_[Team]",
-            "2026-11-24T06:30:00Z",
-            "**First**\n\n- One",
-          ),
+          message("first", "A_[Team]", "2026-11-24T06:30:00Z", firstBody),
           message("second", "B", "2026-11-24T06:31:00Z", "Second"),
         ],
         page: { has_more: true, next_cursor: "first" },
@@ -89,13 +100,22 @@ describe("Room Markdown export", () => {
 
     await waitFor(() => expect(click).toHaveBeenCalledOnce());
     const link = click.mock.contexts[0] as HTMLAnchorElement;
-    expect(link.download).toBe("room-all.md");
+    expect(link.download).toBe(filename);
     const blob = createUrl.mock.calls[0]![0] as Blob;
     expect(blob.type).toBe("text/markdown;charset=utf-8");
-    expect(await blob.text()).toBe(
-      "## A\\_\\[Team\\] · 2026-11-24T06:30:00Z\n\n**First**\n\n- One\n\n" +
-        "## B · 2026-11-24T06:31:00Z\n\nSecond\n",
+    const markdown = await blob.text();
+    expect(markdown).toBe(
+      `## A\\_\\[Team\\] · 2026-11-24T06:30:00Z\n\n~~~~~~\n${firstBody}~~~~~~\n\n` +
+        "## B · 2026-11-24T06:31:00Z\n\n~~~\nSecond\n~~~\n",
     );
+    const preview = render(<ReactMarkdown>{markdown}</ReactMarkdown>);
+    const headings = within(preview.container).getAllByRole("heading", {
+      level: 2,
+    });
+    expect(headings.map((heading) => heading.textContent)).toEqual([
+      "A_[Team] · 2026-11-24T06:30:00Z",
+      "B · 2026-11-24T06:31:00Z",
+    ]);
     expect(server.requestsTo("GET", messagesPath)).toHaveLength(1);
     await waitFor(() =>
       expect(revoke).toHaveBeenCalledWith("blob:room-export"),
