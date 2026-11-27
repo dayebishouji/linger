@@ -1,8 +1,5 @@
-import type {
-  RunKind,
-  CapacityPriority,
-  RunPriority,
-} from "../../model-tasks.js";
+import type { RunKind, RunPriority } from "../../model-tasks.js";
+import { redactSensitiveText } from "../../sensitive-text.js";
 import type { RuntimeHistoryOptions, RuntimeHistoryPage } from "./history.js";
 
 export interface McpServerResource {
@@ -139,15 +136,28 @@ export type RuntimeStopHookDecision =
   | { readonly action: "allow" }
   | { readonly action: "block"; readonly reason: string };
 
+export interface PreviousRuntimeSession {
+  readonly providerType: "codex" | "claude" | "pi" | "antigravity";
+  readonly sessionId: string;
+}
+
 export interface ExecutionSpec {
   /** Process-local monotonic acceptance time; never persisted or sent over the wire. */
   acceptedAtMonotonicMs?: number;
+  /** Superseded native session whose local transcript a fresh start may export to ./playground/.previous-context.md. */
+  previousSession?: PreviousRuntimeSession;
   /** What queued the Run, for model scheduling; never sent over the wire. */
   runKind?: RunKind;
   /** The Run's live queue priority; absent, its kind's. */
   priority?: RunPriority;
   /** Revalidate the live claim after readmission and before resuming its native session. */
   beforeYieldResume?: () => Promise<void>;
+  /**
+   * Gives back the place of a Run that has not been sent to its Runtime:
+   * aborting it stops the waits before the start, and the start rejects with
+   * its reason. It has no effect once the start is sent.
+   */
+  preemptSignal?: AbortSignal;
   /** Evaluated before a Runtime finishes a turn when stop interception is active. */
   onStopHook?: (
     event: RuntimeStopHookEvent,
@@ -196,7 +206,7 @@ export interface ModelRespondedEvent {
   agent?: { id: string; parentCallId?: string };
 }
 
-export type RunActivityStatus = "working" | "thinking";
+export type RunActivityStatus = "working" | "thinking" | "waiting_background";
 export type RunActivityKind =
   | "command"
   | "tool"
@@ -371,11 +381,8 @@ export interface ProviderSessionOptions extends SessionSpec {
 }
 
 export interface AgentProvider {
-  /** Reserve execution capacity before claiming a durable Run. Always release. */
-  acquireRunCapacity?(
-    signal: AbortSignal,
-    priority?: CapacityPriority,
-  ): Promise<() => void>;
+  /** Reserve the execution Context before claiming a durable Run. Always release. */
+  acquireRunCapacity?(signal: AbortSignal): Promise<() => void>;
 
   createSession(options: ProviderSessionOptions): Promise<RuntimeSession>;
 
@@ -464,7 +471,7 @@ export interface ProviderSteerAck {
   turnId: string;
 }
 
-/** Public diagnostic metadata only; native error text never belongs here. */
+/** Public classified failure and optional redacted single-line detail for Activity. */
 export interface RuntimeExecutionFailure {
   code:
     | "session_not_found"
@@ -475,6 +482,7 @@ export interface RuntimeExecutionFailure {
     | "model_unavailable"
     | "model_not_offered"
     | "local_model_unavailable"
+    | "model_gateway_unavailable"
     | "context_too_long"
     | "model_service_error"
     | "timeout"
@@ -490,9 +498,96 @@ export interface RuntimeExecutionFailure {
   /** Absent when the failure was observed without a selected Runtime. */
   runtime_type?: "codex" | "claude" | "pi" | "antigravity";
   runtime_version?: string;
+  /** Redacted, single-line diagnostic summary (at most 500 code points). */
+  detail?: string;
 }
 
-/** Logging-only metadata; never include this object in public failure state. */
+const MAX_RUNTIME_FAILURE_DETAIL_CHARS = 500;
+
+/**
+ * Normalizes a Daemon-supplied failure detail to one printable line within
+ * TeamHub's code-point limit without re-running credential redaction.
+ */
+export function sanitizeRuntimeFailureDetail(
+  detail: string,
+): string | undefined {
+  const normalized = normalizeFailureDetail(detail);
+  if (!normalized) return undefined;
+  return capFailureDetail(normalized);
+}
+
+/**
+ * Redacts credentials and OS home prefixes from a typed Agent Service failure
+ * message, normalizes it to one printable line, and bounds it to TeamHub's
+ * detail limit.
+ */
+export function formatRuntimeFailureDetail(
+  message: string,
+): string | undefined {
+  const redacted = redactSensitiveText(message)
+    .replace(/\/(?:Users|home)\/[^/\s'"<>)}\]]+\//gu, "~/")
+    .replace(/[A-Za-z]:\\Users\\[^\\\s'"<>)}\]]+\\/gu, "~\\");
+  return sanitizeRuntimeFailureDetail(redacted);
+}
+
+/**
+ * Formats structured failure diagnostics for older Daemons that do not send
+ * `failure.detail`.
+ */
+export function formatRuntimeFailureDiagnostics(
+  diagnostics?: RuntimeFailureDiagnostics,
+): string | undefined {
+  if (!diagnostics) return undefined;
+  const parts: string[] = [];
+  if (diagnostics.statusCode !== undefined) {
+    parts.push(`HTTP ${diagnostics.statusCode}`);
+  }
+  if (diagnostics.code) {
+    parts.push(diagnostics.code);
+  }
+  if (diagnostics.signal) {
+    parts.push(`signal ${diagnostics.signal}`);
+  }
+  if (diagnostics.exitCode !== undefined && diagnostics.exitCode !== 0) {
+    parts.push(`exit code ${diagnostics.exitCode}`);
+  }
+  if (parts.length === 0) return undefined;
+  return sanitizeRuntimeFailureDetail(parts.join(", "));
+}
+
+const capFailureDetail = (detail: string): string => {
+  const codePoints = [...detail];
+  if (codePoints.length <= MAX_RUNTIME_FAILURE_DETAIL_CHARS) return detail;
+  return `${codePoints
+    .slice(0, MAX_RUNTIME_FAILURE_DETAIL_CHARS - 3)
+    .join("")
+    .trimEnd()}...`;
+};
+
+const normalizeFailureDetail = (input: string): string => {
+  let out = "";
+  let spacePending = false;
+  for (const ch of input) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (ch === "\r" || ch === "\n" || ch === "\t" || /\s/u.test(ch)) {
+      if (out.length > 0) spacePending = true;
+      continue;
+    }
+    if (code < 0x20 || code === 0x7f) continue;
+    if (spacePending) {
+      out += " ";
+      spacePending = false;
+    }
+    out += ch;
+  }
+  return out;
+};
+
+/**
+ * Structured failure metadata logged on failure and summarized into public
+ * `failure.detail` when a Daemon omits `detail`; never include this raw object
+ * in public failure state.
+ */
 export interface RuntimeFailureDiagnostics {
   code?: string;
   statusCode?: number;

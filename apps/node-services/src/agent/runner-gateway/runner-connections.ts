@@ -25,11 +25,16 @@ import {
   LocalRuntimeAdmissionUnavailableError,
   MINIMUM_CURRENT_COMPUTER_VERSION,
   FIRST_MODEL_INVOKE_CANCEL_COMPUTER_VERSION,
+  FIRST_MODEL_INVOKE_MODEL_COMPUTER_VERSION,
   FIRST_PI_MODEL_INVOKE_COMPUTER_VERSION,
+  FIRST_ANTIGRAVITY_MODEL_INVOKE_COMPUTER_VERSION,
   FIRST_BYOK_ENDPOINT_COMPUTER_VERSION,
   FIRST_LOCAL_MODELS_DIAGNOSTICS_COMPUTER_VERSION,
   FIRST_MODEL_INVOKE_OUTCOMES_COMPUTER_VERSION,
   FIRST_LOCAL_MODELS_ENGINE_COMPUTER_VERSION,
+  FIRST_LOCAL_MODELS_CONCURRENCY_PROBE_COMPUTER_VERSION,
+  FIRST_PI_SESSION_COMPACTION_COMPUTER_VERSION,
+  FIRST_ANTIGRAVITY_SESSION_COMPACTION_COMPUTER_VERSION,
   FIRST_SERVICE_FEATURES_COMPUTER_VERSION,
   resolveSupportedReasoningEffort,
   type LocalPlacementRequirement,
@@ -95,6 +100,7 @@ export class RunnerConnections {
       | "localModels"
       | "operations"
       | "preparation"
+      | "queue"
     >,
   ) {
     this.#open = context.options.openConnectionsLater !== true;
@@ -487,9 +493,22 @@ export class RunnerConnections {
               )
                 ? (["local_models_engine"] as const)
                 : []),
-              // A Computer ignores a feature it does not know, so this one
-              // needs no release gate.
+              ...(isComputerVersionAtLeast(
+                connection.hello.daemon_version,
+                FIRST_LOCAL_MODELS_CONCURRENCY_PROBE_COMPUTER_VERSION,
+              )
+                ? (["local_models_concurrency_probe"] as const)
+                : []),
+              // A Computer ignores a feature it does not know, so these
+              // need no release gate.
               "local_model_unavailable",
+              "model_gateway_unavailable",
+              "local_models_external_holders",
+              "runtime_failure_detail",
+              "operation_background_wait",
+              "dynamic_reasoning_efforts",
+              "antigravity_history",
+              "antigravity_usage_provider",
             ],
           }
         : {}),
@@ -615,21 +634,35 @@ export class RunnerConnections {
       }
       await this.context.computerRegistry?.touch(connection.runnerId, {
         status: "online",
-        seenAt: envelope.sent_at,
+        // The Gateway's clock, as for heartbeats: TeamHub ignores a write
+        // that is not newer than the last one, so a Computer clock behind
+        // the Gateway's would drop this change for good, and one ahead would
+        // put the Computer's last-seen time in the future.
+        seenAt: new Date().toISOString(),
         runtimes: connection.hello.runtimes,
         runtimeDiagnostics: envelope.runtime_diagnostics,
       });
+      for (const diagnostic of envelope.runtime_diagnostics) {
+        this.owners.queue().refreshEndpoint({
+          computerId: connection.runnerId,
+          runtimeType: diagnostic.type,
+        });
+      }
       type Observation = RunnerHello["runtime_registrations"][number];
       const observe = (
         base: Pick<Observation, "tenant_id" | "owner_actor_id">,
         diagnostic: RunnerHello["runtime_diagnostics"][number],
+        previousRevision = 0,
       ): Observation => {
         const available = connection.hello.runtimes.includes(diagnostic.type);
         return {
           ...base,
           provider_type: diagnostic.type,
           status: available ? ("online" as const) : ("unavailable" as const),
-          revision: envelope.revision,
+          // Keep each registration observation's revision strictly ahead of
+          // its previous value even when the Daemon's diagnostics counter is
+          // lower than the clock-seeded revision sent in runner.hello.
+          revision: Math.max(envelope.revision, previousRevision + 1),
           capabilities: available ? ["turn"] : [],
           runtime_diagnostics: structuredClone(
             diagnostic,
@@ -642,7 +675,10 @@ export class RunnerConnections {
           ({ type }) => type === observation.provider_type,
         );
         return diagnostic
-          ? { ...observation, ...observe(observation, diagnostic) }
+          ? {
+              ...observation,
+              ...observe(observation, diagnostic, observation.revision),
+            }
           : observation;
       });
       // A Computer leaves a Runtime that is not installed out of its hello,
@@ -680,6 +716,9 @@ export class RunnerConnections {
           connection.hello,
         ),
       });
+      await this.owners
+        .lifecycle()
+        .refreshComputerPlacements(connection.runnerId);
       return;
     }
     if (envelope.type === "runtime.registration.observed") {
@@ -845,7 +884,18 @@ export class RunnerConnections {
     const connection = this.#connections.get(runnerId);
     return (
       isServingConnection(connection) &&
-      (runtimeType === "codex" || runtimeType === "claude") &&
+      (runtimeType === "codex" ||
+        runtimeType === "claude" ||
+        (runtimeType === "pi" &&
+          isComputerVersionAtLeast(
+            connection.hello.daemon_version,
+            FIRST_PI_SESSION_COMPACTION_COMPUTER_VERSION,
+          )) ||
+        (runtimeType === "antigravity" &&
+          isComputerVersionAtLeast(
+            connection.hello.daemon_version,
+            FIRST_ANTIGRAVITY_SESSION_COMPACTION_COMPUTER_VERSION,
+          ))) &&
       connection.hello.runtime_diagnostics.some(
         ({ type, status }) => type === runtimeType && status === "ready",
       )
@@ -868,6 +918,19 @@ export class RunnerConnections {
     );
   }
 
+  /** Whether the Computer on this connection decodes `model` on model_invoke. */
+  supportsModelInvokeModel(runnerId: string, connectionEpoch: number): boolean {
+    const connection = this.#connections.get(runnerId);
+    return (
+      isServingConnection(connection) &&
+      connection.connectionEpoch === connectionEpoch &&
+      isComputerVersionAtLeast(
+        connection.hello.daemon_version,
+        FIRST_MODEL_INVOKE_MODEL_COMPUTER_VERSION,
+      )
+    );
+  }
+
   /** Whether the Computer can run a model invocation on this Runtime now. */
   supportsModelInvoke(
     runnerId: string,
@@ -881,8 +944,25 @@ export class RunnerConnections {
           connection.hello.daemon_version,
           FIRST_PI_MODEL_INVOKE_COMPUTER_VERSION,
         )) &&
+      (runtimeType !== "antigravity" ||
+        isComputerVersionAtLeast(
+          connection.hello.daemon_version,
+          FIRST_ANTIGRAVITY_MODEL_INVOKE_COMPUTER_VERSION,
+        )) &&
       connection.hello.runtime_diagnostics.some(
         ({ type, status }) => type === runtimeType && status === "ready",
+      )
+    );
+  }
+
+  /** Whether the Computer negotiates post-load local-model concurrency probing. */
+  supportsLocalModelsConcurrencyProbe(runnerId: string): boolean {
+    const connection = this.#connections.get(runnerId);
+    return (
+      connection?.connected === true &&
+      isComputerVersionAtLeast(
+        connection.hello.daemon_version,
+        FIRST_LOCAL_MODELS_CONCURRENCY_PROBE_COMPUTER_VERSION,
       )
     );
   }
@@ -983,7 +1063,6 @@ export class RunnerConnections {
     const resolvedEffort = resolveSupportedReasoningEffort(
       model,
       reasoningEffort,
-      requirement.runtimeType,
     );
     if (
       reasoningEffort !== undefined &&

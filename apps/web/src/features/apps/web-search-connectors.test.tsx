@@ -52,8 +52,8 @@ describe("Web search connectors", () => {
 
     fireEvent.click(
       within(
-        screen.getByRole("tablist", { name: "Connector categories" }),
-      ).getByRole("tab", { name: "Web search" }),
+        screen.getByRole("group", { name: "Connector categories" }),
+      ).getByRole("button", { name: "Web search" }),
     );
     expect(
       screen.queryByRole("region", { name: "Application connections" }),
@@ -146,9 +146,6 @@ describe("Web search connectors", () => {
     const section = await screen.findByRole("region", { name: "Web search" });
     fireEvent.click(within(section).getByRole("button", { name: "Tavily" }));
     const dialog = await screen.findByRole("dialog", { name: "Tavily" });
-    expect(dialog).toHaveTextContent(
-      "The real-time search engine for AI agents.",
-    );
     expect(dialog).toHaveTextContent("DoesSearches the web and reads pages");
     expect(
       within(dialog).getByRole("link", { name: /app\.tavily\.com\/home/ }),
@@ -252,7 +249,7 @@ describe("Web search connectors", () => {
     renderPage(runtime);
 
     await screen.findByRole("region", { name: "Web search" });
-    fireEvent.click(screen.getByRole("button", { name: "Connected only" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Connected only" }));
     expect(
       cardNames(
         screen.getByRole("region", { name: "Application connections" }),

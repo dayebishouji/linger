@@ -2,6 +2,7 @@ package localmodels
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -190,18 +192,6 @@ func isManagedProfilePath(stateDir, candidate string, homes ...string) bool {
 	return hasManagedProfileSuffix(cleaned, homes...)
 }
 
-func envLookup(environment map[string]string, key string) string {
-	if value, ok := environment[key]; ok {
-		return strings.TrimSpace(value)
-	}
-	for k, value := range environment {
-		if strings.EqualFold(k, key) {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
-}
-
 // localGatewayPiProfile resolves the existing managed gateway-home Pi profile
 // shared by both localmodels tool invocations (when model-source.json exists)
 // and local-mode Runtime discovery. It keeps the verified legacy profile
@@ -225,7 +215,7 @@ func localGatewayPiProfile(base map[string]string, stateDir string, overlay *Ove
 			candidates = append(candidates, filepath.Clean(configured))
 		}
 	}
-	if existing := envLookup(base, "PI_CODING_AGENT_DIR"); existing != "" && filepath.IsAbs(existing) &&
+	if existing := localworkspace.EnvLookup(base, "PI_CODING_AGENT_DIR"); existing != "" && filepath.IsAbs(existing) &&
 		isManagedProfilePath(stateDir, existing, "gateway-home") {
 		candidates = append(candidates, filepath.Clean(existing))
 	}
@@ -250,7 +240,7 @@ func GatewayRuntime(environment map[string]string, stateDir, runtimeType string)
 		return false
 	}
 	key, ok := runtimeProfileKeys[runtimeType]
-	return ok && isManagedProfilePath(stateDir, envLookup(environment, key), "gateway-home", "byok-home")
+	return ok && isManagedProfilePath(stateDir, localworkspace.EnvLookup(environment, key), "gateway-home", "byok-home")
 }
 
 // OverlayEnvironment computes the effective Runtime discovery/execution
@@ -304,35 +294,370 @@ func OverlayEnvironment(base map[string]string, stateDir string) map[string]stri
 	return result
 }
 
+var managedRuntimeNames = []string{"claude", "codex", "pi"}
+
+// RuntimePathLayers separates explicit configured Runtime paths (checked
+// before user PATH) from harness-managed fallback paths (checked after
+// user PATH and before bundled runtimes).
+type RuntimePathLayers struct {
+	Configured map[string]string
+	Managed    map[string]string
+}
+
 // OverlayRuntimePaths supplements configured Runtime executable paths with
-// managed Runtimes under <home>/runtime/harness/bin or recorded in model-source.json.
+// managed Runtimes recorded in model-source.json, under <home>/runtime/harness/bin,
+// or under <home>/runtime/harness/tools/<runtime>/<version>.
 func OverlayRuntimePaths(configured map[string]string, stateDir string) map[string]string {
-	result := maps.Clone(configured)
-	if result == nil {
-		result = make(map[string]string)
-	}
-	if overlay := ReadOverlay(stateDir); overlay != nil {
-		for rt, exe := range overlay.RuntimePaths {
-			if current := result[rt]; current == "" {
-				if info, err := os.Stat(exe); err == nil && info.Mode().IsRegular() {
-					result[rt] = exe
-				}
-			}
-		}
-	}
-	if harness := HarnessRoot(stateDir); harness != "" {
-		binDir := filepath.Join(harness, "bin")
-		for _, rt := range []string{"claude", "codex", "pi"} {
-			if result[rt] != "" {
-				continue
-			}
-			candidate := filepath.Join(binDir, rt)
-			if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
-				result[rt] = candidate
-			}
+	layers := ResolveRuntimePathsWithBundled(configured, stateDir, "")
+	result := layers.Configured
+	for rt, exe := range layers.Managed {
+		if !isExecutableFile(result[rt]) {
+			result[rt] = exe
 		}
 	}
 	return result
+}
+
+// ResolveRuntimePathsWithBundled separates explicit configured Runtime paths
+// from harness-managed Pi paths. Harness-managed Pi installs stay in Managed
+// (checked after user PATH and before BundledPaths) and are included only when
+// their version directory is strictly newer than a valid bundledPiVersion.
+func ResolveRuntimePathsWithBundled(configured map[string]string, stateDir, bundledPiVersion string) RuntimePathLayers {
+	configuredOut := maps.Clone(configured)
+	if configuredOut == nil {
+		configuredOut = make(map[string]string)
+	}
+	managedOut := make(map[string]string)
+	harness := HarnessRoot(stateDir)
+	var bundledPiRoot string
+	if stateDir != "" && filepath.IsAbs(stateDir) {
+		bundledPiRoot = filepath.Join(filepath.Dir(filepath.Dir(filepath.Clean(stateDir))), "bundled-pi")
+	}
+	bundledPiValid := bundledPiVersion != "" && parseVersionName(bundledPiVersion).isVersion
+
+	if exe := configuredOut["pi"]; exe != "" {
+		if harness != "" && pathWithin(harness, exe) {
+			delete(configuredOut, "pi")
+			if !isSupersededHarnessPiPath(exe, harness, bundledPiVersion) && isExecutableFile(exe) {
+				managedOut["pi"] = exe
+			}
+		} else if bundledPiRoot != "" && bundledPiValid && pathWithin(bundledPiRoot, exe) {
+			delete(configuredOut, "pi")
+		}
+	}
+
+	if overlay := ReadOverlay(stateDir); overlay != nil {
+		for rt, exe := range overlay.RuntimePaths {
+			if rt == "pi" {
+				if harness != "" && pathWithin(harness, exe) {
+					if !isSupersededHarnessPiPath(exe, harness, bundledPiVersion) && !isExecutableFile(managedOut["pi"]) && isExecutableFile(exe) {
+						managedOut["pi"] = exe
+					}
+					continue
+				}
+				if bundledPiRoot != "" && bundledPiValid && pathWithin(bundledPiRoot, exe) {
+					continue
+				}
+				if !isExecutableFile(configuredOut["pi"]) && isExecutableFile(exe) {
+					configuredOut["pi"] = exe
+				}
+				continue
+			}
+			if !isExecutableFile(configuredOut[rt]) && isExecutableFile(exe) {
+				configuredOut[rt] = exe
+			}
+		}
+	}
+
+	if harness != "" {
+		for rt, exe := range discoverHarnessRuntimePaths(harness, bundledPiVersion) {
+			if rt == "pi" {
+				if !isExecutableFile(managedOut["pi"]) {
+					managedOut["pi"] = exe
+				}
+				continue
+			}
+			if !isExecutableFile(configuredOut[rt]) {
+				configuredOut[rt] = exe
+			}
+		}
+	}
+
+	return RuntimePathLayers{Configured: configuredOut, Managed: managedOut}
+}
+
+// FilterManagedPiPath drops a harness-managed Pi executable when a valid
+// bundledPiVersion is at least as new as that harness version, returning exe
+// unchanged otherwise.
+func FilterManagedPiPath(exe, stateDir, bundledPiVersion string) string {
+	if exe == "" || isSupersededHarnessPiPath(exe, HarnessRoot(stateDir), bundledPiVersion) {
+		return ""
+	}
+	return exe
+}
+
+func isSupersededHarnessPiPath(exe, harness, bundledPiVersion string) bool {
+	if exe == "" || harness == "" || bundledPiVersion == "" || !parseVersionName(bundledPiVersion).isVersion {
+		return false
+	}
+	if !pathWithin(harness, exe) {
+		return false
+	}
+	toolsPiDir := filepath.Join(harness, "tools", "pi")
+	if !pathWithin(toolsPiDir, exe) {
+		return true
+	}
+	rel, err := filepath.Rel(toolsPiDir, filepath.Clean(exe))
+	if err != nil {
+		return true
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) < 2 {
+		return true
+	}
+	version := parts[0]
+	return !parseVersionName(version).isVersion || compareVersionNames(version, bundledPiVersion) <= 0
+}
+
+func executableNames(name string) []string {
+	if runtime.GOOS != "windows" || filepath.Ext(name) != "" {
+		return []string{name}
+	}
+	return []string{name + ".exe", name + ".com", name + ".cmd", name + ".bat", name + ".ps1"}
+}
+
+func isExecutableFile(candidate string) bool {
+	if candidate == "" || !filepath.IsAbs(candidate) {
+		return false
+	}
+	info, err := os.Stat(candidate)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	return runtime.GOOS == "windows" || info.Mode().Perm()&0o111 != 0
+}
+
+func harnessExecutableInDir(dir, rt string) string {
+	for _, name := range executableNames(rt) {
+		candidate := filepath.Join(dir, name)
+		if isExecutableFile(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func harnessToolsExecutable(harness, rt string) (string, string) {
+	toolsRTDir := filepath.Join(harness, "tools", rt)
+	entries, err := os.ReadDir(toolsRTDir)
+	if err != nil {
+		return "", ""
+	}
+	bestVersion := ""
+	bestExecutable := ""
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		versionDir := filepath.Join(toolsRTDir, name)
+		info, err := os.Stat(versionDir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		candidate := harnessExecutableInDir(versionDir, rt)
+		if candidate == "" {
+			continue
+		}
+		if bestExecutable == "" || compareVersionNames(name, bestVersion) > 0 {
+			bestVersion = name
+			bestExecutable = candidate
+		}
+	}
+	return bestVersion, bestExecutable
+}
+
+func discoverHarnessRuntimePaths(harness, bundledPiVersion string) map[string]string {
+	paths := make(map[string]string)
+	if harness == "" {
+		return paths
+	}
+	bundledPiValid := bundledPiVersion != "" && parseVersionName(bundledPiVersion).isVersion
+	binDir := filepath.Join(harness, "bin")
+	for _, rt := range managedRuntimeNames {
+		if rt == "pi" && bundledPiValid {
+			if bestVer, exe := harnessToolsExecutable(harness, rt); exe != "" &&
+				parseVersionName(bestVer).isVersion && compareVersionNames(bestVer, bundledPiVersion) > 0 {
+				paths[rt] = exe
+			}
+			continue
+		}
+		if exe := harnessExecutableInDir(binDir, rt); exe != "" {
+			paths[rt] = exe
+			continue
+		}
+		if _, exe := harnessToolsExecutable(harness, rt); exe != "" {
+			paths[rt] = exe
+		}
+	}
+	return paths
+}
+
+func isASCIIAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := range len(s) {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func trimLeadingZeros(s string) string {
+	trimmed := strings.TrimLeft(s, "0")
+	if trimmed == "" {
+		return "0"
+	}
+	return trimmed
+}
+
+func compareNumericTokens(a, b string) int {
+	a, b = trimLeadingZeros(a), trimLeadingZeros(b)
+	if len(a) != len(b) {
+		return cmp.Compare(len(a), len(b))
+	}
+	return strings.Compare(a, b)
+}
+
+type parsedVersion struct {
+	isVersion bool
+	core      []string
+	hasPre    bool
+	pre       []string
+}
+
+func parseVersionName(raw string) parsedVersion {
+	s := raw
+	if idx := strings.IndexByte(s, '+'); idx >= 0 {
+		s = s[:idx]
+	}
+	if len(s) >= 2 && (s[0] == 'v' || s[0] == 'V') && s[1] >= '0' && s[1] <= '9' {
+		s = s[1:]
+	}
+	coreStr, preStr, hasPre := strings.Cut(s, "-")
+	if hasPre && preStr == "" {
+		return parsedVersion{}
+	}
+	parts := strings.Split(coreStr, ".")
+	if len(parts) == 0 {
+		return parsedVersion{}
+	}
+	for _, part := range parts {
+		if !isASCIIAllDigits(part) {
+			return parsedVersion{}
+		}
+	}
+	var pre []string
+	if hasPre {
+		pre = strings.Split(preStr, ".")
+	}
+	return parsedVersion{isVersion: true, core: parts, hasPre: hasPre, pre: pre}
+}
+
+func splitNaturalChunks(s string) []string {
+	var chunks []string
+	for i := 0; i < len(s); {
+		digit := s[i] >= '0' && s[i] <= '9'
+		j := i + 1
+		for j < len(s) && (s[j] >= '0' && s[j] <= '9') == digit {
+			j++
+		}
+		chunks = append(chunks, s[i:j])
+		i = j
+	}
+	return chunks
+}
+
+func compareNaturalNames(a, b string) int {
+	ca, cb := splitNaturalChunks(a), splitNaturalChunks(b)
+	for i := range min(len(ca), len(cb)) {
+		da, db := isASCIIAllDigits(ca[i]), isASCIIAllDigits(cb[i])
+		var c int
+		if da && db {
+			c = compareNumericTokens(ca[i], cb[i])
+		} else {
+			c = strings.Compare(ca[i], cb[i])
+		}
+		if c != 0 {
+			return c
+		}
+	}
+	if len(ca) != len(cb) {
+		return cmp.Compare(len(ca), len(cb))
+	}
+	return strings.Compare(a, b)
+}
+
+func compareVersionNames(a, b string) int {
+	va, vb := parseVersionName(a), parseVersionName(b)
+	if va.isVersion != vb.isVersion {
+		if va.isVersion {
+			return 1
+		}
+		return -1
+	}
+	if !va.isVersion {
+		return compareNaturalNames(a, b)
+	}
+	for i := range max(len(va.core), len(vb.core)) {
+		segA, segB := "0", "0"
+		if i < len(va.core) {
+			segA = va.core[i]
+		}
+		if i < len(vb.core) {
+			segB = vb.core[i]
+		}
+		if c := compareNumericTokens(segA, segB); c != 0 {
+			return c
+		}
+	}
+	if va.hasPre != vb.hasPre {
+		if !va.hasPre {
+			return 1
+		}
+		return -1
+	}
+	if va.hasPre {
+		for i := range min(len(va.pre), len(vb.pre)) {
+			pa, pb := va.pre[i], vb.pre[i]
+			da, db := isASCIIAllDigits(pa), isASCIIAllDigits(pb)
+			var c int
+			switch {
+			case da && db:
+				c = compareNumericTokens(pa, pb)
+			case da != db:
+				if da {
+					c = -1
+				} else {
+					c = 1
+				}
+			default:
+				c = strings.Compare(pa, pb)
+			}
+			if c != 0 {
+				return c
+			}
+		}
+		if len(va.pre) != len(vb.pre) {
+			return cmp.Compare(len(va.pre), len(vb.pre))
+		}
+	}
+	if len(va.core) != len(vb.core) {
+		return cmp.Compare(len(va.core), len(vb.core))
+	}
+	return strings.Compare(a, b)
 }
 
 // ModelSourceOptions configures a ModelSource controller.
@@ -628,6 +953,7 @@ func (m *ModelSource) Apply(ctx context.Context, apply ModelSourceApply) (wire.M
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	previousPaths := m.readExecutableRuntimePaths()
 
 	applyDeadline := time.Now().Add(m.applyTimeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(applyDeadline) {
@@ -676,7 +1002,7 @@ func (m *ModelSource) Apply(ctx context.Context, apply ModelSourceApply) (wire.M
 	}
 	// Persist runtime_paths discovered by source apply into model-source.json so
 	// OverlayRuntimePaths can resolve newly installed managed runtimes immediately.
-	m.persistRuntimePaths(stdout)
+	m.persistRuntimePaths(stdout, previousPaths)
 	var catalogs map[string][]RuntimeModelOption
 	if m.onApplied != nil {
 		if remaining := time.Until(applyDeadline); remaining > 0 {
@@ -801,14 +1127,42 @@ func agentRuntimeModel(mode, runtime, target string, catalog []RuntimeModelOptio
 	return model.ID, effort
 }
 
-func (m *ModelSource) persistRuntimePaths(stdout []byte) {
+func (m *ModelSource) readExecutableRuntimePaths() map[string]string {
+	if m.tool == nil || m.tool.StateDirectory == "" {
+		return nil
+	}
+	overlay := ReadOverlay(m.tool.StateDirectory)
+	if overlay == nil || len(overlay.RuntimePaths) == 0 {
+		return nil
+	}
+	paths := make(map[string]string, len(overlay.RuntimePaths))
+	for rt, exe := range overlay.RuntimePaths {
+		if slices.Contains(managedRuntimeNames, rt) && isExecutableFile(exe) {
+			paths[rt] = exe
+		}
+	}
+	return paths
+}
+
+func (m *ModelSource) persistRuntimePaths(stdout []byte, previousPaths map[string]string) {
 	if m.tool == nil || m.tool.StateDirectory == "" {
 		return
 	}
-	docBytes := lastJSONDocument(stdout)
-	var doc sourceStatusDocument
-	if len(docBytes) == 0 || json.Unmarshal(docBytes, &doc) != nil || len(doc.RuntimePaths) == 0 {
-		return
+	harness := m.harnessRoot
+	if harness == "" {
+		harness = HarnessRoot(m.tool.StateDirectory)
+	}
+	outsideHarness := func(exe string) bool {
+		return harness == "" || !pathWithin(harness, exe)
+	}
+	// Keep only paths the Daemon cannot rediscover on read (valid previous
+	// executables outside the harness, plus explicit paths reported by apply);
+	// OverlayRuntimePaths owns scanning <harness>/bin and tools/<rt>/<ver>.
+	merged := make(map[string]string)
+	for rt, exe := range previousPaths {
+		if slices.Contains(managedRuntimeNames, rt) && isExecutableFile(exe) && outsideHarness(exe) {
+			merged[rt] = exe
+		}
 	}
 	stateFile := filepath.Join(m.tool.StateDirectory, "model-source.json")
 	raw, err := readBounded(stateFile, 64*1024)
@@ -819,7 +1173,34 @@ func (m *ModelSource) persistRuntimePaths(stdout []byte) {
 	if err := json.Unmarshal(raw, &current); err != nil {
 		return
 	}
-	current["runtime_paths"] = doc.RuntimePaths
+	if existing, ok := current["runtime_paths"].(map[string]any); ok {
+		for rt, val := range existing {
+			exe, isStr := val.(string)
+			trimmed := strings.TrimSpace(exe)
+			cleaned := filepath.Clean(trimmed)
+			if isStr && slices.Contains(managedRuntimeNames, rt) && isExecutableFile(cleaned) && outsideHarness(cleaned) && merged[rt] == "" {
+				merged[rt] = cleaned
+			}
+		}
+	}
+	docBytes := lastJSONDocument(stdout)
+	var doc sourceStatusDocument
+	if len(docBytes) > 0 && json.Unmarshal(docBytes, &doc) == nil {
+		for rt, exe := range doc.RuntimePaths {
+			trimmed := strings.TrimSpace(exe)
+			if slices.Contains(managedRuntimeNames, rt) && trimmed != "" && filepath.IsAbs(trimmed) {
+				merged[rt] = filepath.Clean(trimmed)
+			}
+		}
+	}
+	if len(merged) == 0 {
+		if _, hadPaths := current["runtime_paths"]; !hadPaths {
+			return
+		}
+		delete(current, "runtime_paths")
+	} else {
+		current["runtime_paths"] = merged
+	}
 	encoded, err := json.MarshalIndent(current, "", "  ")
 	if err != nil {
 		return
@@ -828,7 +1209,9 @@ func (m *ModelSource) persistRuntimePaths(stdout []byte) {
 	if err := os.WriteFile(tmp, append(encoded, '\n'), 0o600); err != nil {
 		return
 	}
-	_ = os.Rename(tmp, stateFile)
+	if err := os.Rename(tmp, stateFile); err != nil {
+		_ = os.Remove(tmp)
+	}
 }
 
 func (m *ModelSource) resolveNodePath() string {
@@ -939,15 +1322,19 @@ func unsupportedSourceCommand(exitCode int, stdout []byte) error {
 	return nil
 }
 
-// sanitizeModelSourceMessage removes the submitted BYOK secret and recognizable
-// credentials before an error message leaves the Computer; TeamHub owns full
-// public-response scrubbing of user-home paths and URL query strings.
+var modelSourceURLQueryPattern = regexp.MustCompile(`(?i)(\b[a-z][a-z0-9+.-]*://[^\s?#"'\)\]}]+)\?[^\s"'<>)\]}]*`)
+
+// sanitizeModelSourceMessage removes the submitted BYOK secret, URL query
+// strings, and recognizable credentials before an error message is logged or
+// leaves the Computer.
 func sanitizeModelSourceMessage(raw, fallback, secret string) string {
 	scrubbed := strings.TrimSpace(raw)
 	if scrubbed == "" {
 		return fallback
 	}
-	scrubbed = redact.Text(redactSecret(scrubbed, secret))
+	scrubbed = redactSecret(scrubbed, secret)
+	scrubbed = modelSourceURLQueryPattern.ReplaceAllString(scrubbed, "${1}?[REDACTED]")
+	scrubbed = redact.Text(scrubbed)
 	cleaned := strings.Join(strings.Fields(scrubbed), " ")
 	if cleaned == "" {
 		return fallback

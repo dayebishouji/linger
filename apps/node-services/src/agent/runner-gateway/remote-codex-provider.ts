@@ -1,8 +1,4 @@
-import {
-  runPriorities,
-  RunPriority,
-  type CapacityPriority,
-} from "../../model-tasks.js";
+import { runPriorities, RunPriority } from "../../model-tasks.js";
 import { displayText } from "@linger/service-kit";
 import {
   OPERATION_OUTCOME_UNKNOWN,
@@ -29,6 +25,7 @@ import type {
   RuntimeSession,
 } from "../executor/provider.js";
 import {
+  formatRuntimeFailureDetail,
   RuntimeExecutionError,
   StreamingAgentRun,
   ProviderRunCleanupError,
@@ -165,14 +162,11 @@ export class RemoteRuntimeProvider implements AgentProvider {
   #capacityPermit?: RunnerCapacityPermit;
   readonly #closed = new AbortController();
 
-  async acquireRunCapacity(
-    signal: AbortSignal,
-    priority?: CapacityPriority,
-  ): Promise<() => void> {
+  async acquireRunCapacity(signal: AbortSignal): Promise<() => void> {
     let permit: RunnerCapacityPermit | undefined;
     try {
       permit = await this.#dispatcher.acquireOperationCapacity?.(
-        { ...this.#target, priority },
+        this.#target,
         AbortSignal.any([signal, this.#closed.signal]),
       );
     } catch (error) {
@@ -217,7 +211,10 @@ export class RemoteRuntimeProvider implements AgentProvider {
     }
     const runtimeType = options.runtime.type;
     if (
-      (runtimeType === "codex" || runtimeType === "claude") &&
+      (runtimeType === "codex" ||
+        runtimeType === "claude" ||
+        runtimeType === "pi" ||
+        runtimeType === "antigravity") &&
       options.dispatcher.compactParkedSession
     ) {
       this.compactSession = (session, compactOptions) =>
@@ -231,7 +228,7 @@ export class RemoteRuntimeProvider implements AgentProvider {
    * Context without a parked process cannot be compacted now.
    */
   async #compactSession(
-    runtimeType: "codex" | "claude",
+    runtimeType: "codex" | "claude" | "pi" | "antigravity",
     session: RuntimeSession,
     options: ProviderCompactOptions,
   ): Promise<ProviderCompactResult> {
@@ -316,19 +313,24 @@ export class RemoteRuntimeProvider implements AgentProvider {
       );
     }
     if (
-      this.#runtime.type === "codex" &&
+      (this.#runtime.type === "codex" ||
+        this.#runtime.type === "antigravity") &&
       requireOpaqueObject(session, "session").threadId === ""
     ) {
-      // The first run has not created the Codex thread, so there is no
-      // rollout to read yet.
+      const antigravity = this.#runtime.type === "antigravity";
+      const reason = antigravity
+        ? "Antigravity session has not started yet"
+        : "Codex thread has not started yet";
+      // The first run has not created the native session, so there is no
+      // rollout or transcript to read yet.
       return {
         status: "unavailable",
-        providerKind: "codex",
-        reason: "Codex thread has not started yet",
+        providerKind: this.#runtime.type,
+        reason,
         instructions: {
           status: "unavailable",
-          source: "codex_rollout",
-          reason: "Codex thread has not started yet",
+          source: antigravity ? "antigravity_transcript" : "codex_rollout",
+          reason,
           blocks: [],
         },
         records: [],
@@ -479,6 +481,8 @@ export class RemoteRuntimeProvider implements AgentProvider {
     let busyRetries = 0;
     for (;;) {
       signal.throwIfAborted();
+      // Nothing reached the Runtime yet, a busy rejection included.
+      spec.preemptSignal?.throwIfAborted();
       if (!spec.runContext)
         throw new TypeError("Local Run requires a Context run context");
       const runStartContext = await this.#contextRunStart(spec.runContext, {
@@ -491,6 +495,14 @@ export class RemoteRuntimeProvider implements AgentProvider {
           runtime: this.#runtime,
           session_options: this.#requireSessionOptions(),
           session: mutableSession,
+          ...(spec.previousSession
+            ? {
+                previous_session: {
+                  provider_type: spec.previousSession.providerType,
+                  session_id: spec.previousSession.sessionId,
+                },
+              }
+            : {}),
           input,
           ...runStartContext,
           ...(cliRunContext ? { cli_run_context: cliRunContext } : {}),
@@ -529,7 +541,11 @@ export class RemoteRuntimeProvider implements AgentProvider {
             ) *
             (0.5 + Math.random() / 2);
           busyRetries += 1;
-          await waitForAdmission(delay, undefined, { signal });
+          await waitForAdmission(delay, undefined, {
+            signal: spec.preemptSignal
+              ? AbortSignal.any([signal, spec.preemptSignal])
+              : signal,
+          });
           continue;
         }
         throw localRunFailure(error, false, this.#runtime.type);
@@ -549,6 +565,7 @@ export class RemoteRuntimeProvider implements AgentProvider {
         throw new RuntimeExecutionError({
           code: "protocol_incompatible",
           runtime_type: this.#runtime.type,
+          detail: "Runtime did not return an initial session checkpoint",
         });
       }
       replaceOpaqueObject(mutableSession, checkpoint);
@@ -761,7 +778,11 @@ export class RemoteRuntimeProvider implements AgentProvider {
       runKind,
       priority = new RunPriority(runPriorities[runKind ?? "chat"]),
       beforeYieldResume,
-    }: Pick<ExecutionSpec, "runKind" | "priority" | "beforeYieldResume"> = {},
+      preemptSignal,
+    }: Pick<
+      ExecutionSpec,
+      "runKind" | "priority" | "beforeYieldResume" | "preemptSignal"
+    > = {},
   ): Promise<RunnerOperation> {
     if (this.#closePromise) {
       throw new Error("Remote Codex provider is closed");
@@ -769,8 +790,8 @@ export class RemoteRuntimeProvider implements AgentProvider {
     const permit =
       this.#capacityPermit ??
       (await this.#dispatcher.acquireOperationCapacity?.(
-        { ...this.#target, priority },
-        signal,
+        this.#target,
+        preemptSignal ? AbortSignal.any([signal, preemptSignal]) : signal,
       ));
     try {
       const operation = await this.#dispatcher.startOperation({
@@ -780,6 +801,7 @@ export class RemoteRuntimeProvider implements AgentProvider {
         priority,
         ...(beforeYieldResume ? { beforeYieldResume } : {}),
         signal,
+        ...(preemptSignal ? { preemptSignal } : {}),
         contextViewRef: this.#contextRunResources.currentContextViewRef(),
         request,
         ...(permit ? { capacityPermit: permit } : {}),
@@ -806,13 +828,13 @@ export class RemoteRuntimeProvider implements AgentProvider {
 
   /**
    * Advisory and never throws: after a Room-presence activation without input,
-   * start the Codex process or Claude CLI early so the first Run adopts it.
-   * Every call sends a fresh prepare; the Daemon answers already_ready while a
-   * compatible process stays parked, and keeps a prepared process parked like
-   * a Run's, so nothing is ever renewed or canceled. When a pre-prepare hook is
-   * configured, the prepare is sent only after it resolves, so the prestarted
-   * process matches the first Run's environment; a Run that started meanwhile
-   * owns the process, so nothing is sent then.
+   * start the Codex, Claude, Pi, or Antigravity Runtime early so the first Run
+   * adopts it. Every call sends a fresh prepare; the Daemon answers
+   * already_ready while a compatible process stays parked, and keeps a prepared
+   * process parked like a Run's, so nothing is ever renewed or canceled. When a
+   * pre-prepare hook is configured, the prepare is sent only after it resolves,
+   * so the prestarted process matches the first Run's environment; a Run that
+   * started meanwhile owns the process, so nothing is sent then.
    */
   prepareForPresence(session: RuntimeSession): void {
     const beforePrepare = this.#beforePresencePrepare;
@@ -847,7 +869,7 @@ export class RemoteRuntimeProvider implements AgentProvider {
   ): void {
     let prepared: SentProviderPrepare | string;
     try {
-      // Claude is prepared only for Room presence, where no input is waiting.
+      // Claude, Pi, and Antigravity are prepared only for Room presence, where no input is waiting.
       prepared =
         source === "accepted_input" && this.#runtime.type !== "codex"
           ? "runtime_unsupported"
@@ -878,23 +900,30 @@ export class RemoteRuntimeProvider implements AgentProvider {
   }
 
   /**
-   * Sends one provider prepare for the session's Codex thread or Claude
-   * conversation, or returns why it was not sent. For a Context that has no
-   * Codex thread yet the Daemon starts one, and the Context's first Run adopts
-   * it. A Claude conversation id always exists, so the Daemon creates the
-   * conversation it names when it is not materialized.
+   * Sends one provider prepare for the session's Codex thread, Claude
+   * conversation, Pi session, or Antigravity ACP server, or returns why it was
+   * not sent. For a Context that has no Codex thread yet the Daemon starts one,
+   * and the Context's first Run adopts it. A Claude or Pi session id always
+   * exists, so the Daemon creates the session it names when it is not
+   * materialized. Antigravity warms its ACP server for both blank and resumed
+   * rooms without creating a conversation ahead of the first Run.
    */
   #sendProviderPrepare(session: RuntimeSession): SentProviderPrepare | string {
     const target = this.#target;
     const executionContextKey = target.executionContextKey;
     const runtime = this.#runtime.type;
-    if (runtime !== "codex" && runtime !== "claude")
+    if (
+      runtime !== "codex" &&
+      runtime !== "claude" &&
+      runtime !== "pi" &&
+      runtime !== "antigravity"
+    )
       return "runtime_unsupported";
     if (this.#closePromise !== undefined) return "closed";
     if (!this.#sessionOptions) return "session_unavailable";
     const retained = requireOpaqueObject(session, "session");
     if (
-      runtime === "claude" &&
+      (runtime === "claude" || runtime === "pi") &&
       (typeof retained.sessionId !== "string" || retained.sessionId === "")
     ) {
       return "session_not_started";
@@ -1145,10 +1174,12 @@ const localRunFailure = (
     !executionStarted &&
     (error.code === "RUNNER_STOPPED" || error.code === "RUNTIME_NOT_ENABLED")
   ) {
+    const detail = formatRuntimeFailureDetail(error.message);
     return new RuntimeExecutionError(
       {
         code: "computer_unavailable",
         ...(runtimeType ? { runtime_type: runtimeType } : {}),
+        ...(detail ? { detail } : {}),
       },
       { cause: error },
     );
@@ -1346,6 +1377,16 @@ const toRunEvent = (event: WireRunEvent): RunEvent | null => {
     case "file.updated":
     case "file.deleted":
       return { type: event.type, path: event.path };
+    case "run.background_waiting":
+      return {
+        type: "status.changed",
+        status: "waiting_background",
+      };
+    case "run.background_resumed":
+      return {
+        type: "status.changed",
+        status: "working",
+      };
     case "run.completed":
       return event;
     case "run.failed":

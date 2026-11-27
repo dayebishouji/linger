@@ -3,12 +3,15 @@
 package computerconfig
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -18,15 +21,14 @@ import (
 
 // Config is a validated Local Computer config with its Gateway credential.
 type Config struct {
-	ComputerID              string
-	DisplayName             string
-	GatewayURL              string
-	GatewayToken            string
-	CodexAuthFile           string
-	StateDirectory          string
-	MaxConcurrentOperations *int
-	RuntimePaths            map[string]string
-	EnabledRuntimes         []string
+	ComputerID      string
+	DisplayName     string
+	GatewayURL      string
+	GatewayToken    string
+	CodexAuthFile   string
+	StateDirectory  string
+	RuntimePaths    map[string]string
+	EnabledRuntimes []string
 	// PreferredRuntime is the Runtime the person chose at installation, or
 	// empty when the installer chose none.
 	PreferredRuntime string
@@ -55,6 +57,7 @@ type LocalModels struct {
 // closes its stdin and reports its state as JSON lines on stdout.
 type Desktop struct {
 	TeamHubCLIDirectory string
+	CuaSocket           string
 }
 
 // Owner is one tenant owner scope named by the Gateway credential.
@@ -75,19 +78,18 @@ type WorkspaceGrant struct {
 }
 
 type encodedConfig struct {
-	RunnerID                string              `json:"runner_id"`
-	DisplayName             string              `json:"display_name"`
-	Gateway                 encodedGateway      `json:"gateway"`
-	StateDirectory          string              `json:"state_directory"`
-	MaxConcurrentOperations *int                `json:"max_concurrent_operations,omitempty"`
-	RuntimePaths            map[string]string   `json:"runtime_paths,omitempty"`
-	EnabledRuntimes         json.RawMessage     `json:"enabled_runtimes,omitempty"`
-	PreferredRuntime        string              `json:"preferred_runtime,omitempty"`
-	WorkspaceGrants         []WorkspaceGrant    `json:"workspace_grants"`
-	CredentialExpiresAt     string              `json:"credential_expires_at,omitempty"`
-	Codex                   *encodedCodex       `json:"codex,omitempty"`
-	Desktop                 *encodedDesktop     `json:"desktop,omitempty"`
-	LocalModels             *encodedLocalModels `json:"local_models,omitempty"`
+	RunnerID            string              `json:"runner_id"`
+	DisplayName         string              `json:"display_name"`
+	Gateway             encodedGateway      `json:"gateway"`
+	StateDirectory      string              `json:"state_directory"`
+	RuntimePaths        map[string]string   `json:"runtime_paths,omitempty"`
+	EnabledRuntimes     json.RawMessage     `json:"enabled_runtimes,omitempty"`
+	PreferredRuntime    string              `json:"preferred_runtime,omitempty"`
+	WorkspaceGrants     []WorkspaceGrant    `json:"workspace_grants"`
+	CredentialExpiresAt string              `json:"credential_expires_at,omitempty"`
+	Codex               *encodedCodex       `json:"codex,omitempty"`
+	Desktop             *encodedDesktop     `json:"desktop,omitempty"`
+	LocalModels         *encodedLocalModels `json:"local_models,omitempty"`
 }
 
 type encodedLocalModels struct {
@@ -99,6 +101,7 @@ type encodedLocalModels struct {
 
 type encodedDesktop struct {
 	TeamHubCLIDirectory string `json:"teamhub_cli_directory,omitempty"`
+	CuaSocket           string `json:"cua_socket,omitempty"`
 }
 
 type encodedCodex struct {
@@ -118,10 +121,15 @@ func Load(path string, environment map[string]string) (Config, error) {
 		return Config{}, fmt.Errorf("read Computer config: %w", err)
 	}
 	var value encodedConfig
-	decoder := json.NewDecoder(strings.NewReader(string(encoded)))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&value); err != nil {
-		return Config{}, fmt.Errorf("decode Computer config: %w", err)
+	if err := decodeConfig(encoded, &value); err != nil {
+		migrated, migrateErr := removeOperationLimit(path, encoded, "")
+		if migrateErr != nil {
+			return Config{}, migrateErr
+		}
+		if migrated == nil {
+			return Config{}, fmt.Errorf("decode Computer config: %w", err)
+		}
+		value = *migrated
 	}
 	if value.RunnerID == "" || value.DisplayName == "" || !filepath.IsAbs(value.StateDirectory) {
 		return Config{}, errors.New("Computer config identity or state directory is invalid")
@@ -141,7 +149,17 @@ func Load(path string, environment map[string]string) (Config, error) {
 		if value.Desktop.TeamHubCLIDirectory != "" && !filepath.IsAbs(value.Desktop.TeamHubCLIDirectory) {
 			return Config{}, errors.New("Computer Desktop TeamHub CLI path is invalid")
 		}
-		desktop = &Desktop{TeamHubCLIDirectory: value.Desktop.TeamHubCLIDirectory}
+		socket := value.Desktop.CuaSocket
+		if socket != "" {
+			if runtime.GOOS != "darwin" {
+				return Config{}, errors.New("desktop.cua_socket requires macOS")
+			}
+			// Darwin's sockaddr_un.sun_path has 104 bytes including the terminator.
+			if !filepath.IsAbs(socket) || filepath.Clean(socket) != socket || socket == "/" || strings.IndexByte(socket, 0) >= 0 || len(socket) >= 104 {
+				return Config{}, errors.New("desktop.cua_socket must be a clean absolute Unix socket path of at most 103 bytes")
+			}
+		}
+		desktop = &Desktop{TeamHubCLIDirectory: value.Desktop.TeamHubCLIDirectory, CuaSocket: socket}
 	}
 	var localModels *LocalModels
 	if value.LocalModels != nil {
@@ -175,9 +193,6 @@ func Load(path string, environment map[string]string) (Config, error) {
 	owners, err := tokenOwners(token, value.RunnerID)
 	if err != nil {
 		return Config{}, err
-	}
-	if value.MaxConcurrentOperations != nil && (*value.MaxConcurrentOperations < 1 || *value.MaxConcurrentOperations > 100) {
-		return Config{}, errors.New("max_concurrent_operations is invalid")
 	}
 	for runtimeType, runtimePath := range value.RuntimePaths {
 		if (runtimeType != "codex" && runtimeType != "claude" && runtimeType != "pi" && runtimeType != "antigravity") || !filepath.IsAbs(runtimePath) {
@@ -218,10 +233,74 @@ func Load(path string, environment map[string]string) (Config, error) {
 	return Config{
 		ComputerID: value.RunnerID, DisplayName: value.DisplayName,
 		GatewayURL: value.Gateway.URL, GatewayToken: token, CodexAuthFile: codexAuthFile(value.Codex), StateDirectory: value.StateDirectory,
-		MaxConcurrentOperations: value.MaxConcurrentOperations, RuntimePaths: value.RuntimePaths,
+		RuntimePaths:    value.RuntimePaths,
 		EnabledRuntimes: enabledRuntimes, PreferredRuntime: value.PreferredRuntime,
 		WorkspaceGrants: value.WorkspaceGrants, Owners: owners, Desktop: desktop, LocalModels: localModels,
 	}, nil
+}
+
+func decodeConfig(encoded []byte, value *encodedConfig) error {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(value)
+}
+
+// SetupLockName protects changes to the Computer's owner configuration.
+const SetupLockName = "setup.lock"
+
+// MigrateSetupConfig upgrades an existing config while setup owns the lock in
+// lockedStateDirectory. A new installation has no config to migrate.
+func MigrateSetupConfig(path, lockedStateDirectory string) error {
+	encoded, err := readOwnerFile(path, 1024*1024)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, err = removeOperationLimit(path, encoded, lockedStateDirectory)
+	return err
+}
+
+func removeOperationLimit(path string, original []byte, lockedStateDirectory string) (*encodedConfig, error) {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(original, &fields) != nil || fields["max_concurrent_operations"] == nil {
+		return nil, nil
+	}
+	delete(fields, "max_concurrent_operations")
+	migrated, err := json.MarshalIndent(fields, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	migrated = append(migrated, '\n')
+	var value encodedConfig
+	if err := decodeConfig(migrated, &value); err != nil {
+		return nil, fmt.Errorf("decode Computer config: %w", err)
+	}
+	if !filepath.IsAbs(value.StateDirectory) {
+		return nil, errors.New("Computer state directory is invalid")
+	}
+	if filepath.Clean(value.StateDirectory) != filepath.Clean(lockedStateDirectory) {
+		if err := privatefs.EnsureDir(value.StateDirectory); err != nil {
+			return nil, err
+		}
+		lock, acquired, err := privatefs.AcquireLock(filepath.Join(value.StateDirectory, SetupLockName))
+		if err != nil {
+			return nil, err
+		}
+		if !acquired {
+			return nil, errors.New("Computer configuration is being updated")
+		}
+		defer privatefs.ReleaseLock(lock)
+	}
+	current, err := readOwnerFile(path, 1024*1024)
+	if err != nil || bytes.Equal(current, migrated) {
+		return &value, err
+	}
+	if !bytes.Equal(current, original) {
+		return nil, errors.New("Computer configuration changed during migration")
+	}
+	return &value, privatefs.WriteFile(path, migrated, false)
 }
 
 func codexAuthFile(value *encodedCodex) string {

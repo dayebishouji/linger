@@ -31,8 +31,18 @@ set -euo pipefail
 #
 # Inputs (environment):
 #   DESKTOP_VERSION              release version, as printed by `version` (compile, package)
+#   DESKTOP_REQUIRE_MACOS_SIGNING
+#                                when `true`, fail darwin-arm64 packaging instead of ad-hoc signing
+#                                if Developer ID or notary credentials are missing
+#   DESKTOP_REQUIRE_UPDATE_KEY   when `true`, fail `manifest` instead of warning if
+#                                DESKTOP_UPDATE_KEY is unset
 #   LINGER_NATIVE_POSTGRES_DIR   where build.mjs reads the bundled archives
 #                                (~/.cache/linger-desktop)
+#   LINGER_BUNDLED_LOCALMODELS_KIT_DIR
+#                                optional directory holding a pre-built <target>.tgz
+#                                localmodels kit archive matching distribution/<target>.json;
+#                                when set, verified and staged as
+#                                dist/installer/bundled-localmodels-kit.tgz (unset by default)
 #   LINGER_NATIVE_DEPS_URL       folder serving those archives by file name; in a GitLab
 #                                CI job it defaults to the project's linger-native-deps package
 #   LINGER_DIAGNOSTICS_UPLOAD_URL
@@ -84,10 +94,12 @@ usage() {
 }
 
 sha256_of() {
+  # Hash stdin: sha256sum escapes a name holding a backslash (a Windows path)
+  # by prefixing the line with one.
   if command -v sha256sum >/dev/null; then
-    sha256sum "$1" | cut -d' ' -f1
+    sha256sum <"$1" | cut -d' ' -f1
   else
-    shasum -a 256 "$1" | cut -d' ' -f1
+    shasum -a 256 <"$1" | cut -d' ' -f1
   fi
 }
 
@@ -193,25 +205,90 @@ out_dir() {
   echo "${RELEASE_OUT:-$repo_root/.linger-runtime/desktop-release}"
 }
 
+bundled_localmodels_kit_pin() {
+  local target="$1"
+  local dist_file="$desktop/distribution/$target.json"
+  [[ -f "$dist_file" ]] || die "missing distribution metadata: $dist_file"
+  node -e '
+    const fs = require("fs");
+    const d = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const t = d && d.localmodelsTool;
+    if (!t || typeof t.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(t.sha256) || !Number.isSafeInteger(t.bytes) || t.bytes <= 0) {
+      process.stderr.write("invalid localmodelsTool pin in " + process.argv[1] + "\n");
+      process.exit(1);
+    }
+    console.log(t.sha256, t.bytes);
+  ' "$dist_file"
+}
+
+verify_bundled_localmodels_kit_file() {
+  local target="$1" file="$2" pin expected_sha expected_bytes actual_bytes actual_sha
+  pin="$(bundled_localmodels_kit_pin "$target")"
+  read -r expected_sha expected_bytes <<<"$pin"
+  if [[ -L "$file" || ! -f "$file" ]]; then
+    die "bundled localmodels kit must be a regular non-symlink file: $file"
+  fi
+  actual_bytes="$(wc -c <"$file" | tr -d ' ')"
+  if [[ "$actual_bytes" != "$expected_bytes" ]]; then
+    die "bundled localmodels kit $file size mismatch for $target: expected $expected_bytes bytes, got $actual_bytes"
+  fi
+  actual_sha="$(sha256_of "$file")"
+  if [[ "$actual_sha" != "$expected_sha" ]]; then
+    die "bundled localmodels kit $file sha256 mismatch for $target: expected $expected_sha, got $actual_sha"
+  fi
+}
+
+verify_bundled_localmodels_kit() {
+  local target="$1" kit_dir="${LINGER_BUNDLED_LOCALMODELS_KIT_DIR:-}" kit
+  [[ -n "${kit_dir//[[:space:]]/}" ]] || return 0
+  kit="${kit_dir%/}/$target.tgz"
+  verify_bundled_localmodels_kit_file "$target" "$kit"
+}
+
+stage_bundled_localmodels_kit() {
+  local target="$1" kit_dir="${LINGER_BUNDLED_LOCALMODELS_KIT_DIR:-}" kit staged
+  staged="$desktop/dist/installer/bundled-localmodels-kit.tgz"
+  if [[ -z "${kit_dir//[[:space:]]/}" ]]; then
+    rm -f "$staged"
+    return 0
+  fi
+  kit="${kit_dir%/}/$target.tgz"
+  verify_bundled_localmodels_kit_file "$target" "$kit"
+  if [[ ! -f "$staged" || -L "$staged" ]]; then
+    rm -f "$staged"
+    mkdir -p "$desktop/dist/installer"
+    cp "$kit" "$staged"
+  fi
+  verify_bundled_localmodels_kit_file "$target" "$staged"
+}
+
 cmd_compile() {
-  local target="${1:-}" version out source
+  local target="${1:-}" version out commit shipped_source full_source
   check_target "$target"
   version="$(release_version)"
+  verify_bundled_localmodels_kit "$target"
   out="$(out_dir)"
+  commit="$(git -C "$repo_root" rev-parse --verify "HEAD^{commit}")"
   rm -rf "$out/source"
-  mkdir -p "$out"
-  node "$repo_root/scripts/prepare-source-archive.mjs" --ref HEAD --output "$out/source"
-  source="$(find "$out/source" -maxdepth 1 -name '*.tar.gz' | head -1)"
-  [[ -n "$source" ]] || die "prepare-source-archive.mjs wrote no archive"
+  mkdir -p "$out/source/shipped" "$out/source/full"
+  node "$repo_root/scripts/prepare-source-archive.mjs" --ref "$commit" --mode minimal --output "$out/source/shipped"
+  node "$repo_root/scripts/prepare-source-archive.mjs" --ref "$commit" --mode full --output "$out/source/full"
+  shipped_source="$(find "$out/source/shipped" -maxdepth 1 -name '*.tar.gz' | head -1)"
+  [[ -n "$shipped_source" ]] || die "prepare-source-archive.mjs wrote no shipped archive"
+  full_source="$(find "$out/source/full" -maxdepth 1 -name '*.tar.gz' | head -1)"
+  [[ -n "$full_source" ]] || die "prepare-source-archive.mjs wrote no full archive"
   set_package_version "$version"
   (
     cd "$desktop"
     rm -rf dist
     LINGER_NATIVE_POSTGRES_DIR="$(native_dir)" \
-      LINGER_SOURCE_ARCHIVE_FILE="$source" \
+      LINGER_BUNDLED_LOCALMODELS_KIT_DIR="${LINGER_BUNDLED_LOCALMODELS_KIT_DIR:-}" \
+      LINGER_SOURCE_ARCHIVE_FILE="$shipped_source" \
+      LINGER_BUILD_SOURCE_ARCHIVE_FILE="$full_source" \
       LINGER_DESKTOP_DAEMON_TARGETS="$target" \
       node build.mjs
   )
+  stage_bundled_localmodels_kit "$target"
 }
 
 ensure_docker_image() {
@@ -237,6 +314,10 @@ ensure_docker_image() {
 
 package_darwin() {
   local version="$1" pkg="$2" assets="$3" args=()
+  if [[ "${DESKTOP_REQUIRE_MACOS_SIGNING:-}" == true ]]; then
+    [[ -n "${MACOS_DEVELOPER_ID_P12:-}" && -n "${MACOS_DEVELOPER_ID_PASSWORD_FILE:-}" && -n "${MACOS_NOTARY_KEY:-}" ]] ||
+      die "MACOS_DEVELOPER_ID_P12, MACOS_DEVELOPER_ID_PASSWORD_FILE, and MACOS_NOTARY_KEY are required when DESKTOP_REQUIRE_MACOS_SIGNING=true (docs/desktop-release.md)"
+  fi
   ensure_docker_image dmgtool "$desktop/packaging/mac"
   args+=(--arch arm64 --rcodesign "${RCODESIGN:-rcodesign}" --out "$pkg")
   if [[ -n "${MACOS_DEVELOPER_ID_P12:-}" ]]; then
@@ -298,6 +379,9 @@ cmd_package() {
 }
 
 cmd_build() {
+  local target="${1:-}"
+  check_target "$target"
+  verify_bundled_localmodels_kit "$target"
   cmd_fetch_native "$@"
   cmd_compile "$@"
   cmd_package "$@"
@@ -320,6 +404,9 @@ cmd_manifest() {
   [[ "$version" =~ $version_pattern ]] || die "manifest needs the release version"
   rm -f "$dir/manifest.json" "$dir/manifest.json.sig"
   if [[ -z "${DESKTOP_UPDATE_KEY:-}" ]]; then
+    if [[ "${DESKTOP_REQUIRE_UPDATE_KEY:-}" == true ]]; then
+      die "DESKTOP_UPDATE_KEY_PEM is required when DESKTOP_REQUIRE_UPDATE_KEY=true (docs/desktop-release.md)"
+    fi
     echo "::warning::DESKTOP_UPDATE_KEY_PEM is not set: this release has no update manifest, so installed apps will not update to $version (docs/desktop-release.md)."
     return 0
   fi
@@ -337,30 +424,40 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const [dir, version, keyFile, source, ...pairs] = process.argv.slice(2);
-const packages = {};
-for (let i = 0; i < pairs.length; i += 2) {
-  const bytes = fs.readFileSync(path.join(dir, pairs[i + 1]));
-  packages[pairs[i]] = {
-    file: pairs[i + 1],
-    sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
-    size: bytes.length,
-  };
+async function sha256Stream(filePath) {
+  const hash = crypto.createHash("sha256");
+  for await (const chunk of fs.createReadStream(filePath)) hash.update(chunk);
+  return hash.digest("hex");
 }
-const manifest = Buffer.from(
-  JSON.stringify({ schema: 2, version, packages }, null, 2) + "\n",
-);
-const key = crypto.createPrivateKey(fs.readFileSync(keyFile));
-const signature = crypto.sign(null, manifest, key);
-const builtIn = /-----BEGIN PUBLIC KEY-----[\s\S]+?-----END PUBLIC KEY-----/.exec(
-  fs.readFileSync(source, "utf8"),
-);
-if (!builtIn || !crypto.verify(null, manifest, crypto.createPublicKey(builtIn[0]), signature)) {
-  console.error("desktop-release: DESKTOP_UPDATE_KEY is not the key of UPDATE_PUBLIC_KEY in update-manifest.ts; installed apps would refuse this manifest");
+(async () => {
+  const packages = {};
+  for (let i = 0; i < pairs.length; i += 2) {
+    const filePath = path.join(dir, pairs[i + 1]);
+    packages[pairs[i]] = {
+      file: pairs[i + 1],
+      sha256: await sha256Stream(filePath),
+      size: fs.statSync(filePath).size,
+    };
+  }
+  const manifest = Buffer.from(
+    JSON.stringify({ schema: 2, version, packages }, null, 2) + "\n",
+  );
+  const key = crypto.createPrivateKey(fs.readFileSync(keyFile));
+  const signature = crypto.sign(null, manifest, key);
+  const builtIn = /-----BEGIN PUBLIC KEY-----[\s\S]+?-----END PUBLIC KEY-----/.exec(
+    fs.readFileSync(source, "utf8"),
+  );
+  if (!builtIn || !crypto.verify(null, manifest, crypto.createPublicKey(builtIn[0]), signature)) {
+    console.error("desktop-release: DESKTOP_UPDATE_KEY is not the key of UPDATE_PUBLIC_KEY in update-manifest.ts; installed apps would refuse this manifest");
+    process.exit(1);
+  }
+  fs.writeFileSync(path.join(dir, "manifest.json"), manifest);
+  fs.writeFileSync(path.join(dir, "manifest.json.sig"), signature.toString("base64") + "\n");
+  console.log(`desktop-release: signed manifest.json for ${version}: ${Object.keys(packages).sort().join(", ")}`);
+})().catch((error) => {
+  console.error(error);
   process.exit(1);
-}
-fs.writeFileSync(path.join(dir, "manifest.json"), manifest);
-fs.writeFileSync(path.join(dir, "manifest.json.sig"), signature.toString("base64") + "\n");
-console.log(`desktop-release: signed manifest.json for ${version}: ${Object.keys(packages).sort().join(", ")}`);
+});
 NODE
     die "could not write the update manifest"
 }
@@ -432,9 +529,9 @@ cmd_github_release() {
     die "publishing to $repo from ${GITHUB_REPOSITORY:-this repository} needs the LINGER_RELEASE_TOKEN secret: a token with contents write access to $repo (docs/desktop-release.md)"
   fi
   command -v gh >/dev/null || die "github-release needs the GitHub CLI (gh)"
-  notes="Linger desktop $version. Check downloads against SHA256SUMS.txt."
+  notes="Linger desktop $version (Beta). Check downloads against SHA256SUMS.txt."
   if [[ "$repo" == "${GITHUB_REPOSITORY:-}" && -n "${GITHUB_SHA:-}" ]]; then
-    notes="Linger desktop $version, built from $GITHUB_SHA. Check downloads against SHA256SUMS.txt."
+    notes="Linger desktop $version (Beta), built from $GITHUB_SHA. Check downloads against SHA256SUMS.txt."
     flags+=(--target "$GITHUB_SHA")
   fi
   if [[ "$version" == *-* ]]; then
@@ -449,7 +546,7 @@ cmd_github_release() {
     gh release upload "$tag" "$dir"/* --repo "$repo" --clobber
     echo "desktop-release: updated the $tag release of $repo"
   else
-    gh release create "$tag" "$dir"/* --repo "$repo" --title "Linger Desktop $version" --notes "$notes" "${flags[@]}"
+    gh release create "$tag" "$dir"/* --repo "$repo" --title "Linger Desktop $version (Beta)" --notes "$notes" "${flags[@]}"
     if [[ "$version" == *-* ]]; then
       echo "desktop-release: created the $tag prerelease of $repo"
     else

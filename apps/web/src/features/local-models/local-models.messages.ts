@@ -43,9 +43,9 @@ export const localModelsMessages = defineMessages("localModels", {
   offlineLibraryLastSeen:
     "<strong>{name} is offline (last seen {time}).</strong> This is what it last reported. Reconnect it in <link>Computers</link> to manage its models.",
   offlineReadOnly:
-    "<strong>{name} is offline.</strong> This is what it last reported.",
+    "<strong>{name} is offline and managed by its owner.</strong> Showing its last report.",
   offlineReadOnlyLastSeen:
-    "<strong>{name} is offline (last seen {time}).</strong> This is what it last reported.",
+    "<strong>{name} is offline (last seen {time}) and managed by its owner.</strong> Showing its last report.",
   readOnlyNotice:
     "Only the person who connected {name} can download, load or remove its models.",
   openComputer: "Open {name}",
@@ -98,6 +98,7 @@ export const localModelsMessages = defineMessages("localModels", {
   statusIdle: "Downloaded",
   statusLoaded: "Loaded",
   statusLoading: "Loading",
+  statusProbingConcurrency: "Probing max concurrency",
   statusUnavailable: "Can't download",
   statusDownloadStopped: "Download stopped",
   endingCancel: "Cancelling",
@@ -106,17 +107,22 @@ export const localModelsMessages = defineMessages("localModels", {
   endingDiscard: "Discarding",
   openChat: "Open chat",
   featured: "Featured",
-  featuredNew: "New",
   featuredSpotlightRegion: "Featured model: Inkling 2 Mini",
   featuredByThinkingMachines: "Featured · Thinking Machines",
-  featuredInklingSummary:
-    "26.4B looped MoE (3.4B active) built for local agentic coding and vision — Apache 2.0.",
   featuredReadAnnouncement: "Read announcement",
   featuredHuggingFace: "Hugging Face",
   featuredNotInCatalog:
-    "Not in this computer's local model catalog yet. Update Linger's local models runtime if you're on an older version.",
+    "Not in this computer's catalog yet. Update Linger to get it.",
   recommended: "Recommended",
+  installedBadge: "Installed",
+  selectedModel: "Selected",
   runsSlower: "runs slower",
+  loadedMemoryHybrid: "{vram} VRAM + {ram} RAM",
+  sectionOnComputer: "Installed",
+  sectionAvailable: "Available",
+  chooseVersion: "Choose version for {name}",
+  variantLabelWithEngine: "{quant} · {engine}",
+  variantOptionDetail: "{label} · {detail}",
   noRoomYet: "no room to load yet",
   loadToAnswer: "load to answer",
   usedByNames: "Used by {names}",
@@ -131,8 +137,8 @@ export const localModelsMessages = defineMessages("localModels", {
   retryModel: "Retry {name}",
   loadModel: "Load {name}",
   unloadModel: "Unload {name}",
-  useForAgentsNamed: "Use {name} for Agents",
-  useForAgents: "Use for Agents",
+  switchToModelNamed: "Switch to {name}",
+  switchModel: "Switch",
   useWithNamed: "Use {model} with {agent}",
   useWith: "Use with {agent}",
   waitForTurn: "Wait for {agent} to finish the current turn",
@@ -152,33 +158,30 @@ export const localModelsMessages = defineMessages("localModels", {
   gatewayPiUnavailable: "Bifrost · Pi unavailable",
   factLastDownload: "Last download",
   factLastLoad: "Last load",
-  factWhyNot: "Why not",
-  factNote: "Note",
   factCapabilities: "Capabilities",
   factPublisher: "Publisher",
   factParameters: "Parameters",
   factEngine: "Engine",
+  factSystem: "System",
   factConcurrency: "Concurrency",
   factMemory: "Memory",
   factSystemMemory: "System memory",
   factOnDisk: "On disk",
   factDownload: "Download",
   factContext: "Context",
-  factVersion: "Version",
-  factSpeed: "Speed",
   factLicense: "License",
   factUsedBy: "Used by",
-  factSource: "Source",
   factGateway: "Gateway",
   factEndpoint: "Endpoint",
   factFreeDisk: "Free disk",
   memoryOn: "{size} on {place}",
+  runtimeMemory: "Runtime memory",
+  diskSpace: "Disk space",
   idleUsedWarning: {
     one: "{names} uses this model. Load it so it can answer.",
     other: "{names} use this model. Load it so they can answer.",
   },
-  downloadNeedsRoom:
-    "This model can download now, but only {free} is free on {pool}. Close memory-heavy apps and recheck memory before loading it.",
+  needsFreeMemory: "Needs {size} free",
   noAgentYet: "No Agent yet",
   switchAgentTo: "Switch an Agent to {name}",
   switchingAgent: "Switching…",
@@ -188,6 +191,8 @@ export const localModelsMessages = defineMessages("localModels", {
   poolInUse: "{pool}: {used} of {total} in use",
   otherApps: "Other apps",
   otherAppsSize: "Other apps · {size}",
+  systemAndEngine: "System & engine",
+  systemAndEngineSize: "System & engine · {size}",
   hardware: "Hardware",
 
   // Confirmations.
@@ -243,8 +248,7 @@ export const localModelsMessages = defineMessages("localModels", {
   modeSubscription: "Subscription",
   sourceByok: "BYOK · {model}",
   sourceSubscription: "Subscription · {runtime}",
-  byokExplanation:
-    "Bring your own key: use your own OpenAI-compatible or Anthropic API endpoint. A gateway on this computer serves it to your Agents.",
+  byokExplanation: "Use your own OpenAI- or Anthropic-compatible endpoint.",
   switched: "Switched.",
   agentsNowUse: "Agents now use {source}.",
   agentsMoved: {
@@ -257,59 +261,28 @@ export const localModelsMessages = defineMessages("localModels", {
   },
   terminateTitle: "End running tasks?",
   terminateDescription: {
-    one: "{names} is working on tasks on {computer}. Switching now ends those tasks; they can't be resumed.",
+    one: "{names} is working on tasks on {computer}. Switching now ends them for good; to keep them, switch later.",
     other:
-      "{names} are working on tasks on {computer}. Switching now ends those tasks; they can't be resumed.",
+      "{names} are working on tasks on {computer}. Switching now ends them for good; to keep them, switch later.",
   },
   terminateDescriptionSome:
-    "Some Agents are working on tasks on {computer}. Switching now ends those tasks; they can't be resumed.",
-  terminateBody: "To keep them, wait until they finish and switch then.",
+    "Some Agents are working on tasks on {computer}. Switching now ends them for good; to keep them, switch later.",
   terminateConfirm: "Terminate tasks & Switch",
   modelSource: "Model source",
   inUse: "In use",
-  switchLocalSingle:
-    "<model>{name}</model> is on this computer and can run your Agents locally.",
-  switchLocalChoose:
-    "Choose a model on this computer to run your Agents locally.",
-  switchLocalDownload: "Download a model below to run your Agents locally.",
-  localOptionLoaded: "{name} · Loaded · {size}",
-  localOptionDownloaded: "{name} · Downloaded · {size}",
-  switchToLocal: "Switch to Local model",
-  aiRuntime: "AI runtime",
-  byokApiAddress: "API address",
-  baseUrl: "Base URL",
-  byokPath: "Path",
-  byokEndpoint: "Endpoint",
-  byokPathHeading: "Path · optional",
-  byokEndpointHeading: "Endpoint · optional",
+  byokUrl: "API URL",
+  byokUrlInvalid: "Enter a full http(s) URL without query parameters.",
+  byokEdit: "Edit",
+  byokChangeKey: "Change",
+  byokKeepSavedKey: "Keep saved",
+  byokKeyNotSet: "Not set",
+  byokKeySavedBadge: "Saved",
   byokShowSuggestions: "Show {label} suggestions",
   byokSuggestions: "{label} suggestions",
-  byokDefaultOption: "{label} · Default",
-  byokPathMostProviders: "Most providers",
-  byokPathZhipu: "Zhipu GLM (base {url})",
-  byokPathVolcano: "Volcano Engine Ark",
-  byokPathNone: "No path. The base URL already has it.",
-  byokEndpointRuntimeDefault: "{protocol} · {runtime} default",
-  byokEndpointNone: "No endpoint. The base URL is the full address.",
-  byokAddressHint:
-    "Base URL from your provider's docs. Path and endpoint are optional: pick one, type your own, or clear it.",
-  byokAddressInvalid:
-    "Path and endpoint take segments like /v1, without spaces, ?, # or \\.",
-  byokSendsTo: "Sends {protocol} requests to <url>{url}</url>",
-  byokSendsToRuntimeFormat:
-    "Sends {protocol} (the {runtime} format) requests to <url>{url}</url>",
-  keySavedHint: "A key is saved on this computer. Leave blank to keep it.",
-  keyOptionalHint:
-    "Optional for an endpoint on this computer or your local network.",
+  keySavedHint: "Saved. Leave blank to keep it.",
   apiKey: "API key",
   model: "Model",
   listModels: "List models",
-  byokListingFrom: "Listing models from {url}…",
-  byokModelsListedFrom: {
-    one: "{count} model listed from {url}.",
-    other: "{count} models listed from {url}.",
-  },
-  byokModelHint: "List the endpoint's models, or type an ID.",
   byokContextTokens: "{tokens}-token context",
   byokContextKilo: "{thousands}K context",
   byokTest: "Test",
@@ -408,24 +381,34 @@ export const localModelsMessages = defineMessages("localModels", {
   shortNeedsMemory: "needs more memory",
   shortNeedsDiskSize: "needs {need} of disk",
   shortNeedsSize: "needs {need}",
+  shortNeedsVram: "needs more VRAM",
+  shortNeedsVramSize: "needs {need} VRAM",
   shortNeedsSystemMemory: "needs more system memory",
   shortNeedsSystemMemorySize: "needs {need} RAM",
   shortUnavailable: "unavailable",
   unavailableMemory: "This computer doesn't have enough memory for it.",
   unavailableMemoryReclaimable:
-    "This computer doesn't have enough memory for it. Close memory-heavy apps and recheck memory.",
+    "This computer doesn't have enough memory for it.",
   unavailableMemorySizes:
     "Needs {need} of memory; this computer has {have} for models.",
   unavailableMemorySizesReclaimable:
-    "Needs {need} of memory; this computer has {have} for models. Close memory-heavy apps and recheck memory.",
+    "Needs {need} of memory; this computer has {have} for models.",
+  unavailableVram:
+    "This computer doesn't have enough GPU memory (VRAM) for it.",
+  unavailableVramReclaimable:
+    "This computer doesn't have enough GPU memory (VRAM) for it.",
+  unavailableVramSizes:
+    "Needs {need} of GPU memory (VRAM); this computer has {have} available.",
+  unavailableVramSizesReclaimable:
+    "Needs {need} of GPU memory (VRAM); this computer has {have} available.",
   unavailableSystemMemory:
     "This computer doesn't have enough system memory (RAM) for it.",
   unavailableSystemMemoryReclaimable:
-    "This computer doesn't have enough system memory (RAM) for it. Close memory-heavy apps and recheck memory.",
+    "This computer doesn't have enough system memory (RAM) for it.",
   unavailableSystemMemorySizes:
     "Needs {need} of system memory (RAM); this computer has {have} available.",
   unavailableSystemMemorySizesReclaimable:
-    "Needs {need} of system memory (RAM); this computer has {have} available. Close memory-heavy apps and recheck memory.",
+    "Needs {need} of system memory (RAM); this computer has {have} available.",
   unavailableDisk: "There isn't enough free disk for it.",
   unavailableDiskSizes: "Needs {need} of disk; {have} is free.",
   unavailableGpuAmd:
@@ -436,10 +419,95 @@ export const localModelsMessages = defineMessages("localModels", {
     "No supported GPU was detected on this computer. Local models require an NVIDIA GPU or Apple Silicon Mac; use BYOK instead.",
   unavailableDriverUpdateVersions:
     "Update your NVIDIA driver: the current driver supports CUDA {detected}, but local models require CUDA {required} or newer.",
+  unavailableDriverUpdateVersionsDriver:
+    "Update your NVIDIA driver to {driver}+ (CUDA {required}). The current driver supports CUDA {detected} — only the graphics driver needs an update, not CUDA Toolkit.",
+  unavailableDriverEngineVersionsDriver:
+    "{engine} requires NVIDIA driver {driver}+ (CUDA {required}). Your driver supports CUDA {detected} — only the graphics driver needs an update, not CUDA Toolkit.",
+  unavailableDriverEngineVersions:
+    "{engine} requires an NVIDIA driver supporting CUDA {required} or newer. Your current driver supports CUDA {detected}.",
+  unavailableDriverEngineRequiredDriver:
+    "{engine} requires NVIDIA driver {driver}+ (CUDA {required}). Only the graphics driver needs an update, not CUDA Toolkit.",
+  unavailableDriverEngineRequiredOnly:
+    "{engine} requires an NVIDIA driver supporting CUDA {required} or newer.",
   unavailableDriverUpdateRequiredOnly:
     "Update your NVIDIA driver: local models require CUDA {required} or newer.",
   unavailableDriverUpdateUnknown:
     "Update your NVIDIA driver to run local models on this computer.",
+  updateDriver: "Update driver",
+  updateDriverAction: "Update driver…",
+  updateDriverNamed: "Update NVIDIA driver for {name}",
+  driverGuide: "Upgrade guide",
+  driverCheckAgain: "Check again",
+  driverDialogTitle: "Update NVIDIA driver",
+  driverDialogGpuLabel: "Graphics card",
+  driverDialogCurrentLabel: "Current",
+  driverDialogRequiredLabel: "Required",
+  driverDialogCurrentDriverCuda: "Driver {driver} · CUDA {cuda}",
+  driverDialogCurrentCudaOnly: "CUDA {cuda}",
+  driverDialogCurrentUnknown: "Not detected",
+  driverDialogRequiredDriverCuda: "Driver {driver}+ · CUDA {cuda}",
+  driverDialogRequiredCudaOnly: "CUDA {cuda}+",
+  driverDialogRequiredLatest: "Latest NVIDIA driver",
+  driverDialogNoToolkitNote: "CUDA Toolkit isn't needed.",
+  driverDialogInstallUpdate: "Install driver update",
+  driverDialogDirectInstallHint:
+    "Installs NVIDIA's signed driver; Windows asks for admin permission.",
+  driverDialogDownloading: "Downloading NVIDIA driver {version}…",
+  driverDialogDownloadingProgress:
+    "Downloading NVIDIA driver {version}… {done} / {total} ({percent}%)",
+  driverDialogVerifying: "Verifying NVIDIA digital signature for {version}…",
+  driverDialogInstalling:
+    "Installing NVIDIA driver {version}… Your screen may blink briefly.",
+  driverDialogRebootRequired:
+    "NVIDIA driver {version} installed. Restart Windows to finish — when you reopen Linger, your GPU will be rechecked automatically.",
+  driverDialogInstallComplete:
+    "NVIDIA driver {version} installed. Rechecking your GPU now…",
+  driverDialogErrorUnsupportedGpu:
+    "Automatic install supports GeForce RTX cards. Use NVIDIA App or Download from NVIDIA below.",
+  driverDialogErrorLookupFailed:
+    "Couldn't reach NVIDIA's driver lookup right now. Try again or use Download from NVIDIA.",
+  driverDialogErrorVersionTooOld:
+    "NVIDIA hasn't published a compatible automatic package for this CUDA requirement yet. Use Download from NVIDIA.",
+  driverDialogErrorDownloadFailed:
+    "The driver download was interrupted. Try again or use Download from NVIDIA.",
+  driverDialogErrorSignatureInvalid:
+    "The downloaded file failed NVIDIA digital signature verification and was deleted for safety. Use Download from NVIDIA.",
+  driverDialogErrorUacCancelled:
+    "Administrator permission was cancelled. Try again or update through NVIDIA App.",
+  driverDialogErrorInstallFailed:
+    "The NVIDIA installer didn't finish. Try again, or use NVIDIA App or Download from NVIDIA.",
+  driverResumeBannerRegion: "NVIDIA driver update status",
+  driverResumeRebootTitle: "Restart Windows to finish the NVIDIA driver update",
+  driverResumeRebootBody:
+    "NVIDIA driver {version} is installed. Restart Windows, then reopen Linger to unlock local models.",
+  driverResumeReadyTitle: "NVIDIA driver {version} is ready",
+  driverResumeReadyBody:
+    "Your local models have been rechecked with the updated driver.",
+  driverResumeReadyModelBody:
+    "Your local models have been rechecked — {model} is ready to download.",
+  driverResumeDownloadModel: "Download {model}",
+  driverResumeDismiss: "Dismiss",
+  driverDialogOpenNvidiaApp: "Open NVIDIA App",
+  driverDialogOpenGfe: "Open GeForce Experience",
+  driverDialogNvidiaAppSteps:
+    "In {app}, open Drivers, download the latest driver, and choose Express Installation. Linger checks again when you return.",
+  driverDialogDownloadOfficial: "Download from NVIDIA",
+  driverDialogWindowsManualHint:
+    "Choose your GPU on NVIDIA's download page, install the latest Game Ready or Studio driver, then return here.",
+  driverDialogCopyGpu: "Copy GPU name",
+  driverDialogLinuxHint:
+    "Run this command in a terminal on {computer}, restart, then click Check again.",
+  driverDialogLinuxUbuntuTab: "Ubuntu / Debian",
+  driverDialogLinuxFedoraTab: "Fedora",
+  driverDialogCopyCommand: "Copy command",
+  driverDialogVerifyHint:
+    "After restarting, confirm the CUDA version at the top right of",
+  driverDialogReadGuide: "Read step-by-step guide",
+  driverDialogReadyBanner:
+    "Your NVIDIA driver now meets the requirement. You can download this model now.",
+  driverDialogLaunchFailed:
+    "Couldn't launch {app} automatically. Use Download from NVIDIA instead.",
+  driverDialogCopyFailed: "Couldn't copy to clipboard.",
   unavailableMissingLibraries:
     "Install the missing system library ({libraries}) on this computer, then click Recheck memory.",
   unavailableGlibcVersions:
@@ -452,36 +520,35 @@ export const localModelsMessages = defineMessages("localModels", {
   hostBlockerRegion: "Local model requirements",
   hostBlockerGpuTitle: "Local models need an NVIDIA GPU or Apple Silicon Mac",
   hostBlockerGpuAmdBody:
-    "This computer has an AMD GPU, which isn't supported for local models yet. Switch to BYOK to connect your own API endpoint instead.",
+    "This computer has an AMD GPU, which isn't supported for local models yet.",
   hostBlockerGpuIntelBody:
-    "This computer has an Intel GPU, which isn't supported for local models yet. Switch to BYOK to connect your own API endpoint instead.",
-  hostBlockerGpuNoneBody:
-    "No supported GPU was found on this computer. Switch to BYOK to connect your own API endpoint instead.",
+    "This computer has an Intel GPU, which isn't supported for local models yet.",
+  hostBlockerGpuNoneBody: "No supported GPU was found on this computer.",
   switchToByok: "Switch to BYOK",
   hostBlockerDriverTitle: "Update the NVIDIA driver to use local models",
   hostBlockerDriverBody:
-    "The installed driver supports CUDA {detected}, while the local model engine requires CUDA {required} or newer. Update the driver, then click Recheck memory.",
+    "The installed driver supports CUDA {detected}, while the local model engine requires CUDA {required} or newer.",
   hostBlockerDriverRequiredOnlyBody:
-    "The local model engine requires an NVIDIA driver with CUDA {required} or newer. Update the driver, then click Recheck memory.",
+    "The local model engine needs an NVIDIA driver with CUDA {required} or newer.",
   hostBlockerDriverUnknownBody:
-    "The installed NVIDIA driver is too old for the local model engine. Update the driver, then click Recheck memory.",
+    "The installed NVIDIA driver is too old for the local model engine.",
   hostBlockerRuntimeTitle:
     "Install missing runtime dependencies to use local models",
   hostBlockerRuntimeLibrariesBody:
-    "This computer is missing {libraries}, required by the local model engine. Install it (for example, libgomp1 on Ubuntu/Debian), then click Recheck memory.",
+    "This computer is missing {libraries} (for example, libgomp1 on Ubuntu/Debian).",
   hostBlockerRuntimeGlibcBody:
     "This system has glibc {detected}, while the local model engine requires glibc {required} or newer.",
   hostBlockerRuntimeGenericBody:
-    "This computer is missing a required system library for the local model engine. Install the missing runtime dependency, then click Recheck memory.",
+    "This computer is missing a system library the local model engine needs.",
   debugBannerRegion: "Debug mode active",
   debugBannerTinyTitle: "Debug mode active (tiny)",
   debugBannerSimulateTitle: "Debug mode active (simulate)",
   debugBannerEnvBody:
-    "LOCALMODELS_DEBUG is set on this computer, overriding the normal model catalog for testing. Unset LOCALMODELS_DEBUG and restart Linger to restore the standard catalog.",
+    "LOCALMODELS_DEBUG is overriding the catalog. Unset it and restart Linger.",
   debugBannerConfigBody:
-    "A local debug config ({path}) is overriding the normal model catalog for testing. Run localmodels debug off or delete that file, then click Recheck memory.",
+    "A debug config ({path}) is overriding the catalog. Run localmodels debug off or delete it.",
   debugBannerConfigBodyHidden:
-    "A local debug config file on this computer is overriding the normal model catalog for testing. Turn off debug mode on that computer to restore the standard catalog.",
+    "A debug config on this computer is overriding the catalog. Turn off debug mode there.",
 
   // A Computer that reports no model library.
   libraryNotReportedTitle: "{computer} hasn't reported local models yet",
@@ -542,19 +609,19 @@ export const localModelsMessages = defineMessages("localModels", {
   guidanceBlockedLoadTitle: "Free memory before loading",
   guidanceBlockedLoadTitleGpu: "Free GPU memory before loading",
   guidanceBlockedLoadBody:
-    "Other apps are holding {other} of memory ({free} of {total} free). Forcing a model into tight memory can freeze the computer. Close video players, games, browsers, or other memory-heavy apps, then click Recheck memory to load it.",
+    "Other apps hold {other} of memory ({free} of {total} free). Close some, then recheck.",
   guidanceBlockedLoadBodyGpu:
-    "Other apps are holding {other} of GPU memory ({free} of {total} free). Forcing a model into tight memory can freeze the computer. Close video players, games, browsers, or other memory-heavy apps, then click Recheck memory to load it.",
+    "Other apps hold {other} of GPU memory ({free} of {total} free). Close some, then recheck.",
   guidanceBlockedDownloadTitle: "Free memory to install a larger model",
   guidanceBlockedDownloadTitleGpu: "Free GPU memory to install a larger model",
   guidanceBlockedDownloadBody:
-    "Other apps are holding {other} of memory ({free} of {total} free), so larger models look unavailable right now. Close unnecessary apps (such as video players, games, or browsers) and click Recheck memory to detect all free memory before installing.",
+    "Other apps hold {other} of memory ({free} of {total} free). Close some, then recheck.",
   guidanceBlockedDownloadBodyGpu:
-    "Other apps are holding {other} of GPU memory ({free} of {total} free), so larger models look unavailable right now. Close unnecessary apps (such as video players, games, or browsers) and click Recheck memory to detect all free memory before installing.",
+    "Other apps hold {other} of GPU memory ({free} of {total} free). Close some, then recheck.",
   guidanceConstrainedTitle: "Other apps are using memory",
   guidanceConstrainedTitleGpu: "Other apps are using GPU memory",
   guidanceConstrainedBody:
-    "Other apps are using {other} of memory ({free} of {total} free). To avoid loading failures or system freezes, close unnecessary apps and click Recheck memory so you can load a better model.",
+    "Other apps hold {other} of memory ({free} of {total} free). Close some, then recheck.",
   guidanceConstrainedBodyGpu:
-    "Other apps are using {other} of GPU memory ({free} of {total} free). To avoid loading failures or system freezes, close unnecessary apps and click Recheck memory so you can load a better model.",
+    "Other apps hold {other} of GPU memory ({free} of {total} free). Close some, then recheck.",
 });

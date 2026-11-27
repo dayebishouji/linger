@@ -30,7 +30,6 @@ export const agentInfoMessages = defineMessages("agentInfo", {
   editInstructions: "Edit instructions",
   instructionsContent: "Instructions content",
   instructionsUnset: UNSET_AGENT_INSTRUCTIONS,
-  instructionsDescription: "Define how your Agent should work and respond.",
   showMore: "Show more",
   showLess: "Show less",
 
@@ -49,35 +48,6 @@ export const agentInfoMessages = defineMessages("agentInfo", {
   agentActions: "Agent actions",
   profileUnavailable: "Agent profile is unavailable.",
 
-  // Skills.
-  skills: "Skills",
-  skillCount: { one: "{count} Skill", other: "{count} Skills" },
-  add: "Add",
-  upload: "Upload",
-  uploadSkill: "Upload Skill",
-  uploadSkillPackage: "Upload Skill package",
-  uploadFormats: "ZIP or SKILL.md",
-  uploadUpgrades: "Same name upgrades this Skill.",
-  sponsorOnlySkills: "Only the Sponsor can change Skills",
-  removeSkill: "Remove {name}",
-  noSkillsTitle: "No Skills added",
-  noSkillsBody:
-    "Add a Skill to give this Agent a repeatable way to handle a task.",
-  showFewerSkills: "Show fewer",
-  showAllSkills: {
-    one: "Show all {count} Skill",
-    other: "Show all {count} Skills",
-  },
-  addSkill: "Add Skill",
-  searchSkills: "Search Skills",
-  loadingSkills: "Loading Skills…",
-  noSkillsMatch: "No Skills match that search.",
-  noMoreSkills: "No more built-in Skills to add.",
-  skillsSaved: "Saved. Future runs will use the new configuration.",
-  skillsLoadIncomplete: "Could not load all Skills. Please retry.",
-  reloadSkillsFirst: "Reload Skill configuration first.",
-  skillOperationFailed: "The Skill operation failed. Please retry.",
-
   // The avatar editor and the profile dialog.
   chooseAvatar: "Choose avatar",
   avatars: "Avatars",
@@ -87,23 +57,8 @@ export const agentInfoMessages = defineMessages("agentInfo", {
   avatarBackgroundColor: "Avatar background color",
   avatarUnusable: "This image could not be used. Try a JPEG, PNG, or WebP.",
   editProfile: "Edit profile",
-  profileDescription: "Update your Agent's name and avatar.",
-  avatarDescription: "Update your Agent's avatar.",
   editAgentName: "Edit agent name",
   avatarSaveFailed: "The avatar could not be saved. Try again.",
-
-  // Choosing a Computer and Runtime for an Agent.
-  placementLabel: "Agent runtime placement",
-  lookingForComputers: "Looking for Local Computers...",
-  computersUnavailable: "Local Computers are unavailable.",
-  noComputerOnline: "No Local Computer online",
-  localRuntime: "Local Runtime",
-  staysOnMachine: "Apps and Skills stay on this machine.",
-  runtimeOption: "{runtime} - {status}",
-  statusSignInRequired: "Sign in required",
-  statusDetectionFailed: "Detection failed",
-  statusUpgradeRequired: "Upgrade required",
-  retryComputers: "Retry Local Computers",
 
   // The Agent's activity list in the side panel.
   activityHistory: "Agent activity history",

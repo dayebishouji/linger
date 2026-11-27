@@ -89,6 +89,15 @@ describe("computer permissions status", () => {
     expect(text).toContain(
       "Computer use (CuaDriver): screen_recording denied, accessibility not_determined",
     );
+    expect(text).toContain(
+      "teamhub computer permissions request --for shell --permissions screen_recording\n",
+    );
+    expect(text).toContain(
+      "teamhub computer permissions request --for computer-use --permissions screen_recording,accessibility\n",
+    );
+    expect(text).toContain(
+      "The managed browser (ui.page and ui.browser) needs none",
+    );
   });
 
   it("says a non-Mac needs no permissions", async () => {
@@ -217,6 +226,47 @@ describe("computer permissions request", () => {
       permissions: status("granted"),
     });
   });
+
+  it.each([
+    [false, true, "computer_one", "permission_requested"],
+    [true, false, "computer_one", "granted"],
+    [true, true, "computer_one", "granted"],
+    [true, true, "computer_two", "permission_requested"],
+  ] as const)(
+    "pins the card owner (embedded at creation %s, at poll %s, computer %s)",
+    async (createdEmbedded, polledEmbedded, computerId, outcome) => {
+      vi.useFakeTimers();
+      const embedded = status("granted");
+      embedded.subjects = (embedded.subjects as Json[]).filter(
+        (group) => group.subject === "linger",
+      );
+      const f = fixture([
+        { ...requested, subject: createdEmbedded ? "linger" : "computer_use" },
+        {
+          computer_id: computerId,
+          permissions: polledEmbedded ? embedded : status("granted"),
+        },
+      ]);
+      const run = runCli(
+        [
+          "computer",
+          "permissions",
+          "request",
+          "--for",
+          "computer-use",
+          "--permissions",
+          "screen_recording",
+          "--wait",
+          "5",
+          "--json",
+        ],
+        f.deps,
+      );
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await run).toBe(0);
+      expect(JSON.parse(f.output.join(""))).toMatchObject({ status: outcome });
+    },
+  );
 
   it("with --wait returns the requested result when time runs out", async () => {
     vi.useFakeTimers();

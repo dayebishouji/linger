@@ -710,7 +710,11 @@ export interface components {
       provider_kind: string;
       reason?: string;
       /** @enum {string} */
-      source?: "codex_rollout" | "claude_transcript";
+      source?:
+        | "codex_rollout"
+        | "claude_transcript"
+        | "pi_session"
+        | "antigravity_transcript";
       snapshot?: components["schemas"]["AgentDebugHistorySnapshot"];
       instructions: components["schemas"]["AgentDebugHistoryInstructions"];
       records: components["schemas"]["AgentDebugHistoryRecord"][];
@@ -1406,7 +1410,11 @@ export interface components {
       /** @enum {string} */
       status: "available" | "unavailable";
       /** @enum {string} */
-      source: "codex_rollout" | "claude_transcript" | "pi_session";
+      source:
+        | "codex_rollout"
+        | "claude_transcript"
+        | "pi_session"
+        | "antigravity_transcript";
       reason?: string;
       blocks: components["schemas"]["AgentDebugHistoryInstructionBlock"][];
     };
@@ -1582,15 +1590,7 @@ export interface components {
      * @enum {string}
      */
     ModelSourceRuntime: "claude" | "codex" | "pi";
-    /** @enum {string} */
-    AgentReasoningEffort:
-      | "none"
-      | "low"
-      | "medium"
-      | "high"
-      | "xhigh"
-      | "max"
-      | "ultra";
+    AgentReasoningEffort: string;
     /**
      * @description Wire format of a BYOK upstream endpoint. The owner's client derives it from the end of the request address, else from the Runtime's own format; the Computer does not probe for it.
      * @enum {string}

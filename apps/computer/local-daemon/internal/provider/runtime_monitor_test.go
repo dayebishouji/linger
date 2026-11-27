@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -101,7 +104,7 @@ func TestRuntimeMonitorRecoversCodexAuthenticationWithoutRestart(t *testing.T) {
 	loginMarker := filepath.Join(root, "logged-in")
 	protocolCount := filepath.Join(root, "protocol-count")
 	script := `#!/bin/sh
-if [ "$1" = "--version" ]; then echo "codex-cli 0.100.0"; exit 0; fi
+if [ "$1" = "--version" ]; then echo "codex-cli 0.171.0"; exit 0; fi
 echo called >> "$PROTOCOL_COUNT"
 read line
 echo '{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex-test"}}'
@@ -209,6 +212,93 @@ func TestRuntimeMonitorSkipsFullRefreshWhileOperationsAreActive(t *testing.T) {
 	}
 	if fullRefreshes != 0 {
 		t.Fatalf("full refreshes = %d, want none while operations are active", fullRefreshes)
+	}
+}
+
+func TestChangedInstallationsNoticesAnInstallOrUpgrade(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX executable fixture")
+	}
+	directory := t.TempDir()
+	agy := filepath.Join(directory, "agy")
+	options := DiscoveryOptions{Environment: map[string]string{"HOME": t.TempDir()}}
+	missing := RuntimeDiagnostic{Type: "antigravity", Status: "not_installed", searchPath: directory}
+	if changed := changedInstallations(t.Context(), []RuntimeDiagnostic{missing}, options, nil); len(changed) != 0 {
+		t.Fatalf("changed = %v before any install", changed)
+	}
+	writeExecutable := func(content string) {
+		t.Helper()
+		staged := filepath.Join(directory, "staged")
+		if err := os.WriteFile(staged, []byte(content), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// npm and the installers replace the file rather than rewrite it.
+		if err := os.Rename(staged, agy); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeExecutable("#!/bin/sh\necho 1.5.0\n")
+	if changed := changedInstallations(t.Context(), []RuntimeDiagnostic{missing}, options, nil); !reflect.DeepEqual(changed, []string{"antigravity"}) {
+		t.Fatalf("changed = %v after install, want antigravity", changed)
+	}
+	canonical, err := canonicalExecutable(agy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := RuntimeDiagnostic{Type: "antigravity", Status: "incompatible", searchPath: directory, ExecutablePath: canonical, executable: info}
+	if changed := changedInstallations(t.Context(), []RuntimeDiagnostic{old}, options, nil); len(changed) != 0 {
+		t.Fatalf("changed = %v for an untouched old install", changed)
+	}
+	writeExecutable("#!/bin/sh\necho 1.5.16\n")
+	if changed := changedInstallations(t.Context(), []RuntimeDiagnostic{old}, options, nil); !reflect.DeepEqual(changed, []string{"antigravity"}) {
+		t.Fatalf("changed = %v after an upgrade in place, want antigravity", changed)
+	}
+}
+
+func TestRuntimeMonitorRediscoversANewInstallWhileOperationsAreActive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX executable fixture")
+	}
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "agy"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	initial := DiscoveryResult{Diagnostics: []RuntimeDiagnostic{
+		{Type: "codex", Status: "ready", Protocol: "app-server", Version: "codex-test"},
+		{Type: "antigravity", Status: "not_installed", Protocol: "acp", searchPath: directory},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var scopes [][]string
+	var published []RuntimeDiagnostic
+	err := MonitorRuntimeDiagnostics(ctx, RuntimeMonitorOptions{
+		Initial: initial, RefreshInterval: 5 * time.Millisecond, FullRefreshEveryTicks: 1_000_000,
+		FullRefreshAllowed: func() bool { return false },
+		Discover: func(_ context.Context, options DiscoveryOptions) (DiscoveryResult, error) {
+			scopes = append(scopes, options.Runtimes)
+			return DiscoveryResult{Diagnostics: []RuntimeDiagnostic{
+				{Type: "codex", Status: "error", Protocol: "app-server"},
+				{Type: "antigravity", Status: "ready", Protocol: "acp", Version: "1.5.16"},
+			}}, nil
+		},
+		OnChanged: func(result DiscoveryResult) error {
+			published = result.Diagnostics
+			cancel()
+			return nil
+		},
+	})
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(scopes, [][]string{{"antigravity"}}) {
+		t.Fatalf("discovery scopes = %v, want one for antigravity", scopes)
+	}
+	if len(published) != 2 || published[0].Status != "ready" || published[1].Status != "ready" {
+		t.Fatalf("published = %+v, want codex kept and antigravity ready", published)
 	}
 }
 
@@ -667,4 +757,794 @@ func TestRuntimeMonitorComparesAgainstTheInitialPublishedResult(t *testing.T) {
 	if len(published) != 1 || len(published[0].Diagnostics[0].Models) != 0 {
 		t.Fatalf("published = %+v", published)
 	}
+}
+
+func TestRuntimeMonitorWithDefaultDiscoverReusesTerminalEnvironmentCache(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX terminal fixture")
+	}
+	root := t.TempDir()
+	binV1 := filepath.Join(root, "bin-v1")
+	binV2 := filepath.Join(root, "bin-v2")
+	for _, dir := range []string{binV1, binV2} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	codexScript := `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "codex-cli 0.171.0"; exit 0; fi
+read initialize
+echo '{"id":1,"result":{"userAgent":"test"}}'
+read initialized
+read request
+case "$request" in
+  *'"method":"model/list"'*) echo '{"id":2,"result":{"data":[{"id":"m1","isDefault":true}],"nextCursor":null}}' ;;
+  *) echo '{"id":2,"result":{"account":{"type":"chatgpt"},"requiresOpenaiAuth":true}}' ;;
+esac
+`
+	for _, dir := range []string{binV1, binV2} {
+		codex := filepath.Join(dir, "codex")
+		if err := os.WriteFile(codex, []byte(codexScript), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		primeTestExecutable(t, codex)
+	}
+
+	zshrc := filepath.Join(root, ".zshrc")
+	if err := os.WriteFile(zshrc, []byte("# initial\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	shellCount := filepath.Join(root, "shell-count")
+	terminalPathFile := filepath.Join(root, "terminal-path")
+	if err := os.WriteFile(terminalPathFile, []byte(binV1+":/usr/bin:/bin\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	shell := filepath.Join(root, "shell")
+	shellScript := `#!/bin/sh
+echo x >> "$SHELL_COUNT"
+IFS= read -r tp < "$TERMINAL_PATH_FILE"
+export PATH="$tp"
+exec /bin/sh -c "$2"
+`
+	if err := os.WriteFile(shell, []byte(shellScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	probeCount := func() int {
+		data, err := os.ReadFile(shellCount)
+		if err != nil {
+			return 0
+		}
+		return strings.Count(string(data), "x")
+	}
+
+	var envMu sync.Mutex
+	currentEnv := map[string]string{
+		"HOME":               root,
+		"SHELL":              shell,
+		"PATH":               "/usr/bin:/bin",
+		"SHELL_COUNT":        shellCount,
+		"TERMINAL_PATH_FILE": terminalPathFile,
+	}
+	resolveOptions := func() DiscoveryOptions {
+		envMu.Lock()
+		defer envMu.Unlock()
+		return DiscoveryOptions{
+			Runtimes:    []string{"codex"},
+			Environment: maps.Clone(currentEnv),
+			Timeout:     10 * time.Second,
+		}
+	}
+
+	cache := NewTerminalEnvironmentCache()
+	initial, err := cache.Discover(t.Context(), resolveOptions())
+	if err != nil || initial.Diagnostics[0].Status != "ready" {
+		t.Fatalf("initial Discover: %+v err=%v", initial, err)
+	}
+	if probeCount() != 1 {
+		t.Fatalf("initial probeCount = %d, want 1", probeCount())
+	}
+
+	// Update overlay env and fire Refresh channel while monitor runs multiple full ticks.
+	// Neither steady ticks, Refresh requests, nor non-PATH overlay env changes may re-run $SHELL.
+	overlayCodexHome := filepath.Join(root, "overlay-codex-home")
+	if err := os.MkdirAll(overlayCodexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	refresh := make(chan struct{}, 1)
+	var resolveCalls atomic.Int32
+	resolveLive := func() DiscoveryOptions {
+		opts := resolveOptions()
+		if resolveCalls.Add(1) >= 2 {
+			opts.Environment["CODEX_HOME"] = overlayCodexHome
+		}
+		return opts
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var onChangedCount atomic.Int32
+	var phase atomic.Int32
+	var changedPaths []string
+
+	err = MonitorRuntimeDiagnostics(ctx, RuntimeMonitorOptions{
+		Initial:               initial,
+		Discovery:             resolveOptions(),
+		ResolveDiscovery:      resolveLive,
+		TerminalEnvironment:   cache,
+		RefreshInterval:       10 * time.Millisecond,
+		FullRefreshEveryTicks: 1,
+		Refresh:               refresh,
+		FullRefreshAllowed: func() bool {
+			switch phase.Load() {
+			case 1:
+				if count := probeCount(); count != 1 {
+					t.Errorf("Refresh wakeup re-ran shell probe: count=%d", count)
+					cancel()
+					return false
+				}
+				phase.Store(2)
+			case 2:
+				if count := probeCount(); count != 1 {
+					t.Errorf("steady full tick re-ran shell probe: count=%d", count)
+					cancel()
+					return false
+				}
+				phase.Store(3)
+				if writeErr := os.WriteFile(terminalPathFile, []byte(binV2+":/usr/bin:/bin\n"), 0o600); writeErr != nil {
+					t.Errorf("write terminalPathFile: %v", writeErr)
+					cancel()
+					return false
+				}
+				if writeErr := os.WriteFile(zshrc, []byte("# updated\n"), 0o600); writeErr != nil {
+					t.Errorf("write zshrc: %v", writeErr)
+					cancel()
+					return false
+				}
+				future := time.Now().Add(2 * time.Second)
+				if chErr := os.Chtimes(zshrc, future, future); chErr != nil {
+					t.Errorf("chtimes zshrc: %v", chErr)
+					cancel()
+					return false
+				}
+			}
+			return true
+		},
+		OnChanged: func(next DiscoveryResult) error {
+			n := onChangedCount.Add(1)
+			changedPaths = append(changedPaths, next.Diagnostics[0].EntryPath)
+			if strings.HasPrefix(next.Diagnostics[0].EntryPath, binV2) {
+				cancel()
+				return nil
+			}
+			// First OnChanged happens once for the overlay envChanged; probeCount must still be 1.
+			if n == 1 {
+				if count := probeCount(); count != 1 {
+					return fmt.Errorf("overlay change re-ran shell probe: count=%d", count)
+				}
+				select {
+				case refresh <- struct{}{}:
+				default:
+				}
+				phase.Store(1)
+				return nil
+			}
+			return fmt.Errorf("unexpected OnChanged #%d with path %q", n, next.Diagnostics[0].EntryPath)
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("monitor exited with %v", err)
+	}
+	if probeCount() != 2 {
+		t.Fatalf("total shell probes = %d, want 2 (1 initial + 1 .zshrc change)", probeCount())
+	}
+	if len(changedPaths) == 0 || changedPaths[len(changedPaths)-1] != filepath.Join(binV2, "codex") {
+		t.Fatalf("changedPaths = %v, want last entry under %s", changedPaths, binV2)
+	}
+}
+
+func TestRuntimeMonitorCreatesInternalTerminalCacheWhenNil(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX terminal fixture")
+	}
+	root := t.TempDir()
+	prevSystemRoot := macApplicationSystemRoot
+	macApplicationSystemRoot = root
+	t.Cleanup(func() { macApplicationSystemRoot = prevSystemRoot })
+	binDir := filepath.Join(root, "term-bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	codex := filepath.Join(binDir, "codex")
+	codexScript := `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "codex-cli 0.171.0"; exit 0; fi
+read initialize
+echo '{"id":1,"result":{"userAgent":"test"}}'
+read initialized
+read request
+case "$request" in
+  *'"method":"model/list"'*) echo '{"id":2,"result":{"data":[{"id":"m1","isDefault":true}],"nextCursor":null}}' ;;
+  *) echo '{"id":2,"result":{"account":{"type":"chatgpt"},"requiresOpenaiAuth":true}}' ;;
+esac
+`
+	if err := os.WriteFile(codex, []byte(codexScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	primeTestExecutable(t, codex)
+
+	shellCount := filepath.Join(root, "shell-count")
+	shell := filepath.Join(root, "shell")
+	shellScript := `#!/bin/sh
+echo x >> "$SHELL_COUNT"
+export PATH="$TERM_BIN:/usr/bin:/bin"
+exec /bin/sh -c "$2"
+`
+	if err := os.WriteFile(shell, []byte(shellScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	primeTestExecutable(t, shell, "SHELL_COUNT="+os.DevNull)
+	options := DiscoveryOptions{
+		Runtimes: []string{"codex"},
+		Environment: map[string]string{
+			"HOME":        root,
+			"SHELL":       shell,
+			"PATH":        "/usr/bin:/bin",
+			"TERM_BIN":    binDir,
+			"SHELL_COUNT": shellCount,
+		},
+		Timeout: 10 * time.Second,
+	}
+	initial := DiscoveryResult{Diagnostics: []RuntimeDiagnostic{{
+		Type: "codex", Status: "not_installed", Protocol: "app-server", Models: []RuntimeModel{},
+	}}}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var changes atomic.Int32
+	var ticks atomic.Int32
+	err := MonitorRuntimeDiagnostics(ctx, RuntimeMonitorOptions{
+		Initial:   initial,
+		Discovery: options,
+		RefreshAllowed: func() bool {
+			if changes.Load() >= 1 && ticks.Add(1) >= 4 {
+				cancel()
+				return false
+			}
+			return true
+		},
+		RefreshInterval:       5 * time.Millisecond,
+		FullRefreshEveryTicks: 1,
+		OnChanged: func(next DiscoveryResult) error {
+			changes.Add(1)
+			return nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("monitor exited with %v, want context.Canceled", err)
+	}
+	data, err := os.ReadFile(shellCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := strings.Count(string(data), "x"); count != 1 {
+		t.Fatalf("internal TerminalEnvironmentCache probed shell %d times, want 1", count)
+	}
+	if changes.Load() != 1 {
+		t.Fatalf("OnChanged called %d times, want 1", changes.Load())
+	}
+}
+
+func TestRuntimeMonitorForceRecapturesTerminalEnvOnExecutableReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX terminal fixture")
+	}
+	root := t.TempDir()
+	prevSystemRoot := macApplicationSystemRoot
+	macApplicationSystemRoot = root
+	t.Cleanup(func() { macApplicationSystemRoot = prevSystemRoot })
+	binDir := filepath.Join(root, "term-bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	makeCodex := func(path, version string) {
+		script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "--version" ]; then echo "codex-cli %s"; exit 0; fi
+read initialize
+echo '{"id":1,"result":{"userAgent":"test"}}'
+read initialized
+read request
+case "$request" in
+  *'"method":"model/list"'*) echo '{"id":2,"result":{"data":[{"id":"m1","isDefault":true}],"nextCursor":null}}' ;;
+  *) echo '{"id":2,"result":{"account":{"type":"chatgpt"},"requiresOpenaiAuth":true}}' ;;
+esac
+`, version)
+		if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		primeTestExecutable(t, path)
+	}
+	codexV1 := filepath.Join(root, "codex-0.171.0")
+	codexV2 := filepath.Join(root, "codex-0.172.0")
+	makeCodex(codexV1, "0.171.0")
+	makeCodex(codexV2, "0.172.0")
+
+	entry := filepath.Join(binDir, "codex")
+	if err := os.Symlink(codexV1, entry); err != nil {
+		t.Fatal(err)
+	}
+
+	shellCount := filepath.Join(root, "shell-count")
+	shell := filepath.Join(root, "shell")
+	shellScript := `#!/bin/sh
+echo x >> "$SHELL_COUNT"
+export PATH="$TERM_BIN:/usr/bin:/bin"
+exec /bin/sh -c "$2"
+`
+	if err := os.WriteFile(shell, []byte(shellScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	primeTestExecutable(t, shell, "SHELL_COUNT="+os.DevNull)
+
+	options := DiscoveryOptions{
+		Runtimes: []string{"codex"},
+		Environment: map[string]string{
+			"HOME":        root,
+			"SHELL":       shell,
+			"PATH":        "/usr/bin:/bin",
+			"TERM_BIN":    binDir,
+			"SHELL_COUNT": shellCount,
+		},
+		Timeout: 10 * time.Second,
+	}
+	probeCount := func() int {
+		data, err := os.ReadFile(shellCount)
+		if err != nil {
+			return 0
+		}
+		return strings.Count(string(data), "x")
+	}
+
+	cache := NewTerminalEnvironmentCache()
+	initial, err := cache.Discover(t.Context(), options)
+	if err != nil || initial.Diagnostics[0].Version != "codex-cli 0.171.0" {
+		t.Fatalf("initial Discover: %+v err=%v", initial, err)
+	}
+	if probeCount() != 1 {
+		t.Fatalf("initial probeCount = %d, want 1", probeCount())
+	}
+
+	// Replace the entry symlink target without editing any watched shell startup file.
+	if err := os.Remove(entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(codexV2, entry); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var updated DiscoveryResult
+	err = MonitorRuntimeDiagnostics(ctx, RuntimeMonitorOptions{
+		Initial:               initial,
+		Discovery:             options,
+		TerminalEnvironment:   cache,
+		RefreshInterval:       5 * time.Millisecond,
+		FullRefreshEveryTicks: 100,
+		OnChanged: func(next DiscoveryResult) error {
+			updated = next
+			cancel()
+			return nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("monitor exited with %v, want context.Canceled", err)
+	}
+	if probeCount() != 2 {
+		t.Fatalf("probeCount = %d, want 2 (forceCapture on executable change)", probeCount())
+	}
+	if updated.Diagnostics[0].Version != "codex-cli 0.172.0" {
+		t.Fatalf("updated diagnostic = %+v, want codex-cli 0.172.0", updated.Diagnostics[0])
+	}
+}
+
+func TestRuntimeMonitorChangedInstallationsReusesTerminalEnvironmentCache(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX terminal fixture")
+	}
+	root := t.TempDir()
+	prevSystemRoot := macApplicationSystemRoot
+	macApplicationSystemRoot = root
+	t.Cleanup(func() { macApplicationSystemRoot = prevSystemRoot })
+	binDir := filepath.Join(root, "term-bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	codexScript := `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "codex-cli 0.171.0"; exit 0; fi
+read initialize
+echo '{"id":1,"result":{"userAgent":"test"}}'
+read initialized
+read request
+case "$request" in
+  *'"method":"model/list"'*) echo '{"id":2,"result":{"data":[{"id":"m1","isDefault":true}],"nextCursor":null}}' ;;
+  *) echo '{"id":2,"result":{"account":{"type":"chatgpt"},"requiresOpenaiAuth":true}}' ;;
+esac
+`
+	stagedCodex := filepath.Join(root, "codex-staged")
+	if err := os.WriteFile(stagedCodex, []byte(codexScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	primeTestExecutable(t, stagedCodex)
+	codex := filepath.Join(binDir, "codex")
+
+	shellCount := filepath.Join(root, "shell-count")
+	shell := filepath.Join(root, "shell")
+	shellScript := `#!/bin/sh
+echo x >> "$SHELL_COUNT"
+export PATH="$TERM_BIN:/usr/bin:/bin"
+exec /bin/sh -c "$2"
+`
+	if err := os.WriteFile(shell, []byte(shellScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	primeTestExecutable(t, shell, "SHELL_COUNT="+os.DevNull)
+	probeCount := func() int {
+		data, err := os.ReadFile(shellCount)
+		if err != nil {
+			return 0
+		}
+		return strings.Count(string(data), "x")
+	}
+
+	options := DiscoveryOptions{
+		Runtimes: []string{"codex"},
+		Environment: map[string]string{
+			"HOME":        root,
+			"SHELL":       shell,
+			"PATH":        "/usr/bin:/bin",
+			"TERM_BIN":    binDir,
+			"SHELL_COUNT": shellCount,
+		},
+		Timeout: 10 * time.Second,
+	}
+	cache := NewTerminalEnvironmentCache()
+	resolvedEnv := cache.Resolve(t.Context(), options.Environment, false)
+	if !strings.HasPrefix(resolvedEnv["PATH"], binDir+":") {
+		t.Fatalf("resolved PATH = %q, want %s prefix", resolvedEnv["PATH"], binDir)
+	}
+	if probeCount() != 1 {
+		t.Fatalf("initial probeCount = %d, want 1", probeCount())
+	}
+
+	initial := DiscoveryResult{Diagnostics: []RuntimeDiagnostic{{
+		Type:       "codex",
+		Status:     "not_installed",
+		Protocol:   "app-server",
+		Models:     []RuntimeModel{},
+		searchPath: binDir,
+	}}}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var ticks atomic.Int32
+	var published DiscoveryResult
+	err := MonitorRuntimeDiagnostics(ctx, RuntimeMonitorOptions{
+		Initial:               initial,
+		Discovery:             options,
+		TerminalEnvironment:   cache,
+		RefreshInterval:       5 * time.Millisecond,
+		FullRefreshEveryTicks: 100,
+		FullRefreshAllowed:    func() bool { return false },
+		RefreshAllowed: func() bool {
+			if ticks.Add(1) == 2 {
+				if renameErr := os.Rename(stagedCodex, codex); renameErr != nil {
+					t.Errorf("install codex: %v", renameErr)
+					cancel()
+					return false
+				}
+			}
+			return true
+		},
+		OnChanged: func(next DiscoveryResult) error {
+			published = next
+			cancel()
+			return nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("monitor exited with %v, want context.Canceled", err)
+	}
+	if probeCount() != 1 {
+		t.Fatalf("probeCount = %d, want 1 (targeted rediscovery reused TerminalEnvironmentCache)", probeCount())
+	}
+	if len(published.Diagnostics) != 1 || published.Diagnostics[0].Status != "ready" ||
+		published.Diagnostics[0].EntryPath != codex ||
+		published.Diagnostics[0].ExecutionPath != resolvedEnv["PATH"] {
+		t.Fatalf("published diagnostics = %+v, want ready codex at %s with PATH %q", published.Diagnostics, codex, resolvedEnv["PATH"])
+	}
+}
+
+func TestChangedInstallationsRespectsBundledPaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX executable fixture")
+	}
+	root := t.TempDir()
+	emptyPath := filepath.Join(root, "empty")
+	bundledBin := filepath.Join(root, "bundled")
+	for _, dir := range []string{emptyPath, bundledBin} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bundledPi := filepath.Join(bundledBin, "pi")
+	missing := RuntimeDiagnostic{Type: "pi", Status: "not_installed", searchPath: emptyPath}
+	options := DiscoveryOptions{
+		BundledPaths: map[string]string{"pi": bundledPi},
+		Environment:  map[string]string{"HOME": filepath.Join(root, "home")},
+	}
+	if changed := changedInstallations(t.Context(), []RuntimeDiagnostic{missing}, options, nil); len(changed) != 0 {
+		t.Fatalf("changed = %v before bundled pi exists", changed)
+	}
+	if err := os.WriteFile(bundledPi, []byte("#!/bin/sh\necho 1.5.2\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if changed := changedInstallations(t.Context(), []RuntimeDiagnostic{missing}, options, nil); !reflect.DeepEqual(changed, []string{"pi"}) {
+		t.Fatalf("changed = %v after bundled pi appears, want [pi]", changed)
+	}
+}
+
+func TestChangedInstallationsRespectsManagedPaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX executable fixture")
+	}
+	root := t.TempDir()
+	emptyPath := filepath.Join(root, "empty")
+	managedBin := filepath.Join(root, "managed")
+	for _, dir := range []string{emptyPath, managedBin} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	managedPi := filepath.Join(managedBin, "pi")
+	missing := RuntimeDiagnostic{Type: "pi", Status: "not_installed", searchPath: emptyPath}
+	options := DiscoveryOptions{
+		ManagedPaths: map[string]string{"pi": managedPi},
+		Environment:  map[string]string{"HOME": filepath.Join(root, "home")},
+	}
+	if changed := changedInstallations(t.Context(), []RuntimeDiagnostic{missing}, options, nil); len(changed) != 0 {
+		t.Fatalf("changed = %v before managed pi exists", changed)
+	}
+	if err := os.WriteFile(managedPi, []byte("#!/bin/sh\necho 1.7.0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if changed := changedInstallations(t.Context(), []RuntimeDiagnostic{missing}, options, nil); !reflect.DeepEqual(changed, []string{"pi"}) {
+		t.Fatalf("changed = %v after managed pi appears, want [pi]", changed)
+	}
+}
+
+func TestRuntimeMonitorBackfillsDeferredRuntimesImmediately(t *testing.T) {
+	if got, want := AllRuntimeTypes(), []string{"codex", "claude", "pi", "antigravity"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("AllRuntimeTypes() = %v, want %v", got, want)
+	}
+	initialPi := RuntimeDiagnostic{
+		Type:           "pi",
+		Status:         "ready",
+		Protocol:       "rpc",
+		Preferred:      true,
+		ExecutablePath: "/bin/pi",
+		Models:         []RuntimeModel{{ID: "fixture/pi", Label: "Pi", AllowedReasoningEffort: []string{}}},
+	}
+	initial := DiscoveryResult{
+		Diagnostics:   []RuntimeDiagnostic{initialPi},
+		Installations: InstallationsFromDiagnostics([]RuntimeDiagnostic{initialPi}),
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	var discoverCalls atomic.Int32
+	var seenRuntimes []string
+	var published DiscoveryResult
+
+	err := MonitorRuntimeDiagnostics(ctx, RuntimeMonitorOptions{
+		Initial:               initial,
+		BackfillRuntimes:      []string{"codex", "claude", "antigravity"},
+		Discovery:             DiscoveryOptions{PreferredRuntime: "pi"},
+		RefreshInterval:       10 * time.Second,
+		FullRefreshEveryTicks: 4,
+		Discover: func(_ context.Context, opts DiscoveryOptions) (DiscoveryResult, error) {
+			discoverCalls.Add(1)
+			seenRuntimes = append([]string(nil), opts.Runtimes...)
+			// Return deferred runtimes out of canonical order to verify MergeRuntimeDiagnostics sorts them.
+			found := []RuntimeDiagnostic{
+				{Type: "antigravity", Status: "not_installed", Protocol: "acp", Models: []RuntimeModel{}},
+				{Type: "claude", Status: "authentication_required", Protocol: "stream-json", ExecutablePath: "/bin/claude", Models: []RuntimeModel{}},
+				{Type: "codex", Status: "ready", Protocol: "app-server", ExecutablePath: "/bin/codex", Models: []RuntimeModel{}},
+			}
+			return DiscoveryResult{Diagnostics: found, Installations: InstallationsFromDiagnostics(found)}, nil
+		},
+		OnChanged: func(next DiscoveryResult) error {
+			published = next
+			cancel()
+			return nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("MonitorRuntimeDiagnostics exited with %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("backfill waited %v instead of running immediately before RefreshInterval", elapsed)
+	}
+	if discoverCalls.Load() != 1 {
+		t.Fatalf("discoverCalls = %d, want 1", discoverCalls.Load())
+	}
+	if want := []string{"codex", "claude", "antigravity"}; !reflect.DeepEqual(seenRuntimes, want) {
+		t.Fatalf("backfill discover runtimes = %v, want %v", seenRuntimes, want)
+	}
+	gotTypes := make([]string, len(published.Diagnostics))
+	for i, d := range published.Diagnostics {
+		gotTypes[i] = d.Type
+	}
+	if want := []string{"codex", "claude", "pi", "antigravity"}; !reflect.DeepEqual(gotTypes, want) {
+		t.Fatalf("merged diagnostic order = %v, want %v", gotTypes, want)
+	}
+	if !published.Diagnostics[2].Preferred || published.Diagnostics[2].ExecutablePath != "/bin/pi" {
+		t.Fatalf("initial preferred pi diagnostic was lost: %+v", published.Diagnostics[2])
+	}
+	for _, kind := range []string{"codex", "claude", "pi"} {
+		if _, ok := published.Installations[kind]; !ok {
+			t.Fatalf("merged installations missing %q: %+v", kind, published.Installations)
+		}
+	}
+	if _, ok := published.Installations["antigravity"]; ok {
+		t.Fatalf("not_installed antigravity unexpectedly in installations: %+v", published.Installations)
+	}
+}
+
+func TestRuntimeMonitorRecoversFromBackfillErrorOnNextTick(t *testing.T) {
+	initialPi := RuntimeDiagnostic{
+		Type:           "pi",
+		Status:         "ready",
+		Protocol:       "rpc",
+		Preferred:      true,
+		ExecutablePath: "/bin/pi",
+		Models:         []RuntimeModel{},
+	}
+	initial := DiscoveryResult{
+		Diagnostics:   []RuntimeDiagnostic{initialPi},
+		Installations: InstallationsFromDiagnostics([]RuntimeDiagnostic{initialPi}),
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	backfillErr := errors.New("backfill discovery failed")
+	var recordedErrors []error
+	var discoverRuntimes [][]string
+	var published DiscoveryResult
+
+	err := MonitorRuntimeDiagnostics(ctx, RuntimeMonitorOptions{
+		Initial:               initial,
+		BackfillRuntimes:      []string{"codex", "claude", "antigravity"},
+		Discovery:             DiscoveryOptions{PreferredRuntime: "pi"},
+		RefreshInterval:       10 * time.Millisecond,
+		FullRefreshEveryTicks: 100,
+		Discover: func(_ context.Context, opts DiscoveryOptions) (DiscoveryResult, error) {
+			discoverRuntimes = append(discoverRuntimes, append([]string(nil), opts.Runtimes...))
+			if len(discoverRuntimes) == 1 {
+				return DiscoveryResult{}, backfillErr
+			}
+			full := []RuntimeDiagnostic{
+				{Type: "codex", Status: "ready", Protocol: "app-server", ExecutablePath: "/bin/codex", Models: []RuntimeModel{}},
+				{Type: "claude", Status: "not_installed", Protocol: "stream-json", Models: []RuntimeModel{}},
+				initialPi,
+				{Type: "antigravity", Status: "not_installed", Protocol: "acp", Models: []RuntimeModel{}},
+			}
+			return DiscoveryResult{Diagnostics: full, Installations: InstallationsFromDiagnostics(full)}, nil
+		},
+		OnError: func(err error) {
+			recordedErrors = append(recordedErrors, err)
+		},
+		OnChanged: func(next DiscoveryResult) error {
+			published = next
+			cancel()
+			return nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("MonitorRuntimeDiagnostics exited with %v, want context.Canceled", err)
+	}
+	if len(recordedErrors) != 1 || !errors.Is(recordedErrors[0], backfillErr) {
+		t.Fatalf("recordedErrors = %v, want [%v]", recordedErrors, backfillErr)
+	}
+	if len(discoverRuntimes) != 2 {
+		t.Fatalf("discover calls = %v, want 2 (backfill then full recovery)", discoverRuntimes)
+	}
+	if want := []string{"codex", "claude", "antigravity"}; !reflect.DeepEqual(discoverRuntimes[0], want) {
+		t.Fatalf("first discover runtimes = %v, want %v", discoverRuntimes[0], want)
+	}
+	if len(discoverRuntimes[1]) != 0 {
+		t.Fatalf("recovery discover runtimes = %v, want empty (full discovery)", discoverRuntimes[1])
+	}
+	if len(published.Diagnostics) != 4 || published.Diagnostics[0].Type != "codex" || published.Diagnostics[2].Type != "pi" {
+		t.Fatalf("recovered diagnostics = %+v", published.Diagnostics)
+	}
+}
+
+func TestRuntimeMonitorDebouncesTransientNotInstalledForReadyRuntime(t *testing.T) {
+	// Simulate a CLI executable that existed when initial ready state was probed,
+	// then briefly disappears (e.g. during self-update) and comes back, vs staying
+	// gone across two consecutive probes.
+	missingPath := filepath.Join(t.TempDir(), "codex")
+	ready := DiscoveryResult{Diagnostics: []RuntimeDiagnostic{{
+		Type: "codex", Status: "ready", Protocol: "app-server",
+		EntryPath: missingPath, ExecutablePath: missingPath,
+		Models: []RuntimeModel{{ID: "gpt-5", Label: "GPT-5", AllowedReasoningEffort: []string{}}},
+	}}}
+	notInstalled := DiscoveryResult{Diagnostics: []RuntimeDiagnostic{{
+		Type: "codex", Status: "not_installed", Protocol: "app-server",
+		Models: []RuntimeModel{},
+		Error:  &DiagnosticError{Code: "RUNTIME_NOT_INSTALLED", Message: "Runtime executable not found"},
+	}}}
+
+	t.Run("single transient not_installed retains ready", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		calls := 0
+		var statuses []string
+		err := MonitorRuntimeDiagnostics(ctx, RuntimeMonitorOptions{
+			Initial: ready, RefreshInterval: 5 * time.Millisecond, FullRefreshEveryTicks: 1,
+			Discover: func(context.Context, DiscoveryOptions) (DiscoveryResult, error) {
+				calls++
+				if calls == 1 {
+					return notInstalled, nil
+				}
+				if calls == 2 {
+					return ready, nil
+				}
+				// A second single transient miss after recovery must also be debounced.
+				if calls == 3 {
+					return notInstalled, nil
+				}
+				cancel()
+				return ready, nil
+			},
+			OnChanged: func(result DiscoveryResult) error {
+				statuses = append(statuses, result.Diagnostics[0].Status)
+				return nil
+			},
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("monitor exited with %v", err)
+		}
+		if len(statuses) != 0 {
+			t.Fatalf("published statuses = %v, want none on single transient not_installed", statuses)
+		}
+	})
+
+	t.Run("two consecutive not_installed probes publish not_installed", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		calls := 0
+		var statuses []string
+		err := MonitorRuntimeDiagnostics(ctx, RuntimeMonitorOptions{
+			Initial: ready, RefreshInterval: 5 * time.Millisecond, FullRefreshEveryTicks: 1,
+			Discover: func(context.Context, DiscoveryOptions) (DiscoveryResult, error) {
+				calls++
+				return notInstalled, nil
+			},
+			OnChanged: func(result DiscoveryResult) error {
+				statuses = append(statuses, result.Diagnostics[0].Status)
+				cancel()
+				return nil
+			},
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("monitor exited with %v", err)
+		}
+		if calls != transientRuntimeFailureThreshold {
+			t.Fatalf("discover calls = %d, want %d", calls, transientRuntimeFailureThreshold)
+		}
+		if !reflect.DeepEqual(statuses, []string{"not_installed"}) {
+			t.Fatalf("published statuses = %v, want [not_installed]", statuses)
+		}
+	})
 }

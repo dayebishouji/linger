@@ -34,6 +34,7 @@ import {
   labView,
   localModel,
   macView,
+  memoryPool,
   modelView,
 } from "./local-models-test-support";
 
@@ -194,7 +195,10 @@ function statuses() {
   return cards().map((item) => {
     const toggle = within(item).getAllByRole("button")[0]!;
     const name = toggle.getAttribute("aria-label")!;
-    return `${name}: ${toggle.textContent.slice(name.length)}`;
+    const statusText =
+      item.querySelector("[data-status-line]")?.textContent ??
+      toggle.textContent.slice(name.length);
+    return `${name}: ${statusText}`;
   });
 }
 
@@ -285,16 +289,21 @@ describe("LocalModelsPage", () => {
     expect(statuses()).toEqual([
       "Qwen3 Coder 30B: Loaded · GPU 0 · 21.4 GB",
       "Gemma 3 27B: Downloaded",
-      "GPT-OSS 20B: Not downloaded · 12.1 GB · Recommended",
-      "Gemma 3 4B: Not downloaded · 3.3 GB",
-      "Llama 3.3 70B: Not downloaded · 42.5 GB · runs slower",
+      "GPT-OSS 20B: 12.1 GB",
+      "Gemma 3 4B: 3.3 GB",
+      "Llama 3.3 70B: 42.5 GB · runs slower",
       "Llama 3.1 405B: Can't download · needs 230 GB",
     ]);
+    expect(
+      within(card("Qwen3 Coder 30B")).getByText("Installed"),
+    ).toBeVisible();
+    expect(within(card("Gemma 3 27B")).getByText("Installed")).toBeVisible();
+    expect(within(card("GPT-OSS 20B")).getByText("Recommended")).toBeVisible();
     expect(
       screen.getByText("22.5 GB of 48 GB GPU memory in use"),
     ).toBeVisible();
     expect(screen.queryByText("Sample data")).not.toBeInTheDocument();
-    // A model that can't be downloaded has no action, only its toggle.
+    // A model that can't be downloaded is dimmed inline under Available with no download action.
     expect(within(card("Llama 3.1 405B")).getAllByRole("button")).toHaveLength(
       1,
     );
@@ -315,6 +324,7 @@ describe("LocalModelsPage", () => {
           family: "other",
           fit,
           id,
+          memory_bytes: gb(4.9),
           name,
           pool: fit === "system" ? "system" : "unified",
           recommended,
@@ -335,17 +345,18 @@ describe("LocalModelsPage", () => {
     await renderPage(fixture, "?computer=computer-mac");
     await findModels();
     expect(statuses()).toEqual([
-      "Spark-X2.6 4B: Not downloaded · 2.6 GB · Recommended",
-      "Qwen3.8 27B: Not downloaded · 2.6 GB",
+      "Spark-X2.6 4B: 2.6 GB",
+      "Qwen3.8 27B: 2.6 GB",
     ]);
+    expect(
+      within(card("Spark-X2.6 4B")).getByText("Recommended"),
+    ).toBeVisible();
+    expect(card("Spark-X2.6 4B")).toHaveAttribute("data-recommended", "true");
 
     cleanup();
     await renderPage(fixture, "?computer=computer-win");
-    await waitFor(() =>
-      expect(statuses()).toEqual([
-        "Qwen3.5 9B: Not downloaded · 2.6 GB · Recommended",
-      ]),
-    );
+    await waitFor(() => expect(statuses()).toEqual(["Qwen3.5 9B: 2.6 GB"]));
+    expect(within(card("Qwen3.5 9B")).getByText("Recommended")).toBeVisible();
   });
 
   it("expands one row at a time to show a model's details", async () => {
@@ -386,7 +397,6 @@ describe("LocalModelsPage", () => {
     ).toBeVisible();
     // A foundation component holds memory but is not a model row.
     expect(dialog).toHaveTextContent("Qwen3 Embedding");
-    expect(dialog).toHaveTextContent("Ubuntu 24.04 · llama.cpp b11370 · CUDA");
     expect(dialog).toHaveTextContent("412 GB");
   });
 
@@ -590,9 +600,7 @@ describe("LocalModelsPage", () => {
 
     publishSnapshot(fixture, labView());
     answer();
-    await waitFor(() =>
-      expect(statusOf("GPT-OSS 20B")).toMatch(/^Not downloaded/),
-    );
+    await waitFor(() => expect(statusOf("GPT-OSS 20B")).toBe("12.1 GB"));
   });
 
   it("discards a stopped download instead of removing it", async () => {
@@ -1298,7 +1306,7 @@ describe("LocalModelsPage", () => {
     )
       .getByText("Memory")
       .closest("div")!;
-    expect(memory).toHaveTextContent(/^Memory230 GB$/);
+    expect(memory).toHaveTextContent(/^Memory230 GBRuntime memory$/);
   });
 
   it("shows a loaded model's endpoint without a gateway model id", async () => {
@@ -1464,7 +1472,7 @@ describe("LocalModelsPage", () => {
     ).toBe("computer-mac");
   });
 
-  it("shows rich model card icons, capability badges, and expanded metadata", async () => {
+  it("shows rich model card icons and keeps metadata in expanded details", async () => {
     const richLab = withModel(labView(), "qwen3-coder-30b:Q4_K_M", {
       active_parameters: "3B",
       architecture: "moe",
@@ -1487,22 +1495,18 @@ describe("LocalModelsPage", () => {
     expect(coderCard).toHaveAttribute("data-status", "loaded");
     const qwenTile = coderCard.querySelector('[data-family="qwen"]');
     expect(qwenTile).toBeInTheDocument();
-    expect(qwenTile).toHaveClass("bg-lavender-500/15", "text-lavender-700");
+    expect(qwenTile).toHaveAttribute("data-brand", "qwen");
+    expect(qwenTile?.querySelector("img")).toBeInTheDocument();
     expect(within(coderCard).getByText("2 Agents")).toBeVisible();
-    expect(within(coderCard).getByText("3B active")).toBeVisible();
-    expect(within(coderCard).getByText("Tool use")).toBeVisible();
-    expect(within(coderCard).getByText("Reasoning")).toBeVisible();
-    expect(within(coderCard).getByText("+1")).toHaveAttribute(
-      "title",
-      "Coding",
-    );
+    expect(within(coderCard).queryByText("3B active")).not.toBeInTheDocument();
 
     const gemmaCard = card("Gemma 3 4B");
     expect(gemmaCard).toHaveAttribute("data-status", "available");
     const gemmaTile = gemmaCard.querySelector('[data-family="gemma"]');
     expect(gemmaTile).toBeInTheDocument();
-    expect(gemmaTile).toHaveClass("bg-bluebell-500/15", "text-bluebell-700");
-    expect(within(gemmaCard).getByText("Vision")).toBeVisible();
+    expect(gemmaTile).toHaveAttribute("data-brand", "gemma");
+    expect(gemmaTile?.querySelector("img")).toBeInTheDocument();
+    expect(within(gemmaCard).queryByText("128K")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Qwen3 Coder 30B" }));
     const details = screen.getByRole("region", {
@@ -1551,11 +1555,9 @@ describe("LocalModelsPage", () => {
         name: "Download GPT-OSS 20B",
       }),
     ).toHaveClass("bg-primary");
-    const badgeGroup = within(recommendedCard)
-      .getByText("Tool use")
-      .closest("div")!;
-    expect(badgeGroup).toHaveClass("flex");
-    expect(badgeGroup).not.toHaveClass("hidden");
+    expect(
+      within(recommendedCard).queryByText("Tool use"),
+    ).not.toBeInTheDocument();
     expect(recommendedCard.firstElementChild).toHaveClass("grid");
     expect(recommendedCard.firstElementChild).not.toHaveClass("flex", "hidden");
 
@@ -2086,7 +2088,7 @@ describe("Model source", () => {
     return { listings, switches, tests };
   }
 
-  it("opens on the source in use and explains BYOK on hover", async () => {
+  it("opens on the source in use, shows a clean saved BYOK card, and explains BYOK on hover", async () => {
     const fixture = setup([labView()]);
     withSource(fixture, byokStatus);
     await renderPage(fixture);
@@ -2098,25 +2100,105 @@ describe("Model source", () => {
     expect(
       within(tabs).getByRole("img", { name: "In use" }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("tooltip")).toHaveTextContent("Bring your own key");
+    expect(screen.getByRole("tooltip")).toHaveTextContent(
+      "Use your own OpenAI- or Anthropic-compatible endpoint.",
+    );
+    // Configured BYOK opens on a compact saved connection summary card.
+    const byokRegion = screen.getByRole("region", { name: "BYOK" });
     expect(
-      screen.getByText("Agents on lab-118 use BYOK · vendor/model"),
+      within(byokRegion).getByRole("heading", { name: "vendor/model" }),
     ).toBeInTheDocument();
+    expect(within(byokRegion).getByText("Selected")).toBeInTheDocument();
+    expect(
+      within(byokRegion).getByText("api.example.com · OpenAI Chat Completions"),
+    ).toBeInTheDocument();
+    expect(
+      within(byokRegion).getByText(
+        "https://api.example.com/v1/chat/completions",
+      ),
+    ).toBeInTheDocument();
+    expect(within(byokRegion).getByText("Saved")).toBeInTheDocument();
+    expect(
+      within(byokRegion).queryByRole("button", { name: "Switch" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("API URL")).not.toBeInTheDocument();
+
+    // Clicking Edit opens the 3-field form cleanly with a masked saved key.
+    fireEvent.click(within(byokRegion).getByRole("button", { name: "Edit" }));
     expect(screen.queryByText(/Stored privately/u)).not.toBeInTheDocument();
     expect(screen.queryByLabelText("API format")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Base URL")).toHaveValue(
-      "https://api.example.com",
-    );
-    expect(screen.getByRole("combobox", { name: "Path" })).toHaveValue("/v1");
-    expect(screen.getByRole("combobox", { name: "Endpoint" })).toHaveValue(
-      "/chat/completions",
-    );
     expect(
-      screen.getByText(/^Sends OpenAI Chat Completions requests to/u),
-    ).toHaveTextContent("https://api.example.com/v1/chat/completions");
+      screen.queryByRole("group", { name: "Provider" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("combobox", { name: "Path" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("combobox", { name: "Endpoint" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("combobox", { name: "AI runtime" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("API URL")).toHaveValue(
+      "https://api.example.com/v1/chat/completions",
+    );
+    expect(screen.getByRole("button", { name: "Change" })).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Test connection" }),
     ).not.toBeInTheDocument();
+
+    // Cancel returns cleanly to the saved connection summary card.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByLabelText("API URL")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "vendor/model" }),
+    ).toBeInTheDocument();
+  });
+
+  it("reserves the model source tabs slot and defers mount memory refresh while model-source is pending", async () => {
+    const fixture = setup([labView()]);
+    let releaseSource!: (response: Response) => void;
+    fixture.runtime.server.on(
+      "GET",
+      switchPath,
+      () =>
+        new Promise<Response>((resolve) => {
+          releaseSource = resolve;
+        }),
+    );
+
+    await renderPage(fixture);
+    await findModels();
+
+    // Library renders immediately while model-source is still in flight; the
+    // tabs slot holds a skeleton without exposing a premature tablist, and
+    // mount auto-refresh waits so it does not compete with model-source.
+    expect(
+      document.querySelector("[data-model-source-tabs-loading]"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("tablist", { name: "Model source" }),
+    ).not.toBeInTheDocument();
+    expect(fixture.refreshes).toEqual([]);
+
+    await reactAct(async () => {
+      releaseSource(
+        Response.json({
+          computer_id: "computer-lab",
+          online: true,
+          status: { ...byokStatus, mode: "local", runtime: "pi" },
+          viewer_is_owner: true,
+        }),
+      );
+    });
+
+    expect(
+      await screen.findByRole("tablist", { name: "Model source" }),
+    ).toBeInTheDocument();
+    expect(
+      document.querySelector("[data-model-source-tabs-loading]"),
+    ).not.toBeInTheDocument();
+    await waitFor(() => expect(fixture.refreshes).toEqual(["computer-lab"]));
   });
 
   it("asks before ending running tasks and switches only once confirmed", async () => {
@@ -2155,7 +2237,7 @@ describe("Model source", () => {
 
     fireEvent.click(await screen.findByRole("tab", { name: "Local model" }));
     fireEvent.click(
-      await screen.findByRole("button", { name: "Switch to Local model" }),
+      await screen.findByRole("button", { name: "Switch to Qwen3 Coder 30B" }),
     );
     const dialog = await screen.findByRole("dialog", {
       name: "End running tasks?",
@@ -2211,12 +2293,17 @@ describe("Model source", () => {
 
     fireEvent.click(await screen.findByRole("tab", { name: "Local model" }));
     fireEvent.click(
-      await screen.findByRole("button", { name: "Switch to Local model" }),
+      await screen.findByRole("button", { name: "Switch to Qwen3 Coder 30B" }),
     );
 
-    expect(
-      await screen.findByText("Agents on lab-118 use Local model"),
-    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        within(screen.getByRole("tab", { name: /Local model/u })).getByRole(
+          "img",
+          { name: "In use" },
+        ),
+      ).toBeInTheDocument(),
+    );
     expect(reads).toBe(2);
   });
 
@@ -2243,7 +2330,10 @@ describe("Model source", () => {
     await renderPage(fixture);
 
     fireEvent.click(await screen.findByRole("tab", { name: /BYOK/u }));
-    expect(await screen.findByLabelText("Model")).toHaveValue("vendor/model");
+    expect(
+      await screen.findByRole("heading", { name: "vendor/model" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Switch" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Test" }));
     const connected = (await screen.findByText("Connected")).closest(
       '[role="status"]',
@@ -2255,11 +2345,14 @@ describe("Model source", () => {
       "https://api.example.com/v1/chat/completions",
     );
 
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByLabelText("Model")).toHaveValue("vendor/model");
     fireEvent.click(screen.getByRole("button", { name: "List models" }));
     fireEvent.click(
       await screen.findByRole("option", { name: "vendor/other" }),
     );
     expect(screen.getByLabelText("Model")).toHaveValue("vendor/other");
+    fireEvent.click(screen.getByRole("button", { name: "Change" }));
     fireEvent.change(screen.getByLabelText("API key"), {
       target: { value: "sk-new" },
     });
@@ -2268,9 +2361,15 @@ describe("Model source", () => {
     );
 
     await waitFor(() => expect(switches).toHaveLength(1));
+    expect(
+      await screen.findByRole("heading", { name: "vendor/other" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Selected")).toBeInTheDocument();
     fireEvent.click(await screen.findByRole("tab", { name: "Local model" }));
     fireEvent.click(screen.getByRole("tab", { name: /BYOK/u }));
-    expect(await screen.findByLabelText("Model")).toHaveValue("vendor/other");
+    expect(
+      await screen.findByRole("heading", { name: "vendor/other" }),
+    ).toBeInTheDocument();
     const address = {
       base_url: "https://api.example.com",
       endpoint: "/chat/completions",
@@ -2286,73 +2385,54 @@ describe("Model source", () => {
       {
         byok: { ...address, api_key: "sk-new", model_id: "vendor/other" },
         mode: "byok",
-        runtime: "claude",
+        runtime: "pi",
       },
     ]);
   });
 
-  it("sends requests to the base URL, path and endpoint as entered", async () => {
+  it("parses full BYOK URLs directly and rejects malformed addresses", async () => {
     const fixture = setup([labView()]);
-    const { listings, tests } = withSource(fixture, unconfigured);
+    const { listings, switches, tests } = withSource(fixture, unconfigured);
+    fixture.runtime.server.on("POST", switchPath, ({ body }) => {
+      switches.push(body);
+      return Response.json({
+        computer_id: "computer-lab",
+        online: true,
+        status: {
+          byok: {
+            base_url: "https://api.anthropic.com",
+            configured: true,
+            endpoint: "/messages",
+            key_saved: true,
+            model_id: "claude-sonnet-4-6",
+            path: "/v1",
+            protocol: "anthropic",
+          },
+          mode: "byok",
+          runtime: "claude",
+        },
+        viewer_is_owner: true,
+      });
+    });
     await renderPage(fixture);
 
     fireEvent.click(await screen.findByRole("tab", { name: /BYOK/u }));
-    const path = screen.getByRole("combobox", { name: "Path" });
-    const endpoint = screen.getByRole("combobox", { name: "Endpoint" });
-    expect(path).toHaveValue("/v1");
-    expect(path).toHaveClass("text-muted-foreground");
-    expect(endpoint).toHaveValue("/messages");
-
-    const baseUrl = screen.getByLabelText("Base URL");
-    fireEvent.change(baseUrl, {
-      target: { value: " https://open.bigmodel.cn/ " },
+    const urlInput = screen.getByLabelText("API URL");
+    fireEvent.change(urlInput, {
+      target: {
+        value: " https://open.bigmodel.cn/api/paas/v4/chat/completions/ ",
+      },
     });
-    fireEvent.blur(baseUrl);
-    expect(baseUrl).toHaveValue("https://open.bigmodel.cn");
-    expect(
-      screen.getByText(/^Sends Anthropic Messages requests to/u),
-    ).toHaveTextContent("https://open.bigmodel.cn/v1/messages");
-
-    fireEvent.click(
-      screen.getByRole("button", { name: "Show Path suggestions" }),
-    );
-    fireEvent.click(
-      await screen.findByRole("option", { name: /^\/api\/paas\/v4 /u }),
-    );
-    expect(path).toHaveValue("/api/paas/v4");
-    expect(path).toHaveClass("text-foreground");
-
-    // An endpoint left at its default follows the Runtime.
-    fireEvent.click(screen.getByRole("combobox", { name: "AI runtime" }));
-    fireEvent.click(await screen.findByRole("option", { name: "Pi" }));
-    expect(endpoint).toHaveValue("/chat/completions");
-    expect(
-      screen.getByText(/^Sends OpenAI Chat Completions requests to/u),
-    ).toHaveTextContent(
+    fireEvent.blur(urlInput);
+    expect(urlInput).toHaveValue(
       "https://open.bigmodel.cn/api/paas/v4/chat/completions",
     );
-
-    // Without an endpoint the address names no format, so Pi's own applies.
-    fireEvent.click(
-      screen.getByRole("button", { name: "Show Endpoint suggestions" }),
-    );
-    fireEvent.click(
-      await screen.findByRole("option", {
-        name: "- No endpoint. The base URL is the full address.",
-      }),
-    );
-    expect(endpoint).toHaveValue("");
-    expect(
-      screen.getByText(
-        /^Sends OpenAI Chat Completions \(the Pi format\) requests to/u,
-      ),
-    ).toHaveTextContent("https://open.bigmodel.cn/api/paas/v4");
 
     fireEvent.click(screen.getByRole("button", { name: "List models" }));
     await waitFor(() => expect(listings).toHaveLength(1));
     expect(listings[0]).toEqual({
       base_url: "https://open.bigmodel.cn",
-      endpoint: "",
+      endpoint: "/chat/completions",
       path: "/api/paas/v4",
       protocol: "openai-chat",
     });
@@ -2365,17 +2445,53 @@ describe("Model source", () => {
     expect(tests[0]).toEqual({
       byok: {
         base_url: "https://open.bigmodel.cn",
-        endpoint: "",
+        endpoint: "/chat/completions",
         model_id: "glm-5",
         path: "/api/paas/v4",
         protocol: "openai-chat",
       },
     });
 
-    // A path carries only segments, never a query.
-    fireEvent.change(path, { target: { value: "/v4?beta=1" } });
+    // Anthropic full URLs infer the anthropic wire protocol and Claude runtime.
+    fireEvent.change(urlInput, {
+      target: { value: "https://api.anthropic.com/v1/messages" },
+    });
+    fireEvent.change(screen.getByLabelText("API key"), {
+      target: { value: "sk-ant-test" },
+    });
+    fireEvent.change(screen.getByLabelText("Model"), {
+      target: { value: "claude-sonnet-4-6" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Save & Switch to BYOK" }),
+    );
+    await waitFor(() => expect(switches).toHaveLength(1));
+    expect(switches[0]).toEqual({
+      byok: {
+        api_key: "sk-ant-test",
+        base_url: "https://api.anthropic.com",
+        endpoint: "/messages",
+        model_id: "claude-sonnet-4-6",
+        path: "/v1",
+        protocol: "anthropic",
+      },
+      mode: "byok",
+      runtime: "claude",
+    });
+
+    // Query parameters are rejected cleanly when editing the saved endpoint.
     expect(
-      screen.getByText(/Path and endpoint take segments like \/v1/u),
+      await screen.findByRole("heading", { name: "claude-sonnet-4-6" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByLabelText("API URL")).toHaveValue(
+      "https://api.anthropic.com/v1/messages",
+    );
+    fireEvent.change(screen.getByLabelText("API URL"), {
+      target: { value: "https://open.bigmodel.cn/api/paas/v4?beta=1" },
+    });
+    expect(
+      screen.getByText(/Enter a full http\(s\) URL without query parameters/u),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Test" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "List models" })).toBeDisabled();
@@ -2386,20 +2502,32 @@ describe("Model source", () => {
     const { listings } = withSource(fixture, byokStatus);
     await renderPage(fixture);
 
-    expect(
-      await screen.findByText("List the endpoint's models, or type an ID."),
-    ).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const listButton = screen.getByRole("button", {
+      name: "List models",
+    });
     expect(listings).toEqual([]);
-    fireEvent.click(screen.getByRole("button", { name: "List models" }));
+    fireEvent.click(listButton);
     expect(
-      await screen.findByText(
-        "2 models listed from https://api.example.com/v1/models.",
-      ),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("option", {
+      await screen.findByRole("option", {
         name: "vendor/model Vendor · 128K context",
       }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("option", { name: "vendor/other" }),
+    ).toBeInTheDocument();
+
+    // Typing filters the portaled model list live so long catalogs stay easy to pick from.
+    fireEvent.change(screen.getByLabelText("Model"), {
+      target: { value: "other" },
+    });
+    expect(
+      screen.queryByRole("option", {
+        name: "vendor/model Vendor · 128K context",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("option", { name: "vendor/other" }),
     ).toBeInTheDocument();
     expect(listings).toEqual([
       {
@@ -2411,10 +2539,13 @@ describe("Model source", () => {
       },
     ]);
 
+    fireEvent.click(screen.getByRole("button", { name: "Change" }));
     fireEvent.change(screen.getByLabelText("API key"), {
       target: { value: "sk-typed" },
     });
-    expect(screen.queryByText(/models listed from/u)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("option", { name: /^vendor\/model/u }),
+    ).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "List models" }));
     await waitFor(() => expect(listings).toHaveLength(2));
     expect(listings[1]).toMatchObject({ api_key: "sk-typed" });
@@ -2433,7 +2564,8 @@ describe("Model source", () => {
     );
     await renderPage(fixture);
 
-    fireEvent.click(await screen.findByRole("button", { name: "List models" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "List models" }));
     expect(
       await screen.findByText(
         "https://api.example.com/v1/models returned HTTP 404: the address or the model was not found.",
@@ -2474,7 +2606,8 @@ describe("Model source", () => {
       }
     }
 
-    fireEvent.click(await screen.findByRole("button", { name: "Test" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Test" }));
     const failed = await screen.findByRole("alert");
     expect(failed).toHaveTextContent("Couldn't connect");
     expect(failed).toHaveTextContent(
@@ -2501,8 +2634,8 @@ describe("Model source", () => {
     fireEvent.click(screen.getByRole("button", { name: "Test" }));
     expect(await screen.findByRole("alert")).toBeInTheDocument();
     // Editing the address withdraws the result it no longer describes.
-    fireEvent.change(screen.getByRole("combobox", { name: "Path" }), {
-      target: { value: "/v2" },
+    fireEvent.change(screen.getByLabelText("API URL"), {
+      target: { value: "https://api.example.com/v2/chat/completions" },
     });
     expect(screen.queryByText("Couldn't connect")).not.toBeInTheDocument();
 
@@ -2544,7 +2677,7 @@ describe("Model source", () => {
 
     fireEvent.click(await screen.findByRole("tab", { name: "Local model" }));
     fireEvent.click(
-      await screen.findByRole("button", { name: "Switch to Local model" }),
+      await screen.findByRole("button", { name: "Switch to Qwen3 Coder 30B" }),
     );
 
     await waitFor(() => expect(switches).toHaveLength(1));
@@ -2606,8 +2739,8 @@ describe("Model source", () => {
       within(tabs).queryByRole("tab", { name: "Subscription" }),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByText("Agents on lab-118 use Subscription · Claude Code"),
-    ).toBeInTheDocument();
+      within(tabs).queryByRole("img", { name: "In use" }),
+    ).not.toBeInTheDocument();
 
     const guidance = await screen.findByRole("complementary", {
       name: "Memory guidance",
@@ -2833,7 +2966,7 @@ describe("Model source", () => {
     );
   });
 
-  it("lets the owner choose a loaded larger model in SwitchToLocalNotice and Use for Agents", async () => {
+  it("lets the owner switch directly on each installed model row and shows a green Selected indicator", async () => {
     const small = localModel({
       id: "spark-4b:Q4_K_M",
       memory_bytes: gb(4),
@@ -2862,6 +2995,11 @@ describe("Model source", () => {
     });
     fixture.runtime.server.on("POST", switchPath, ({ body }) => {
       switches.push(body);
+      const modelId = (body as { local_model_id?: string }).local_model_id;
+      const runtimeModel =
+        modelId === "qwen3.8-27b:IQ3_S"
+          ? "localmodels-library/qwen3.8-27b"
+          : "localmodels-library/spark-4b";
       return Response.json({
         computer_id: "computer-lab",
         online: true,
@@ -2869,7 +3007,7 @@ describe("Model source", () => {
           ...byokStatus,
           mode: "local",
           runtime: "pi",
-          runtime_model: "localmodels-library/spark-4b",
+          runtime_model: runtimeModel,
         },
         viewer_is_owner: true,
       });
@@ -2877,13 +3015,12 @@ describe("Model source", () => {
     await renderPage(fixture);
 
     fireEvent.click(await screen.findByRole("tab", { name: "Local model" }));
-    const modelSelect = await screen.findByRole("combobox", {
-      name: "Local model",
-    });
-    fireEvent.click(modelSelect);
-    fireEvent.click(await screen.findByRole("option", { name: /Spark 4B/u }));
+    expect(
+      screen.queryByRole("button", { name: "Switch to Local model" }),
+    ).not.toBeInTheDocument();
+
     fireEvent.click(
-      screen.getByRole("button", { name: "Switch to Local model" }),
+      await screen.findByRole("button", { name: "Switch to Spark 4B" }),
     );
     await waitFor(() => expect(switches).toHaveLength(1));
     expect(switches[0]).toEqual({
@@ -2891,22 +3028,24 @@ describe("Model source", () => {
       mode: "local",
     });
 
-    // Once on Local model mode running Spark 4B, loaded Qwen3.8 27B offers Use for Agents.
-    const useLarge = await screen.findByRole("button", {
-      name: "Use Qwen3.8 27B for Agents",
-    });
+    // Once on Local model mode running Spark 4B, Spark 4B shows Selected and Qwen3.8 27B offers Switch.
+    expect(within(card("Spark 4B")).getByText("Selected")).toBeVisible();
     expect(
-      screen.queryByRole("button", { name: "Use Spark 4B for Agents" }),
+      screen.queryByRole("button", { name: "Switch to Spark 4B" }),
     ).toBeNull();
-    fireEvent.click(useLarge);
+    const switchLarge = await screen.findByRole("button", {
+      name: "Switch to Qwen3.8 27B",
+    });
+    fireEvent.click(switchLarge);
     await waitFor(() => expect(switches).toHaveLength(2));
     expect(switches[1]).toEqual({
       local_model_id: "qwen3.8-27b:IQ3_S",
       mode: "local",
     });
+    expect(within(card("Qwen3.8 27B")).getByText("Selected")).toBeVisible();
   });
 
-  it("hides Recheck memory and Use for Agents when read-only or offline while keeping one status notice", async () => {
+  it("hides Recheck memory and Switch when read-only or offline while keeping one status notice", async () => {
     const busyView = labView({
       models: [
         modelView(
@@ -2949,7 +3088,7 @@ describe("Model source", () => {
       screen.queryByRole("button", { name: "Recheck memory" }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /Use .* for Agents/u }),
+      screen.queryByRole("button", { name: /^Switch to /u }),
     ).not.toBeInTheDocument();
 
     cleanup();
@@ -2995,9 +3134,14 @@ describe("Model source", () => {
       }),
     );
     fireEvent.click(retry);
-    expect(
-      await screen.findByText("Agents on lab-118 use Local model"),
-    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        within(screen.getByRole("tab", { name: /Local model/u })).getByRole(
+          "img",
+          { name: "In use" },
+        ),
+      ).toBeInTheDocument(),
+    );
   });
 
   it("refetches model source when a Computer comes back online and disables BYOK when offline", async () => {
@@ -3027,13 +3171,14 @@ describe("Model source", () => {
     expect(
       await screen.findByRole("tab", { name: /BYOK/u, selected: true }),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText("Base URL")).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Edit" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Test" })).toBeEnabled();
 
-    // Going offline while viewing BYOK shows the offline notice and disables edits.
+    // Going offline while viewing BYOK shows the offline notice and disables actions.
     publishSnapshot(fixture, offlineLab);
     expect(await screen.findByText(/Reconnect it in/u)).toBeInTheDocument();
-    expect(screen.getByLabelText("Base URL")).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Edit" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Test" })).toBeDisabled();
   });
 
   it("auto-refreshes GPU memory on mount and reconnect, and disables BYOK on 503 LOCAL_COMPUTER_OFFLINE", async () => {
@@ -3054,7 +3199,7 @@ describe("Model source", () => {
     await renderPage(fixture);
 
     // Mount auto-refreshes GPU memory once for an online owned Computer.
-    expect(await screen.findByLabelText("Base URL")).toBeEnabled();
+    expect(await screen.findByRole("button", { name: "Edit" })).toBeEnabled();
     await waitFor(() => expect(fixture.refreshes).toEqual(["computer-lab"]));
 
     // A computers invalidation while the Computer is offline (503 LOCAL_COMPUTER_OFFLINE)
@@ -3066,7 +3211,7 @@ describe("Model source", () => {
     });
 
     await waitFor(() =>
-      expect(screen.getByLabelText("Base URL")).toBeDisabled(),
+      expect(screen.getByRole("button", { name: "Edit" })).toBeDisabled(),
     );
     expect(screen.getByText(/Reconnect it in/u)).toBeVisible();
 
@@ -3080,7 +3225,7 @@ describe("Model source", () => {
     });
 
     await waitFor(() =>
-      expect(screen.getByLabelText("Base URL")).toBeEnabled(),
+      expect(screen.getByRole("button", { name: "Edit" })).toBeEnabled(),
     );
     await waitFor(() => expect(fixture.refreshes).toEqual(["computer-lab"]));
   });
@@ -3101,11 +3246,12 @@ describe("Model source", () => {
 
     const tabs = await screen.findByRole("tablist", { name: "Model source" });
     expect(tabs).toHaveClass("self-start");
-    fireEvent.click(await screen.findByRole("button", { name: "List models" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByText("Saved")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Change" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "List models" }));
     expect(
-      await screen.findByText(
-        "2 models listed from https://api.example.com/v1/models.",
-      ),
+      await screen.findByRole("option", { name: /^vendor\/model/u }),
     ).toBeInTheDocument();
 
     // Any model ID can be typed even when the endpoint listed models.
@@ -3115,17 +3261,15 @@ describe("Model source", () => {
     expect(await screen.findByText("Connected")).toBeInTheDocument();
 
     // Another origin withdraws the result, the listed models and the saved key.
-    const baseUrl = screen.getByLabelText("Base URL");
-    fireEvent.change(baseUrl, {
+    const urlInput = screen.getByLabelText("API URL");
+    fireEvent.change(urlInput, {
       target: { value: "https://other.example.net" },
     });
     expect(screen.queryByText("Connected")).not.toBeInTheDocument();
     expect(
-      screen.getByText("List the endpoint's models, or type an ID."),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByText(/A key is saved on this computer/u),
+      screen.queryByRole("option", { name: /^vendor\/model/u }),
     ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("API key")).not.toHaveAttribute("placeholder");
 
     fireEvent.click(screen.getByRole("button", { name: "Test" }));
     await waitFor(() => expect(tests).toHaveLength(2));
@@ -3139,16 +3283,24 @@ describe("Model source", () => {
       },
     });
 
-    // Saving while already on BYOK clears the typed API key input cleanly.
-    fireEvent.change(baseUrl, { target: { value: "https://api.example.com" } });
+    // Saving while already on BYOK returns cleanly to the saved connection card.
+    fireEvent.change(urlInput, {
+      target: { value: "https://api.example.com/v1/chat/completions" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Change" }));
+    expect(screen.getByLabelText("API key")).toHaveAttribute(
+      "placeholder",
+      "Saved. Leave blank to keep it.",
+    );
     fireEvent.change(screen.getByLabelText("API key"), {
       target: { value: "sk-rotate" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(switches).toHaveLength(1));
-    await waitFor(() =>
-      expect(screen.getByLabelText("API key")).toHaveValue(""),
-    );
+    expect(
+      await screen.findByRole("heading", { name: "vendor/model" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("API key")).not.toBeInTheDocument();
     expect(listings).toHaveLength(1);
   });
 
@@ -3204,7 +3356,7 @@ describe("Model source", () => {
     fireEvent.click(await screen.findByRole("tab", { name: "Local model" }));
     await findModels();
 
-    // A newly loaded model becomes the default target without sticking on the earlier idle one.
+    // A newly loaded model offers Switch right on its row and refreshes Tenant Agents once chosen.
     publishSnapshot(
       fixture,
       labView({
@@ -3213,9 +3365,8 @@ describe("Model source", () => {
       }),
     );
     const readsBeforeSwitch = agentReads;
-    await screen.findByRole("combobox", { name: "Local model" });
     fireEvent.click(
-      screen.getByRole("button", { name: "Switch to Local model" }),
+      await screen.findByRole("button", { name: "Switch to Qwen3.8 27B" }),
     );
     await waitFor(() => expect(switches).toHaveLength(1));
     expect(switches[0]).toEqual({
@@ -3554,7 +3705,7 @@ describe("Model source", () => {
 
     fireEvent.click(await screen.findByRole("tab", { name: /BYOK/u }));
     const submit = await screen.findByRole("button", {
-      name: "Save & Switch to BYOK",
+      name: "Switch",
     });
 
     fireEvent.click(submit);
@@ -3622,7 +3773,7 @@ describe("Model source", () => {
 
       fireEvent.click(await screen.findByRole("tab", { name: /BYOK/u }));
       const submit = await screen.findByRole("button", {
-        name: zhCN.localModels.saveAndSwitch,
+        name: zhCN.localModels.switchModel,
       });
 
       fireEvent.click(submit);
@@ -3680,9 +3831,7 @@ describe("Model source", () => {
     fireEvent.click(
       within(banner).getByRole("button", { name: "Switch to BYOK" }),
     );
-    expect(
-      await screen.findByRole("button", { name: "Save & Switch to BYOK" }),
-    ).toBeVisible();
+    expect(await screen.findByRole("button", { name: "Switch" })).toBeVisible();
   });
 
   it("shows driver update and missing runtime banners with Recheck memory and RAM detail copy", async () => {
@@ -3719,6 +3868,20 @@ describe("Model source", () => {
     );
     expect(banner).toHaveTextContent("CUDA 11.8");
     expect(banner).toHaveTextContent("CUDA 12.4");
+    fireEvent.click(
+      within(banner).getByRole("button", { name: "Update driver…" }),
+    );
+    const driverDialog = await screen.findByRole("dialog", {
+      name: "Update NVIDIA driver",
+    });
+    expect(driverDialog).toHaveTextContent("Driver 525.60 · CUDA 11.8");
+    expect(driverDialog).toHaveTextContent("Driver 550+ · CUDA 12.4");
+    fireEvent.click(within(driverDialog).getByRole("button", { name: "Done" }));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "Update NVIDIA driver" }),
+      ).toBeNull(),
+    );
     await waitFor(() => expect(fixture.refreshes).toEqual(["computer-lab"]));
     fixture.refreshes.length = 0;
     fireEvent.click(
@@ -4041,7 +4204,8 @@ describe("Model source", () => {
       );
     await renderPage(fixture);
 
-    fireEvent.click(await screen.findByRole("button", { name: "List models" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "List models" }));
     expect(
       await screen.findByText(
         "The computer didn't answer in time while checking the endpoint. Try again.",
@@ -4089,28 +4253,21 @@ describe("Model source", () => {
       );
     await renderPage(fixture);
 
-    const listButton = await screen.findByRole("button", {
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const listButton = screen.getByRole("button", {
       name: "List models",
     });
-    const baseUrl = screen.getByLabelText("Base URL");
+    const urlInput = screen.getByLabelText("API URL");
     const modelInput = screen.getByLabelText("Model");
 
     // First models probe is aborted and cleared as soon as the address changes.
     fireEvent.click(listButton);
     await waitFor(() => expect(heldModels).toHaveLength(1));
-    expect(
-      screen.getByText(
-        "Listing models from https://api.example.com/v1/models…",
-      ),
-    ).toBeVisible();
 
-    fireEvent.change(baseUrl, {
+    fireEvent.change(urlInput, {
       target: { value: "https://other.example.net" },
     });
     expect(heldModels[0]!.signal.aborted).toBe(true);
-    expect(
-      screen.getByText("List the endpoint's models, or type an ID."),
-    ).toBeVisible();
 
     // A newer models probe succeeds; settling the stale first probe does not overwrite it or flash an error.
     fireEvent.click(listButton);
@@ -4124,9 +4281,7 @@ describe("Model source", () => {
       );
     });
     expect(
-      await screen.findByText(
-        "1 model listed from https://other.example.net/v1/models.",
-      ),
+      await screen.findByRole("option", { name: /^other\/model/u }),
     ).toBeVisible();
 
     await reactAct(async () => {
@@ -4135,9 +4290,7 @@ describe("Model source", () => {
       );
     });
     expect(
-      screen.getByText(
-        "1 model listed from https://other.example.net/v1/models.",
-      ),
+      screen.getByRole("option", { name: /^other\/model/u }),
     ).toBeVisible();
     expect(screen.queryByText("stale models error")).not.toBeInTheDocument();
     expect(
@@ -4249,12 +4402,8 @@ describe("Featured Inkling 2 Mini spotlight", () => {
 
     const spotlight = spotlightRegion();
     expect(spotlight).toHaveAttribute("data-in-catalog", "true");
-    expect(spotlight).toHaveTextContent("New");
     expect(spotlight).toHaveTextContent("Featured · Thinking Machines");
     expect(spotlight).toHaveTextContent("Inkling 2 Mini");
-    expect(spotlight).toHaveTextContent(
-      "26.4B looped MoE (3.4B active) built for local agentic coding and vision — Apache 2.0.",
-    );
 
     const announcement = within(spotlight).getByRole("link", {
       name: "Read announcement",
@@ -4279,12 +4428,12 @@ describe("Featured Inkling 2 Mini spotlight", () => {
     // Inkling 2 Mini renders once inside the spotlight at the top of Models,
     // without duplicating controls or a second row below.
     expect(statuses()).toEqual([
-      "Inkling 2 Mini: Not downloaded · 16.5 GB",
+      "Inkling 2 Mini: 16.5 GB",
       "Qwen3 Coder 30B: Loaded · GPU 0 · 21.4 GB",
       "Gemma 3 27B: Downloaded",
-      "GPT-OSS 20B: Not downloaded · 12.1 GB · Recommended",
-      "Gemma 3 4B: Not downloaded · 3.3 GB",
-      "Llama 3.3 70B: Not downloaded · 42.5 GB · runs slower",
+      "GPT-OSS 20B: 12.1 GB",
+      "Gemma 3 4B: 3.3 GB",
+      "Llama 3.3 70B: 42.5 GB · runs slower",
       "Llama 3.1 405B: Can't download · needs 230 GB",
     ]);
     expect(
@@ -4296,10 +4445,8 @@ describe("Featured Inkling 2 Mini spotlight", () => {
     expect(inklingCard).toHaveAttribute("data-featured", "true");
     expect(within(inklingCard).queryByText("Featured")).toBeNull();
     const inklingTile = inklingCard.querySelector('[data-family="other"]');
-    expect(inklingTile).toHaveClass(
-      "bg-[var(--app-mention-surface)]",
-      "text-app-info",
-    );
+    expect(inklingTile).toHaveAttribute("data-brand", "thinkingmachines");
+    expect(inklingTile?.querySelector("img")).toBeInTheDocument();
 
     // Clicking Download in the spotlight runs the real download action.
     fireEvent.click(
@@ -4368,11 +4515,7 @@ describe("Featured Inkling 2 Mini spotlight", () => {
         observed_at: "2026-11-13T10:02:00.000Z",
       }),
     );
-    await waitFor(() =>
-      expect(statusOf("Inkling 2 Mini")).toBe(
-        "Not downloaded · 16.5 GB · Recommended",
-      ),
-    );
+    await waitFor(() => expect(statusOf("Inkling 2 Mini")).toBe("16.5 GB"));
     const recommendedRow = within(spotlight).getByRole("article");
     expect(recommendedRow).toHaveAttribute("data-featured", "true");
     expect(recommendedRow).toHaveAttribute("data-recommended", "true");
@@ -4519,7 +4662,7 @@ describe("Featured Inkling 2 Mini spotlight", () => {
     );
     expect(spotlight).toHaveTextContent("Loaded · GPU 1 · 19.2 GB");
     const useButton = await within(spotlight).findByRole("button", {
-      name: "Use Inkling 2 Mini for Agents",
+      name: "Switch to Inkling 2 Mini",
     });
     fireEvent.click(useButton);
     await waitFor(() =>
@@ -4570,7 +4713,7 @@ describe("Featured Inkling 2 Mini spotlight", () => {
     const absentSpotlight = spotlightRegion();
     expect(absentSpotlight).toHaveAttribute("data-in-catalog", "false");
     expect(absentSpotlight).toHaveTextContent(
-      "Not in this computer's local model catalog yet. Update Linger's local models runtime if you're on an older version.",
+      "Not in this computer's catalog yet. Update Linger to get it.",
     );
     expect(within(absentSpotlight).queryByRole("article")).toBeNull();
     expect(
@@ -4673,7 +4816,7 @@ describe("Featured Inkling 2 Mini spotlight", () => {
       }),
     ).toBeVisible();
 
-    // 5. Multiple sibling quant entries spotlight UD-Q4_K_M and keep sibling IQ3_XXS badged below.
+    // 5. Multiple sibling quant entries group into one spotlight card with an inline version switcher.
     cleanup();
     const multiFixture = setup([
       labView({
@@ -4694,13 +4837,12 @@ describe("Featured Inkling 2 Mini spotlight", () => {
     await renderPage(multiFixture);
     await findModels();
 
-    expect(statuses()).toEqual([
-      "Inkling 2 Mini: Not downloaded · 16.5 GB",
-      "Inkling 2 Mini (IQ3_XXS): Not downloaded · 11.4 GB",
-    ]);
-    const siblingCard = card("Inkling 2 Mini (IQ3_XXS)");
-    expect(siblingCard).toHaveAttribute("data-featured", "true");
-    expect(within(siblingCard).getAllByText("Featured")).toHaveLength(1);
+    expect(statuses()).toEqual(["Inkling 2 Mini: 16.5 GB"]);
+    expect(screen.queryByText("Featured")).not.toBeInTheDocument();
+    const versionPicker = within(spotlightRegion()).getByRole("combobox", {
+      name: "Choose version for Inkling 2 Mini",
+    });
+    expect(versionPicker).toHaveTextContent("UD-Q4_K_M");
     fireEvent.click(
       within(spotlightRegion()).getByRole("button", {
         name: "Download Inkling 2 Mini",
@@ -4715,8 +4857,14 @@ describe("Featured Inkling 2 Mini spotlight", () => {
         },
       ]),
     );
+    fireEvent.click(versionPicker);
+    const iq3Option = await screen.findByRole("option", {
+      name: /UD-IQ3_XXS/u,
+    });
+    fireEvent.click(iq3Option);
+    expect(statuses()).toEqual(["Inkling 2 Mini: 11.4 GB"]);
 
-    // 6. On a 16 GB GPU where Q4 is unavailable, spotlight wraps sibling IQ3_XXS.
+    // 6. On a 16 GB GPU where Q4 is unavailable, spotlight defaults to sibling IQ3_XXS.
     cleanup();
     const gpu16Fixture = setup([
       labView({
@@ -4757,7 +4905,12 @@ describe("Featured Inkling 2 Mini spotlight", () => {
       "data-status",
       "available",
     );
-    expect(gpu16Spotlight).toHaveTextContent("Inkling 2 Mini (IQ3_XXS)");
+    expect(gpu16Spotlight).toHaveTextContent("Inkling 2 Mini");
+    expect(
+      within(gpu16Spotlight).getByRole("combobox", {
+        name: "Choose version for Inkling 2 Mini",
+      }),
+    ).toHaveTextContent("UD-IQ3_XXS");
     expect(gpu16Spotlight).toHaveTextContent("11.4 GB");
     fireEvent.click(
       within(gpu16Spotlight).getByRole("button", {
@@ -4841,22 +4994,15 @@ describe("Featured Inkling 2 Mini spotlight", () => {
     await renderPage(setup([view]));
     await findModels();
 
-    const polyCard = card("Inkling 2 Mini (UD-Q4_K_XL)");
-    const llamaCard = card("Inkling 2 Mini (UD-Q4_K_M)");
+    // PolyStrata and llama.cpp Inkling variants group into one Spotlight card with a version switcher.
+    const inklingCard = card("Inkling 2 Mini");
     const legacyCard = card("Qwen 3.8 27B");
 
-    const polyBadge = within(polyCard).getByText("PolyStrata");
+    const polyBadge = within(inklingCard).getByText("PolyStrata");
     expect(polyBadge).toHaveAttribute("data-engine", "polystrata");
     expect(polyBadge).toHaveAttribute(
       "title",
       "PolyStrata 0.2.19-poly.1 · CUDA",
-    );
-
-    const llamaBadge = within(llamaCard).getByText("llama.cpp");
-    expect(llamaBadge).toHaveAttribute("data-engine", "llama.cpp");
-    expect(llamaBadge).toHaveAttribute(
-      "title",
-      "llama.cpp b12588-mix-c0c3de8 · CUDA",
     );
 
     expect(within(legacyCard).queryByText("PolyStrata")).toBeNull();
@@ -4864,53 +5010,563 @@ describe("Featured Inkling 2 Mini spotlight", () => {
 
     // Expand PolyStrata row: Engine, Concurrency, and System memory are shown.
     fireEvent.click(
-      within(polyCard).getByRole("button", {
-        name: "Inkling 2 Mini (UD-Q4_K_XL)",
+      within(inklingCard).getByRole("button", {
+        name: "Inkling 2 Mini",
       }),
     );
-    expect(polyCard).toHaveTextContent("Engine");
-    expect(polyCard).toHaveTextContent("PolyStrata 0.2.19-poly.1 · CUDA");
-    expect(polyCard).toHaveTextContent("Hybrid GPU + RAM expert offload");
-    expect(polyCard).toHaveTextContent("Concurrency");
-    expect(polyCard).toHaveTextContent("1 request at a time");
-    expect(polyCard).toHaveTextContent("System memory");
-    expect(polyCard).toHaveTextContent("19.8 GB");
+    expect(inklingCard).toHaveTextContent("Engine");
+    expect(inklingCard).toHaveTextContent("PolyStrata 0.2.19-poly.1 · CUDA");
+    expect(inklingCard).toHaveTextContent("Hybrid GPU + RAM expert offload");
+    expect(inklingCard).toHaveTextContent("Concurrency");
+    expect(inklingCard).toHaveTextContent("1 request at a time");
+    expect(inklingCard).toHaveTextContent("System memory");
+    expect(inklingCard).toHaveTextContent("19.8 GB");
 
-    // Expand llama.cpp row: Engine and Concurrency are shown, System memory is omitted.
+    // Switching to the sibling llama.cpp variant keeps details open and updates engine facts.
+    // The collapsed pill trigger stays compact (quant only) while dropdown options list both engine & VRAM/RAM.
+    expect(statusOf("Inkling 2 Mini")).toBe(
+      "Loaded · GPU 0 · 16.5 GB VRAM + 19.8 GB RAM",
+    );
+    const versionPicker = within(inklingCard).getByRole("combobox", {
+      name: "Choose version for Inkling 2 Mini",
+    });
+    expect(versionPicker).toHaveTextContent("UD-Q4_K_XL");
+    fireEvent.click(versionPicker);
+    expect(
+      await screen.findByRole("option", {
+        name: /UD-Q4_K_XL · PolyStrata · Loaded · 16\.5 GB VRAM \+ 19\.8 GB RAM/u,
+      }),
+    ).toBeVisible();
     fireEvent.click(
-      within(llamaCard).getByRole("button", {
-        name: "Inkling 2 Mini (UD-Q4_K_M)",
+      await screen.findByRole("option", {
+        name: /UD-Q4_K_M · llama\.cpp · 10 GB · Recommended/u,
       }),
     );
-    expect(llamaCard).toHaveTextContent("llama.cpp b12588-mix-c0c3de8 · CUDA");
-    expect(llamaCard).toHaveTextContent("All-in-VRAM native engine");
-    expect(llamaCard).toHaveTextContent("2 concurrent requests");
-    expect(within(llamaCard).queryByText("System memory")).toBeNull();
-
-    // Details dialog surfaces both host engines from host.engine_label.
-    fireEvent.click(screen.getByRole("button", { name: "Details" }));
-    const dialog = screen.getByRole("dialog");
-    expect(dialog).toHaveTextContent(
-      "Ubuntu 24.04 · llama.cpp b11370 · CUDA + PolyStrata 0.2.19-poly.1 · CUDA",
+    const llamaBadge = within(inklingCard).getByText("llama.cpp");
+    expect(llamaBadge).toHaveAttribute("data-engine", "llama.cpp");
+    expect(llamaBadge).toHaveAttribute(
+      "title",
+      "llama.cpp b12588-mix-c0c3de8 · CUDA",
     );
+    expect(inklingCard).toHaveTextContent(
+      "llama.cpp b12588-mix-c0c3de8 · CUDA",
+    );
+    expect(inklingCard).toHaveTextContent("All-in-VRAM native engine");
+    expect(inklingCard).toHaveTextContent("2 concurrent requests");
+    expect(within(inklingCard).queryByText("System memory")).toBeNull();
 
     // Chinese locale keeps product engine names and translates labels and hints.
     await reactAct(async () => {
       await setLanguage("zh-CN");
     });
-    expect(llamaCard).toHaveTextContent(zhCN.localModels.engineHintLlamaCpp);
-    expect(llamaCard).toHaveTextContent(
+    expect(inklingCard).toHaveTextContent(zhCN.localModels.engineHintLlamaCpp);
+    expect(inklingCard).toHaveTextContent(
       zhCN.localModels.concurrencyMultiple.replace("{count}", "2"),
     );
     fireEvent.click(
-      within(polyCard).getByRole("button", {
-        name: "Inkling 2 Mini (UD-Q4_K_XL)",
+      within(inklingCard).getByRole("combobox", {
+        name: zhCN.localModels.chooseVersion.replace(
+          "{name}",
+          "Inkling 2 Mini",
+        ),
       }),
     );
-    expect(polyCard).toHaveTextContent(zhCN.localModels.factEngine);
-    expect(polyCard).toHaveTextContent(zhCN.localModels.engineHintPolystrata);
-    expect(polyCard).toHaveTextContent(zhCN.localModels.concurrencySingle);
-    expect(polyCard).toHaveTextContent(zhCN.localModels.factSystemMemory);
+    fireEvent.click(
+      await screen.findByRole("option", { name: /UD-Q4_K_XL · PolyStrata/u }),
+    );
+    expect(inklingCard).toHaveTextContent(zhCN.localModels.factEngine);
+    expect(inklingCard).toHaveTextContent(
+      zhCN.localModels.engineHintPolystrata,
+    );
+    expect(inklingCard).toHaveTextContent(zhCN.localModels.concurrencySingle);
+    expect(inklingCard).toHaveTextContent(zhCN.localModels.factSystemMemory);
+  });
+
+  it("presents 16 GB Mac with Ornith 1.5 9B Recommended first, unavailable Spotlight below, and collapsed needs-more-memory disclosure", async () => {
+    const mac16 = macView({
+      models: [
+        modelView(
+          localModel({
+            capabilities: ["vision"],
+            context_tokens: 131_072,
+            download_bytes: gb(6.2),
+            engine: "llama.cpp",
+            family: "other",
+            fit: "unified",
+            id: "ornith-1.5-9b:Q4_K_M",
+            memory_bytes: gb(10.4),
+            name: "Ornith 1.5 9B (Q4_K_M)",
+            parameters: "9B",
+            pool: "unified",
+            quant: "Q4_K_M",
+            recommended: true,
+            source_url: "https://huggingface.co/unsloth/Ornith-1.5-9B-GGUF",
+            vision: true,
+          }),
+        ),
+        modelView(
+          localModel({
+            context_tokens: 65_536,
+            download_bytes: gb(3.3),
+            engine: "llama.cpp",
+            family: "other",
+            fit: "unified",
+            id: "spark-x2.6-4b-q4km:Q4_K_M",
+            memory_bytes: gb(4.9),
+            name: "Spark-X2.6 4B (Q4_K_M)",
+            parameters: "4B",
+            pool: "unified",
+            quant: "Q4_K_M",
+            source_url: "https://huggingface.co/unsloth/Spark-X2.6-4B-GGUF",
+          }),
+        ),
+        modelView(
+          localModel({
+            availability: {
+              downloadable: false,
+              reason: {
+                code: "MEMORY_INSUFFICIENT",
+                have_bytes: gb(13),
+                need_bytes: gb(16.2),
+              },
+            },
+            capabilities: ["vision"],
+            context_tokens: 204_800,
+            download_bytes: gb(11.5),
+            engine: "llama.cpp",
+            fit: "none",
+            id: "inkling-2-mini-iq3xxs:UD-IQ3_XXS",
+            memory_bytes: gb(16.2),
+            name: "Inkling 2 Mini (UD-IQ3_XXS)",
+            pool: undefined,
+            quant: "UD-IQ3_XXS",
+            source_url: "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF",
+            vision: true,
+          }),
+        ),
+        modelView(
+          localModel({
+            availability: {
+              downloadable: false,
+              reason: {
+                code: "MEMORY_INSUFFICIENT",
+                have_bytes: gb(13),
+                need_bytes: gb(21.8),
+              },
+            },
+            capabilities: ["vision"],
+            context_tokens: 131_072,
+            download_bytes: gb(16.2),
+            engine: "llama.cpp",
+            family: "qwen",
+            fit: "none",
+            id: "qwen3.8-27b:UD-Q4_K_M",
+            memory_bytes: gb(21.8),
+            name: "Qwen3.8 27B (UD-Q4_K_M)",
+            parameters: "27B",
+            pool: undefined,
+            quant: "UD-Q4_K_M",
+            source_url: "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF",
+            vision: true,
+          }),
+        ),
+      ],
+    });
+    await renderPage(setup([mac16]));
+    await findModels();
+
+    // Recommended Ornith appears first, followed by Spark and dimmed unavailable Qwen3.8 under one Available section.
+    expect(statuses()).toEqual([
+      "Ornith 1.5 9B: 6.2 GB",
+      "Spark-X2.6 4B: 3.3 GB",
+      "Qwen3.8 27B: Can't download · needs 21.8 GB",
+      "Inkling 2 Mini: Can't download · needs 16.2 GB",
+    ]);
+    const ornithCard = card("Ornith 1.5 9B");
+    expect(within(ornithCard).getByText("Recommended")).toBeVisible();
+    expect(within(ornithCard).queryByText("128K")).not.toBeInTheDocument();
+    expect(within(ornithCard).queryByRole("combobox")).not.toBeInTheDocument();
+    expect(screen.queryByText("llama.cpp")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "1 model needs more memory" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("groups multi-quant models on a 128 GB Mac into single cards with smooth in-place version switching", async () => {
+    const qwen27Repo = "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF";
+    const fixture = setup([
+      macView({
+        models: [
+          modelView(
+            localModel({
+              active_parameters: "3.4B",
+              capabilities: ["vision"],
+              context_tokens: 204_800,
+              download_bytes: gb(16.5),
+              engine: "llama.cpp",
+              fit: "unified",
+              id: "inkling-2-mini:UD-Q4_K_M",
+              memory_bytes: gb(27),
+              name: "Inkling 2 Mini (UD-Q4_K_M)",
+              pool: "unified",
+              quant: "UD-Q4_K_M",
+              source_url: "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF",
+              state: "loaded",
+              vision: true,
+            }),
+            ["Another Me"],
+          ),
+          modelView(
+            localModel({
+              active_parameters: "3.4B",
+              capabilities: ["vision"],
+              context_tokens: 204_800,
+              download_bytes: gb(11.5),
+              engine: "llama.cpp",
+              fit: "unified",
+              id: "inkling-2-mini-iq3xxs:UD-IQ3_XXS",
+              memory_bytes: gb(16.2),
+              name: "Inkling 2 Mini (UD-IQ3_XXS)",
+              pool: "unified",
+              quant: "UD-IQ3_XXS",
+              source_url: "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF",
+              vision: true,
+            }),
+          ),
+          modelView(
+            localModel({
+              capabilities: ["vision"],
+              context_tokens: 204_800,
+              download_bytes: gb(16.2),
+              engine: "llama.cpp",
+              family: "qwen",
+              fit: "unified",
+              id: "qwen3.8-27b:UD-Q4_K_M",
+              memory_bytes: gb(21.8),
+              name: "Qwen3.8 27B (UD-Q4_K_M)",
+              parameters: "27B",
+              pool: "unified",
+              quant: "UD-Q4_K_M",
+              recommended: true,
+              source_url: qwen27Repo,
+              vision: true,
+            }),
+          ),
+          modelView(
+            localModel({
+              capabilities: ["vision"],
+              context_tokens: 204_800,
+              download_bytes: gb(12.1),
+              engine: "llama.cpp",
+              family: "qwen",
+              fit: "unified",
+              id: "qwen3.8-27b-iq3s:UD-IQ3_S",
+              memory_bytes: gb(17.5),
+              name: "Qwen3.8 27B (UD-IQ3_S)",
+              parameters: "27B",
+              pool: "unified",
+              quant: "UD-IQ3_S",
+              source_url: qwen27Repo,
+              vision: true,
+            }),
+          ),
+        ],
+      }),
+    ]);
+    await renderPage(fixture);
+    await findModels();
+
+    // Only 2 grouped cards (Spotlight Inkling + Qwen3.8 27B), zero duplicate Featured rows, zero llama.cpp noise.
+    expect(statuses()).toEqual([
+      "Inkling 2 Mini: Loaded · Memory · 27 GB",
+      "Qwen3.8 27B: 16.2 GB",
+    ]);
+    expect(screen.queryByText("llama.cpp")).not.toBeInTheDocument();
+
+    // Expanding Qwen3.8 27B and switching its version keeps details open and targets the selected quant on Download.
+    const qwenCard = card("Qwen3.8 27B");
+    fireEvent.click(
+      within(qwenCard).getByRole("button", { name: "Qwen3.8 27B" }),
+    );
+    expect(
+      screen.getByRole("region", { name: "Qwen3.8 27B (UD-Q4_K_M) details" }),
+    ).toHaveTextContent("21.8 GB");
+    fireEvent.click(
+      within(qwenCard).getByRole("combobox", {
+        name: "Choose version for Qwen3.8 27B",
+      }),
+    );
+    fireEvent.click(await screen.findByRole("option", { name: /UD-IQ3_S/u }));
+    expect(
+      screen.getByRole("region", { name: "Qwen3.8 27B (UD-IQ3_S) details" }),
+    ).toHaveTextContent("17.5 GB");
+    expect(statusOf("Qwen3.8 27B")).toBe("12.1 GB");
+    fireEvent.click(
+      within(qwenCard).getByRole("button", {
+        name: "Download Qwen3.8 27B (UD-IQ3_S)",
+      }),
+    );
+    await waitFor(() =>
+      expect(fixture.actions).toEqual([
+        {
+          body: { action: "download" },
+          computerId: "computer-mac",
+          modelId: "qwen3.8-27b-iq3s:UD-IQ3_S",
+        },
+      ]),
+    );
+  });
+
+  it("shows hybrid VRAM + RAM footprints on Windows/Linux NVIDIA PolyStrata rows and actionable driver-upgrade spotlights", async () => {
+    const win24 = labView({
+      computer: {
+        ...labView().computer,
+        computer_id: "computer-win24",
+        display_name: "Win RTX 4090",
+        host: {
+          ...labView().computer.host!,
+          engine_label:
+            "llama.cpp b12588 · CUDA + PolyStrata 0.2.19-poly.1 · CUDA",
+          gpus: [
+            {
+              free_bytes: gb(23),
+              index: 0,
+              name: "RTX 4090",
+              total_bytes: gb(24),
+            },
+          ],
+          os_label: "Windows 11",
+          platform: "windows",
+          ram_total_bytes: gb(64),
+        },
+      },
+      models: [
+        modelView(
+          localModel({
+            active_parameters: "3.4B",
+            capabilities: ["vision"],
+            concurrency: 1,
+            context_tokens: 131_072,
+            download_bytes: gb(17),
+            engine: "polystrata",
+            engine_label: "PolyStrata 0.2.19-poly.1 · CUDA",
+            fit: "gpu",
+            host_ram_bytes: gb(5.7),
+            id: "inkling-2-mini-q4-poly:UD-Q4_K_XL",
+            memory_bytes: gb(21.1),
+            name: "Inkling 2 Mini (UD-Q4_K_XL)",
+            pool: "gpu:0",
+            quant: "UD-Q4_K_XL",
+            recommended: true,
+            source_url: "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF",
+            vision: true,
+          }),
+        ),
+        modelView(
+          localModel({
+            active_parameters: "3.4B",
+            capabilities: ["vision"],
+            concurrency: 2,
+            context_tokens: 131_072,
+            download_bytes: gb(16.5),
+            engine: "llama.cpp",
+            engine_label: "llama.cpp b12588 · CUDA",
+            fit: "gpu",
+            id: "inkling-2-mini:UD-Q4_K_M",
+            memory_bytes: gb(22),
+            name: "Inkling 2 Mini (UD-Q4_K_M)",
+            pool: "gpu:0",
+            quant: "UD-Q4_K_M",
+            source_url: "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF",
+            vision: true,
+          }),
+        ),
+        modelView(
+          localModel({
+            capabilities: ["vision"],
+            context_tokens: 131_072,
+            download_bytes: gb(16.2),
+            engine: "llama.cpp",
+            family: "qwen",
+            fit: "gpu",
+            id: "qwen3.8-27b:UD-Q4_K_M",
+            memory_bytes: gb(21.7),
+            name: "Qwen3.8 27B (UD-Q4_K_M)",
+            parameters: "27B",
+            pool: "gpu:0",
+            quant: "UD-Q4_K_M",
+            source_url: "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF",
+            vision: true,
+          }),
+        ),
+        modelView(
+          localModel({
+            context_tokens: 199_680,
+            download_bytes: gb(4.2),
+            engine: "llama.cpp",
+            family: "other",
+            fit: "gpu",
+            id: "spark-x2.6-4b:Q8_0",
+            memory_bytes: gb(8.9),
+            name: "Spark-X2.6 4B (Q8_0)",
+            parameters: "4B",
+            pool: "gpu:0",
+            quant: "Q8_0",
+            source_url: "https://huggingface.co/unsloth/Spark-X2.6-4B-GGUF",
+          }),
+        ),
+      ],
+      pools: [gpuPool(0, 24), memoryPool("system", 51.2)],
+    });
+
+    await renderPage(setup([win24]));
+    await findModels();
+
+    expect(statuses()).toEqual([
+      "Inkling 2 Mini: 17 GB",
+      "Qwen3.8 27B: 16.2 GB",
+      "Spark-X2.6 4B: 4.2 GB",
+    ]);
+    const inklingCard = card("Inkling 2 Mini");
+    expect(within(inklingCard).getByText("Recommended")).toBeVisible();
+    expect(within(inklingCard).getByText("PolyStrata")).toBeVisible();
+    const picker = within(inklingCard).getByRole("combobox", {
+      name: "Choose version for Inkling 2 Mini",
+    });
+    expect(picker).toHaveTextContent("UD-Q4_K_XL");
+    fireEvent.click(picker);
+    expect(
+      await screen.findByRole("option", {
+        name: /UD-Q4_K_XL · PolyStrata · 17 GB · Recommended/u,
+      }),
+    ).toBeVisible();
+    expect(
+      await screen.findByRole("option", {
+        name: /UD-Q4_K_M · llama\.cpp · 16\.5 GB/u,
+      }),
+    ).toBeVisible();
+
+    // 12 GB Windows on CUDA 12.8: Spark 4B recommended first, unavailable Spotlight
+    // surfaces actionable driver-update PolyStrata Q3 below, and disclosure shows VRAM shortfalls.
+    cleanup();
+    const win12Old = labView({
+      computer: {
+        ...labView().computer,
+        computer_id: "computer-win12",
+        display_name: "Win RTX 3060",
+        host: {
+          ...labView().computer.host!,
+          gpus: [
+            {
+              free_bytes: gb(11),
+              index: 0,
+              name: "RTX 3060",
+              total_bytes: gb(12),
+            },
+          ],
+          os_label: "Windows 11",
+          platform: "windows",
+          ram_total_bytes: gb(32),
+        },
+      },
+      models: [
+        modelView(
+          localModel({
+            context_tokens: 199_680,
+            download_bytes: gb(4.2),
+            engine: "llama.cpp",
+            fit: "gpu",
+            id: "spark-x2.6-4b:Q8_0",
+            memory_bytes: gb(8.9),
+            name: "Spark-X2.6 4B (Q8_0)",
+            parameters: "4B",
+            pool: "gpu:0",
+            quant: "Q8_0",
+            recommended: true,
+            source_url: "https://huggingface.co/unsloth/Spark-X2.6-4B-GGUF",
+          }),
+        ),
+        modelView(
+          localModel({
+            availability: {
+              downloadable: false,
+              reason: {
+                code: "DRIVER_UPDATE_REQUIRED",
+                detected_cuda: "12.8",
+                required_cuda: "13.0",
+              },
+            },
+            engine: "polystrata",
+            fit: "none",
+            id: "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+            memory_bytes: gb(5),
+            name: "Inkling 2 Mini (UD-Q3_K_XL)",
+            pool: undefined,
+            quant: "UD-Q3_K_XL",
+            source_url: "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF",
+          }),
+        ),
+        modelView(
+          localModel({
+            availability: {
+              downloadable: false,
+              reason: {
+                code: "MEMORY_INSUFFICIENT",
+                have_bytes: gb(11),
+                memory_kind: "vram",
+                need_bytes: gb(13.7),
+              },
+            },
+            engine: "llama.cpp",
+            fit: "none",
+            id: "inkling-2-mini-iq3xxs:UD-IQ3_XXS",
+            memory_bytes: gb(13.7),
+            name: "Inkling 2 Mini (UD-IQ3_XXS)",
+            pool: undefined,
+            quant: "UD-IQ3_XXS",
+            source_url: "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF",
+          }),
+        ),
+        modelView(
+          localModel({
+            availability: {
+              downloadable: false,
+              reason: {
+                code: "MEMORY_INSUFFICIENT",
+                have_bytes: gb(11),
+                memory_kind: "vram",
+                need_bytes: gb(13.4),
+              },
+            },
+            engine: "llama.cpp",
+            family: "qwen",
+            fit: "none",
+            id: "qwen3.8-27b-iq3s:UD-IQ3_S",
+            memory_bytes: gb(13.4),
+            name: "Qwen3.8 27B (UD-IQ3_S)",
+            parameters: "27B",
+            pool: undefined,
+            quant: "UD-IQ3_S",
+            source_url: "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF",
+          }),
+        ),
+      ],
+      pools: [gpuPool(0, 12), memoryPool("system", 25.6)],
+    });
+
+    await renderPage(setup([win12Old]));
+    await findModels();
+
+    expect(statuses()).toEqual([
+      "Spark-X2.6 4B: 4.2 GB",
+      "Qwen3.8 27B: Can't download · needs 13.4 GB VRAM",
+      "Inkling 2 Mini: Can't download · driver update needed",
+    ]);
+    expect(
+      within(spotlightRegion()).getByRole("combobox", {
+        name: "Choose version for Inkling 2 Mini",
+      }),
+    ).toHaveTextContent("UD-Q3_K_XL");
   });
 
   it("supports keyboard arrow switching on ModelSourceTabs and keeps BYOK focused without memory clutter", async () => {
@@ -4957,5 +5613,355 @@ describe("Featured Inkling 2 Mini spotlight", () => {
     expect(
       screen.getByText("22.5 GB of 48 GB GPU memory in use"),
     ).toBeVisible();
+  });
+
+  it("shows probing max concurrency label while a loading model runs its post-load probe", async () => {
+    const probingModel = localModel({
+      concurrency_probing: true,
+      engine: "llama.cpp",
+      engine_label: "llama.cpp b12588-mix-c0c3de8 · CUDA",
+      id: "qwen3-coder-30b:Q4_K_M",
+      memory_bytes: gb(21.4),
+      name: "Qwen3 Coder 30B",
+      quant: "Q4_K_M",
+      state: "loading",
+    });
+    const plainLoadingModel = localModel({
+      engine: "polystrata",
+      id: "qwen3-4b:Q4_K_M",
+      memory_bytes: gb(4),
+      name: "Qwen3 4B",
+      quant: "Q4_K_M",
+      state: "loading",
+    });
+
+    await renderPage(
+      setup([
+        labView({
+          models: [modelView(probingModel), modelView(plainLoadingModel)],
+        }),
+      ]),
+    );
+    await findModels();
+
+    const probingCard = card("Qwen3 Coder 30B");
+    const plainCard = card("Qwen3 4B");
+
+    expect(probingCard).toHaveTextContent("Probing max concurrency");
+    expect(within(probingCard).queryByText("Loading")).toBeNull();
+    expect(plainCard).toHaveTextContent("Loading");
+    expect(within(plainCard).queryByText("Probing max concurrency")).toBeNull();
+
+    await reactAct(async () => {
+      await setLanguage("zh-CN");
+    });
+    expect(probingCard).toHaveTextContent(
+      zhCN.localModels.statusProbingConcurrency,
+    );
+    expect(plainCard).toHaveTextContent(zhCN.localModels.statusLoading);
+  });
+
+  it("features the hardware-fitting Inkling driver-blocked variant and opens UpdateDriverDialog with recheck", async () => {
+    const q4TooBig = localModel({
+      availability: {
+        downloadable: false,
+        reason: {
+          code: "MEMORY_INSUFFICIENT",
+          have_bytes: gb(8),
+          need_bytes: gb(24),
+        },
+      },
+      engine: "polystrata",
+      engine_label: "PolyStrata 0.2.19-poly.1",
+      fit: "none",
+      id: "inkling-2-mini-q4-poly:UD-Q4_K_XL",
+      memory_bytes: gb(19),
+      name: "Inkling 2 Mini (UD-Q4_K_XL)",
+      pool: undefined,
+      quant: "UD-Q4_K_XL",
+      recommended: false,
+      state: "absent",
+    });
+    const q3DriverBlocked = localModel({
+      availability: {
+        downloadable: false,
+        reason: {
+          code: "DRIVER_UPDATE_REQUIRED",
+          detected_cuda: "12.8",
+          driver_version: "572.83",
+          required_cuda: "13.0",
+        },
+      },
+      engine: "polystrata",
+      engine_label: "PolyStrata 0.2.19-poly.1",
+      fit: "none",
+      id: "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+      memory_bytes: gb(8),
+      name: "Inkling 2 Mini (UD-Q3_K_XL)",
+      pool: undefined,
+      quant: "UD-Q3_K_XL",
+      recommended: false,
+      state: "absent",
+    });
+    const loadedSpark = localModel({
+      engine: "llama.cpp",
+      engine_label: "llama.cpp b12588",
+      id: "spark-x2.6-4b:Q8_0",
+      memory_bytes: gb(6.4),
+      name: "Spark-X2.6 4B (Q8_0)",
+      pi_model: "localmodels-library/spark-x2.6-4b",
+      pool: "gpu:0",
+      quant: "Q8_0",
+      state: "loaded",
+    });
+    const win5060 = labView({
+      computer: {
+        ...labView().computer,
+        host: {
+          arch: "x86_64",
+          disk_free_bytes: gb(250),
+          engine_label: "llama.cpp + PolyStrata",
+          gpus: [
+            {
+              free_bytes: gb(7.2),
+              index: 0,
+              name: "NVIDIA GeForce RTX 5060",
+              total_bytes: gb(8),
+              uuid: "GPU-5060",
+            },
+          ],
+          os_label: "Windows 11",
+          platform: "windows",
+          ram_total_bytes: gb(32),
+        },
+      },
+      models: [
+        modelView(q4TooBig),
+        modelView(q3DriverBlocked),
+        modelView(loadedSpark, ["Another Me"]),
+      ],
+      pools: [gpuPool(0, 8)],
+    });
+
+    const fixture = setup([win5060]);
+    await renderPage(fixture);
+    await findModels();
+
+    const spotlight = spotlightRegion();
+    expect(spotlight).toHaveTextContent("Inkling 2 Mini");
+    expect(spotlight).toHaveTextContent("UD-Q3_K_XL");
+    expect(spotlight).not.toHaveTextContent("UD-Q4_K_XL");
+
+    // Expand the spotlight row to check engine-scoped guidance and ready-alternatives hint.
+    fireEvent.click(
+      within(spotlight).getByRole("button", {
+        name: "Inkling 2 Mini",
+      }),
+    );
+    expect(spotlight).toHaveTextContent(
+      "PolyStrata requires NVIDIA driver 580+ (CUDA 13.0). Your driver supports CUDA 12.8 — only the graphics driver needs an update, not CUDA Toolkit.",
+    );
+
+    // Expanded details keep the actionable Update driver button alongside the row action.
+    expect(
+      within(spotlight).getByRole("button", { name: "Update driver…" }),
+    ).toBeInTheDocument();
+
+    // Clicking the compact Update driver action opens the guided dialog.
+    fireEvent.click(
+      within(spotlight).getByRole("button", {
+        name: "Update NVIDIA driver for Inkling 2 Mini (UD-Q3_K_XL)",
+      }),
+    );
+    const dialog = screen.getByRole("dialog", {
+      name: "Update NVIDIA driver",
+    });
+    expect(dialog).toHaveTextContent("NVIDIA GeForce RTX 5060");
+    expect(dialog).toHaveTextContent("Driver 572.83 · CUDA 12.8");
+    expect(dialog).toHaveTextContent("Driver 580+ · CUDA 13.0");
+
+    await waitFor(() => expect(fixture.refreshes).toEqual(["computer-lab"]));
+    fixture.refreshes.length = 0;
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Check again" }),
+    );
+    await waitFor(() => expect(fixture.refreshes).toEqual(["computer-lab"]));
+  });
+
+  it("shows post-reboot driver completion banner with direct model download and dismisses cleanly", async () => {
+    const clearInstallState = vi.fn(async () => {});
+    const previousDesktop = (window as { lingerDesktop?: unknown })
+      .lingerDesktop;
+    (window as { lingerDesktop?: unknown }).lingerDesktop = {
+      computer: {
+        enroll: vi.fn(),
+        getStatus: vi.fn(async () => ({
+          activeOperations: 0,
+          bridge: "connected",
+          computerId: "computer-lab",
+          preventSleep: false,
+          runtime: "ready",
+        })),
+        onStatus: vi.fn(() => () => {}),
+        unenroll: vi.fn(),
+      },
+      driverUpdate: {
+        clearInstallState,
+        getCapabilities: vi.fn(async () => ({
+          directInstallSupported: true,
+          nvidiaApp: "nvidia_app",
+          platform: "win32",
+        })),
+        getInstallState: vi.fn(async () => ({
+          phase: "completed",
+          resumeModelId: "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+          version: "621.24",
+        })),
+        onInstallState: vi.fn(() => () => {}),
+        openGuide: vi.fn(),
+        openNvidiaApp: vi.fn(),
+        openOfficialDownload: vi.fn(),
+        startInstall: vi.fn(),
+      },
+      platform: "win32",
+      version: "0.16.20",
+    };
+
+    try {
+      const unlockedInkling = localModel({
+        availability: { downloadable: true },
+        engine: "polystrata",
+        engine_label: "PolyStrata 0.2.19-poly.1",
+        fit: "gpu",
+        id: "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+        memory_bytes: gb(8),
+        name: "Inkling 2 Mini (UD-Q3_K_XL)",
+        pool: "gpu:0",
+        quant: "UD-Q3_K_XL",
+        recommended: true,
+        state: "absent",
+      });
+      const fixture = setup([
+        labView({
+          models: [modelView(unlockedInkling)],
+          pools: [gpuPool(0, 8)],
+        }),
+      ]);
+      await renderPage(fixture);
+      await findModels();
+
+      const banner = await screen.findByRole("complementary", {
+        name: "NVIDIA driver update status",
+      });
+      expect(banner).toHaveTextContent("NVIDIA driver 621.24 is ready");
+      expect(banner).toHaveTextContent(
+        "Your local models have been rechecked — Inkling 2 Mini (UD-Q3_K_XL) is ready to download.",
+      );
+
+      fireEvent.click(
+        within(banner).getByRole("button", {
+          name: "Download Inkling 2 Mini (UD-Q3_K_XL)",
+        }),
+      );
+      await waitFor(() => expect(clearInstallState).toHaveBeenCalledOnce());
+      await waitFor(() =>
+        expect(fixture.actions).toContainEqual({
+          body: { action: "download" },
+          computerId: "computer-lab",
+          modelId: "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+        }),
+      );
+    } finally {
+      if (previousDesktop === undefined) {
+        delete (window as { lingerDesktop?: unknown }).lingerDesktop;
+      } else {
+        (window as { lingerDesktop?: unknown }).lingerDesktop = previousDesktop;
+      }
+    }
+  });
+
+  it("keeps downloadable models in full color and dims only unavailable models inside the single Available section", async () => {
+    const constrainedPool = {
+      ...memoryPool("unified", 14.5),
+      used_bytes: gb(11.9),
+    };
+    const bigModel = localModel({
+      download_bytes: gb(6.2),
+      fit: "unified",
+      id: "ornith-9b:Q4_K_M",
+      memory_bytes: gb(10.4),
+      name: "Ornith 1.5 9B",
+      pool: "unified",
+    });
+    const smallModel = localModel({
+      download_bytes: gb(1.4),
+      fit: "unified",
+      id: "ling-tiny:Q4_K_M",
+      memory_bytes: gb(2.0),
+      name: "Ling 3.0 tiny",
+      pool: "unified",
+    });
+    const unavailableModel = localModel({
+      availability: {
+        downloadable: false,
+        reason: {
+          code: "MEMORY_INSUFFICIENT",
+          have_bytes: gb(14.5),
+          need_bytes: gb(21.8),
+        },
+      },
+      download_bytes: gb(16.2),
+      family: "qwen",
+      fit: "none",
+      id: "qwen3.8-27b:UD-IQ3_S",
+      memory_bytes: gb(21.8),
+      name: "Qwen3.8 27B",
+      pool: undefined,
+    });
+    await renderPage(
+      setup([
+        macView({
+          models: [
+            modelView(bigModel),
+            modelView(smallModel),
+            modelView(unavailableModel),
+          ],
+          pools: [constrainedPool],
+        }),
+      ]),
+    );
+    await findModels();
+
+    const bigCard = card("Ornith 1.5 9B");
+    expect(within(bigCard).getByText("Needs 10.4 GB free")).toBeVisible();
+    expect(
+      within(bigCard).getByRole("button", { name: "Ornith 1.5 9B" }),
+    ).not.toHaveClass("opacity-55");
+    expect(bigCard.querySelector("img")).not.toHaveClass("grayscale");
+
+    const smallCard = card("Ling 3.0 tiny");
+    expect(
+      within(smallCard).queryByText(/Needs .* free/u),
+    ).not.toBeInTheDocument();
+    expect(
+      within(smallCard).getByRole("button", { name: "Ling 3.0 tiny" }),
+    ).not.toHaveClass("opacity-55");
+    expect(smallCard.querySelector("img")).not.toHaveClass("grayscale");
+
+    const blockedCard = card("Qwen3.8 27B");
+    expect(
+      within(blockedCard).getByRole("button", { name: "Qwen3.8 27B" }),
+    ).toHaveClass("opacity-55");
+    expect(blockedCard.querySelector("img")).toHaveClass("grayscale");
+
+    fireEvent.click(
+      within(bigCard).getByRole("button", { name: "Ornith 1.5 9B" }),
+    );
+    const details = screen.getByRole("region", {
+      name: "Ornith 1.5 9B details",
+    });
+    expect(details).not.toHaveTextContent("Close memory-heavy apps");
+    expect(details).toHaveTextContent("10.4 GB");
+    expect(details).toHaveTextContent("Unified memory");
   });
 });

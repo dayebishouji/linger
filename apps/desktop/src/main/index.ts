@@ -26,8 +26,16 @@ import {
 } from "./computer-daemon.js";
 import { ConfigStore } from "./config.js";
 import { DesktopIpcModule } from "./desktop-ipc.js";
+import { readDevLocalmodelsOverride } from "./dev-localmodels.js";
 import { dialogMessages } from "./dialogs.messages.js";
 import { DiagnosticsModule } from "./diagnostics.js";
+import { DriverUpdater } from "./driver-updater.js";
+import {
+  detectWindowsNvidiaGpuName,
+  runWindowsDriverInstaller,
+  verifyWindowsAuthenticode,
+} from "./windows-driver-platform.js";
+import { EmbeddedComputerUse } from "./embedded-computer-use.js";
 import { EnrollmentModule } from "./enrollment.js";
 import { LanguageModule } from "./language.js";
 import {
@@ -158,6 +166,24 @@ async function main(): Promise<void> {
 
   // The default LINGER_HOME of the installer.
   const home = lingerHome();
+  let devLocalmodels: ReturnType<typeof readDevLocalmodelsOverride>;
+  try {
+    devLocalmodels = readDevLocalmodelsOverride(process.env, home);
+  } catch (error) {
+    log.error("desktop.start_failed", { error: String(error) });
+    dialog.showErrorBox(
+      "Linger could not start",
+      error instanceof Error ? error.message : String(error),
+    );
+    app.exit(1);
+    return;
+  }
+  if (devLocalmodels)
+    log.info("desktop.dev_localmodels_enabled", {
+      python: devLocalmodels.python,
+      module_dir: devLocalmodels.moduleDirectory,
+      home,
+    });
   // The cookie header of the window's session for a server.
   const webSessionCookie = async (
     serverUrl: string,
@@ -169,11 +195,20 @@ async function main(): Promise<void> {
       ? cookies.map((c) => `${c.name}=${c.value}`).join("; ")
       : undefined;
   };
+  const loginShell = resolveLoginShell(log);
+  const daemonPath = daemonExecutable();
+  const nodeBinaryName = process.platform === "win32" ? "node.exe" : "node";
   const localServer = new LocalServerModule({
     home,
+    daemonDirectory,
+    daemonExecutable: daemonPath,
     version: VERSION,
+    inspectEnv: inspectEnv(loginShell),
     macosVersion: () => process.getSystemVersion(),
     installerDirectory: path.join(here, "../installer"),
+    bundledNodePath: app.isPackaged
+      ? path.join(process.resourcesPath, "runtime", "bin", nodeBinaryName)
+      : path.join(here, "../computer/runtime/bin", nodeBinaryName),
     ...(__SOURCE_ARCHIVE__ ? { sourceArchive: __SOURCE_ARCHIVE__ } : {}),
     ...(__SOURCE_DEPENDENCIES__
       ? { sourceDependencies: __SOURCE_DEPENDENCIES__ }
@@ -202,16 +237,48 @@ async function main(): Promise<void> {
     background: background || needsSetup,
     localServerResumable: (url) => localServer.isStarting(url),
   });
+  const openExternal = (url: string): Promise<void> =>
+    process.platform === "linux" ? openWithXdg(url) : shell.openExternal(url);
+  const bus = new EventBus();
+  const driverUpdater = new DriverUpdater({
+    platform: process.platform as "darwin" | "win32" | "linux",
+    arch: process.arch,
+    existsSync,
+    env: process.env,
+    launchExecutable: async (executablePath) => {
+      const error = await shell.openPath(executablePath);
+      if (error) throw new Error(error);
+    },
+    openExternal,
+    onStateChange: () => bus.emit("driver-update.changed"),
+    onBusyChange: (busy) => bus.emit("driver-update.busy", busy),
+    ...(process.platform === "win32" && process.arch === "x64"
+      ? {
+          directInstall: {
+            downloadDirectory: path.join(userData, "driver-updates"),
+            detectGpuName: detectWindowsNvidiaGpuName,
+            verifyAuthenticode: verifyWindowsAuthenticode,
+            runInstaller: runWindowsDriverInstaller,
+            readPendingUpdate: () => config.get().pendingDriverUpdate,
+            writePendingUpdate: (record) => {
+              config.update({ pendingDriverUpdate: record });
+            },
+            systemUptimeSeconds: () => os.uptime(),
+          },
+        }
+      : {}),
+  });
   const setup = new SetupWindowModule({
     preload: path.join(here, "../preload/setup.cjs"),
     version: VERSION,
     defaultDisplayName,
-    show: !background && needsSetup,
+    show: () => !background && !config.get().computerId,
     loginItem: {
       get: () => app.getLoginItemSettings().openAtLogin,
       set: (on) =>
         app.setLoginItemSettings({ openAtLogin: on, args: ["--background"] }),
     },
+    driverUpdater,
     ...(process.platform === "darwin"
       ? {
           permissions: new MacPermissions({
@@ -242,6 +309,8 @@ async function main(): Promise<void> {
       ? updateInstallFor(process.platform, process.execPath, existsSync)
       : undefined,
     downloadDirectory: path.join(userData, "updates"),
+    prepareUpdate: (stagedPath, signal) =>
+      localServer.prepareUpdateTool(stagedPath, signal),
     announce: (state) => {
       if (!Notification.isSupported()) return;
       const notice = new Notification(updateNotice(state, language.t));
@@ -311,8 +380,13 @@ async function main(): Promise<void> {
       defaultDirectory: path.join(app.getPath("home"), "Linger"),
     }),
     new ComputerDaemonModule({
+      createEmbeddedDriver:
+        process.platform === "darwin" && app.isPackaged
+          ? (selected) =>
+              new EmbeddedComputerUse(process.resourcesPath, selected)
+          : undefined,
       spawn: spawnDaemon(
-        daemonExecutable(),
+        daemonPath,
         path.join(userData, "logs", "computer-daemon.log"),
       ),
       credentials,
@@ -321,9 +395,10 @@ async function main(): Promise<void> {
       // with a matching version and the computer needs no Node.
       teamhubCliDirectory: path.join(here, "../teamhub-cli"),
       defaultDisplayName,
-      env: daemonEnv(log),
+      env: daemonEnv(loginShell),
+      ...(devLocalmodels ? { devLocalmodels } : {}),
       ...(process.platform === "win32"
-        ? { protect: protectWithDaemon(daemonExecutable()) }
+        ? { protect: protectWithDaemon(daemonPath) }
         : {}),
       ...desktopPermissions,
     }),
@@ -347,9 +422,10 @@ async function main(): Promise<void> {
     new DesktopIpcModule({
       defaultDisplayName,
       ...(desktopPermissions ? { permissions: desktopPermissions } : {}),
+      driverUpdater,
     }),
   ];
-  const host = new ModuleHost(modules, { config, log, bus: new EventBus() });
+  const host = new ModuleHost(modules, { config, log, bus });
 
   const showApp = (): void => setup.showApp();
   // The uninstaller, or setup replacing this release, asked to quit.
@@ -456,16 +532,43 @@ function electronPower(): PowerApi {
   };
 }
 
-// The user's terminal environment, which runtimes inherit, without the app's
-// own control variables. The runtime paths stay for the daemon config; the
-// daemon keeps LINGER_* from runtimes.
-async function daemonEnv(log: Logger): Promise<Record<string, string>> {
+async function resolveLoginShell(
+  log: Logger,
+): Promise<Record<string, string> | undefined> {
   const started = Date.now();
   const login = await loginShellEnvironment();
   log.info("computer_daemon.login_shell", {
     resolved: login !== undefined,
     duration_ms: Date.now() - started,
   });
+  return login;
+}
+
+// The user's terminal environment for read-only setup inspection (--inspect),
+// keeping LINGER_* controls while adding the login shell's PATH and profile.
+// Never forwarded to --resume, BYOK checks, or the serving installer that
+// starts local services.
+async function inspectEnv(
+  loginShell: Promise<Record<string, string> | undefined>,
+): Promise<Record<string, string>> {
+  const login = await loginShell;
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(
+    withLoginShell(process.env as Record<string, string>, login),
+  )) {
+    if (value === undefined) continue;
+    env[name] = value;
+  }
+  return env;
+}
+
+// The user's terminal environment, which runtimes inherit, without the app's
+// own control variables. The runtime paths stay for the daemon config; the
+// daemon keeps LINGER_* from runtimes.
+async function daemonEnv(
+  loginShell: Promise<Record<string, string> | undefined>,
+): Promise<Record<string, string>> {
+  const login = await loginShell;
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(
     withLoginShell(process.env as Record<string, string>, login),

@@ -255,6 +255,38 @@ describe("RunnerGateway", () => {
     }
   });
 
+  it("records a Runtime update at the Gateway's time, not the Computer's", async () => {
+    const gateway = createTestRunnerGateway({ heartbeatIntervalMs: 60_000 });
+    const touch = vi.spyOn(testRegistryOf(gateway), "touch");
+    const connection = await gateway.acceptConnection(
+      authenticatedPrincipal(),
+      hello(),
+      new RecordingPeer(),
+    );
+    try {
+      const before = Date.now();
+      // A Computer whose clock runs behind stamps an older time than the
+      // Gateway's last heartbeat, which TeamHub would ignore.
+      await connection.receive({
+        type: "runner.runtime_diagnostics",
+        protocol_version: "2",
+        runner_id: "runner-local",
+        sent_at: "2001-01-01T00:00:00.000Z",
+        revision: 2,
+        runtime_diagnostics: runtimeDiagnostics({
+          ready: ["codex", "antigravity"],
+        }),
+      });
+      const recorded = touch.mock.calls
+        .map(([, update]) => update)
+        .filter((update) => update.runtimeDiagnostics !== undefined)
+        .at(-1);
+      expect(Date.parse(recorded?.seenAt ?? "")).toBeGreaterThanOrEqual(before);
+    } finally {
+      connection.disconnect();
+    }
+  });
+
   it("proves the Daemon Identity and names Runtime Registrations on every hello", async () => {
     const verify = vi.fn();
     const gateway = createTestRunnerGateway({
@@ -328,6 +360,102 @@ describe("RunnerGateway", () => {
       ],
     });
     connection.disconnect();
+  });
+
+  it("advances registration revisions monotonically when diagnostics carry a lower revision than hello", async () => {
+    const gateway = createTestRunnerGateway({ heartbeatIntervalMs: 60_000 });
+    const peer = new RecordingPeer();
+    const initialClockRevision = 1_760_000_000_000;
+    const connection = await gateway.acceptConnection(
+      authenticatedPrincipal(),
+      {
+        ...hello(),
+        runtimes: ["codex"],
+        runtime_diagnostics: runtimeDiagnostics({ ready: ["codex"] }),
+        runtime_registrations: [
+          {
+            tenant_id: "tenant-acme",
+            owner_actor_id: "actor-alice",
+            provider_type: "codex",
+            status: "online",
+            revision: initialClockRevision,
+            capabilities: ["turn"],
+            runtime_diagnostics: { status: "ready" },
+          },
+          {
+            tenant_id: "tenant-acme",
+            owner_actor_id: "actor-alice",
+            provider_type: "pi",
+            status: "unavailable",
+            revision: initialClockRevision,
+            capabilities: [],
+            runtime_diagnostics: { status: "not_installed" },
+          },
+        ],
+      },
+      peer,
+    );
+    try {
+      await connection.receive({
+        type: "runner.runtime_diagnostics",
+        protocol_version: "2",
+        runner_id: "runner-local",
+        sent_at: "2026-07-29T00:00:15.000Z",
+        revision: 2,
+        runtime_diagnostics: runtimeDiagnostics({ ready: ["codex", "pi"] }),
+      });
+      const firstUpdate = peer.registrationSnapshots.at(-1)!.registrations;
+      expect(
+        firstUpdate.find(
+          ({ registration_id }) => registration_id === testRegistrationId("pi"),
+        ),
+      ).toMatchObject({
+        observation: {
+          provider_type: "pi",
+          status: "online",
+          revision: initialClockRevision + 1,
+          capabilities: ["turn"],
+        },
+      });
+      expect(
+        firstUpdate.find(
+          ({ registration_id }) =>
+            registration_id === testRegistrationId("codex"),
+        ),
+      ).toMatchObject({
+        observation: {
+          provider_type: "codex",
+          status: "online",
+          revision: initialClockRevision + 1,
+        },
+      });
+
+      await connection.receive({
+        type: "runner.runtime_diagnostics",
+        protocol_version: "2",
+        runner_id: "runner-local",
+        sent_at: "2026-07-29T00:00:30.000Z",
+        revision: 3,
+        runtime_diagnostics: runtimeDiagnostics({
+          ready: ["codex"],
+          authenticationRequired: ["pi"],
+        }),
+      });
+      const secondUpdate = peer.registrationSnapshots.at(-1)!.registrations;
+      expect(
+        secondUpdate.find(
+          ({ registration_id }) => registration_id === testRegistrationId("pi"),
+        ),
+      ).toMatchObject({
+        observation: {
+          provider_type: "pi",
+          status: "online",
+          revision: initialClockRevision + 2,
+        },
+      });
+    } finally {
+      connection.disconnect();
+    }
   });
 
   it("accepts a receipt for a snapshot that a newer snapshot overtook", async () => {
@@ -900,6 +1028,32 @@ describe("RunnerGateway local Computer reconnect wait", () => {
     await waiting;
   });
 
+  it("passes an old Computer's reported limit through to a mixed-version TeamHub", async () => {
+    const connectLocalComputer = vi.fn().mockResolvedValue({ placements: [] });
+    const registry = createTeamHubLocalComputerRegistry({
+      getLocalComputer: vi.fn(),
+      connectLocalComputer,
+      touchLocalComputer: vi.fn(),
+      removeLocalComputer: vi.fn(),
+      recordLocalModels: vi.fn(),
+    });
+    const connection = {
+      computerId: "computer-local",
+      owner: { tenantId: "tenant-acme", ownerActorId: "actor-alice" },
+      credentialGeneration: 0,
+      status: "offline" as const,
+    };
+    await registry.connect({ ...connection, hello: hello([], 5) });
+    await registry.connect({ ...connection, hello: hello([], null) });
+    expect(connectLocalComputer.mock.calls[0]![0]).toHaveProperty(
+      "capacity",
+      5,
+    );
+    expect(connectLocalComputer.mock.calls[1]![0]).not.toHaveProperty(
+      "capacity",
+    );
+  });
+
   it("maps DAEMON_IDENTITY_IN_USE from TeamHub connect to RunnerDaemonIdentityInUseError", async () => {
     const connectLocalComputer = vi
       .fn()
@@ -939,5 +1093,96 @@ describe("RunnerGateway local Computer reconnect wait", () => {
     await expect(registry.connect(connection)).rejects.toMatchObject({
       code: "AGENT_RUNTIME_CONFLICT",
     });
+  });
+
+  it("keeps seen_at strictly monotonic across same-ms connect and touch and clears on remove", async () => {
+    const fixedNow = Date.parse("2026-11-25T12:00:00.000Z");
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(fixedNow);
+    try {
+      const connectLocalComputer = vi
+        .fn()
+        .mockResolvedValue({ placements: [] });
+      const touchLocalComputer = vi.fn().mockResolvedValue(undefined);
+      const removeLocalComputer = vi
+        .fn()
+        .mockResolvedValueOnce({ status: "has_agents" })
+        .mockResolvedValueOnce({ status: "removed" })
+        .mockResolvedValueOnce({ status: "already_removed" });
+      const registry = createTeamHubLocalComputerRegistry({
+        getLocalComputer: vi.fn(),
+        connectLocalComputer,
+        touchLocalComputer,
+        removeLocalComputer,
+        recordLocalModels: vi.fn(),
+      });
+      const owner = { tenantId: "tenant-acme", ownerActorId: "actor-alice" };
+      await registry.connect({
+        computerId: "computer-mono",
+        owner,
+        credentialGeneration: 0,
+        hello: hello(),
+        status: "offline",
+      });
+      await registry.touch("computer-mono", {
+        status: "online",
+        seenAt: new Date(fixedNow).toISOString(),
+      });
+      await registry.touch("computer-mono", {
+        status: "online",
+        seenAt: new Date(fixedNow).toISOString(),
+      });
+      const connectSeenAt = connectLocalComputer.mock.calls[0]?.[0]?.seen_at;
+      const firstTouchSeenAt = touchLocalComputer.mock.calls[0]?.[0]?.seen_at;
+      const secondTouchSeenAt = touchLocalComputer.mock.calls[1]?.[0]?.seen_at;
+      expect(Date.parse(connectSeenAt)).toBe(fixedNow);
+      expect(Date.parse(firstTouchSeenAt)).toBe(fixedNow + 1);
+      expect(Date.parse(secondTouchSeenAt)).toBe(fixedNow + 2);
+
+      // Failed removal keeps monotonic state; removed/already_removed clears it.
+      await expect(
+        registry.remove({ ...owner, computerId: "computer-mono" }),
+      ).resolves.toBe("has-agents");
+      await registry.touch("computer-mono", {
+        status: "online",
+        seenAt: new Date(fixedNow).toISOString(),
+      });
+      expect(Date.parse(touchLocalComputer.mock.calls[2]?.[0]?.seen_at)).toBe(
+        fixedNow + 3,
+      );
+
+      await expect(
+        registry.remove({ ...owner, computerId: "computer-mono" }),
+      ).resolves.toBe("removed");
+      await registry.connect({
+        computerId: "computer-mono",
+        owner,
+        credentialGeneration: 1,
+        hello: hello(),
+        status: "offline",
+      });
+      expect(Date.parse(connectLocalComputer.mock.calls[1]?.[0]?.seen_at)).toBe(
+        fixedNow,
+      );
+
+      await registry.touch("computer-mono", {
+        status: "online",
+        seenAt: new Date(fixedNow).toISOString(),
+      });
+      await expect(
+        registry.remove({ ...owner, computerId: "computer-mono" }),
+      ).resolves.toBe("already-removed");
+      await registry.connect({
+        computerId: "computer-mono",
+        owner,
+        credentialGeneration: 2,
+        hello: hello(),
+        status: "offline",
+      });
+      expect(Date.parse(connectLocalComputer.mock.calls[2]?.[0]?.seen_at)).toBe(
+        fixedNow,
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 });

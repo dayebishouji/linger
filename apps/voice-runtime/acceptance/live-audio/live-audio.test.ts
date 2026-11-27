@@ -33,9 +33,14 @@ const rtc = vi.hoisted(() => {
     }
     closeAudioStreams() {}
   }
-  /** Plays what it is given in real time, keeping a short lead like rtc-node. */
+  /** Plays what it is given in real time, keeping at most its queue ahead like rtc-node. */
   class AudioSource {
     playEnd = now();
+    constructor(
+      readonly sampleRate = 24_000,
+      readonly channels = 1,
+      readonly queueSize = 1_000,
+    ) {}
     frames: Array<{ start: number; end: number; loud: boolean }> = [];
     clears: number[] = [];
     private waiters: Array<() => void> = [];
@@ -49,7 +54,7 @@ const rtc = vi.hoisted(() => {
       for (const sample of frame.data) sum += sample * sample;
       const loud = Math.sqrt(sum / frame.data.length) > 350;
       this.frames.push({ start, end: this.playEnd, loud });
-      const lead = this.playEnd - now() - 200;
+      const lead = this.playEnd - now() - this.queueSize;
       if (lead > 0) await new Promise((resolve) => setTimeout(resolve, lead));
     }
     async waitForPlayout() {
@@ -74,12 +79,20 @@ const rtc = vi.hoisted(() => {
     }
     async close() {}
   }
-  return { Track, AudioSource, now };
+  /** The worker's structured logs, for its own playback and input metrics. */
+  const logs: Array<{
+    at: number;
+    msg: string;
+    fields: Record<string, unknown>;
+  }> = [];
+  const record = (fields: Record<string, unknown>, msg: string) =>
+    void logs.push({ at: now(), msg, fields });
+  return { Track, AudioSource, now, logs, record };
 });
 
 vi.mock("@livekit/agents", () => ({
   AutoSubscribe: { AUDIO_ONLY: 1 },
-  log: () => ({ info: () => {}, warn: () => {}, error: () => {} }),
+  log: () => ({ info: rtc.record, warn: rtc.record, error: rtc.record }),
 }));
 vi.mock("@livekit/rtc-node", () => ({
   RemoteAudioTrack: rtc.Track,
@@ -115,6 +128,7 @@ vi.mock("@livekit/rtc-node", () => ({
 
 import { liveDataTopic, LiveVoiceWorker } from "../../src/live-worker.js";
 import { SileroSpeechActivityDetector } from "../../src/voice-activity.js";
+import { providerProxy } from "../../src/provider-proxy.js";
 import { XaiLiveSession } from "../../src/xai-live.js";
 
 const env = process.env;
@@ -130,11 +144,12 @@ const publisher = { identity: `publisher-${sessionId}` };
 const ttsDir = mkdtempSync(join(tmpdir(), "live-audio-"));
 const ttsCache = new Map<string, Int16Array>();
 /** The words as 24 kHz mono PCM, the rate the worker reads the track at. */
-function speech(text: string) {
-  let pcm = ttsCache.get(text);
+function speech(text: string, voice = "Samantha") {
+  const key = voice + ":" + text;
+  let pcm = ttsCache.get(key);
   if (!pcm) {
     const aiff = join(ttsDir, `${ttsCache.size}.aiff`);
-    execFileSync("say", ["-v", "Samantha", "-o", aiff, text]);
+    execFileSync("say", ["-v", voice, "-o", aiff, text]);
     const raw = execFileSync(
       "ffmpeg",
       [
@@ -153,7 +168,7 @@ function speech(text: string) {
       { maxBuffer: 1 << 26 },
     );
     pcm = new Int16Array(raw.buffer, raw.byteOffset, raw.length / 2).slice();
-    ttsCache.set(text, pcm);
+    ttsCache.set(key, pcm);
   }
   return pcm;
 }
@@ -212,7 +227,7 @@ function distantSpeech(text: string, belowDb: number) {
     );
     distantCache.set(key, pcm);
   }
-  return pcm;
+  return { text: `(distant) ${text}`, pcm };
 }
 const userReference = "Research pricing for Notion, Linear and Feishu for me";
 /** How much quieter than the user another person in the room is. */
@@ -245,6 +260,9 @@ class Call {
   /** The worker's hint callback: TeamHub's push of a change. */
   changed?: () => void;
   private mic: Int16Array[] = [];
+  nonSilentInputMs = 0;
+  /** Delay only provider input; the real local detector still hears the microphone on time. */
+  providerInputDelayMs = 0;
   private pump?: ReturnType<typeof setInterval>;
   private source?: InstanceType<typeof rtc.AudioSource>;
   private shutdown?: () => Promise<void>;
@@ -334,6 +352,8 @@ class Call {
           model: env.VOICE_RUNTIME_XAI_LIVE_MODEL || "grok-voice-3.0",
           voice: env.VOICE_RUNTIME_XAI_LIVE_VOICE || "ara",
           reasoningEffort: "high",
+          // A CONNECT proxy that degrades the provider network, to compare.
+          proxy: providerProxy(env.LIVE_AUDIO_PROXY, ""),
           setup,
         });
         // Compares another end-of-turn silence without changing the runtime.
@@ -374,6 +394,22 @@ class Call {
               });
           },
         );
+        const appendAudio = session.appendAudio.bind(session);
+        const delayed: Int16Array[] = [];
+        let delayedSamples = 0;
+        session.appendAudio = (frame) => {
+          if (this.providerInputDelayMs) {
+            delayed.push(frame);
+            delayedSamples += frame.length;
+            if (delayedSamples <= this.providerInputDelayMs * 24)
+              return appendAudio(new Int16Array(frame.length));
+            frame = delayed.shift()!;
+            delayedSamples -= frame.length;
+          }
+          if (frame.some((sample) => sample !== 0))
+            this.nonSilentInputMs += frame.length / 24;
+          return appendAudio(frame);
+        };
         const spied = session as unknown as Record<
           string,
           (...args: unknown[]) => unknown
@@ -488,11 +524,15 @@ class Call {
 
   private onPublished(event: Record<string, unknown>) {
     const { type } = event;
-    if (type === "user_partial") return;
+    if (type === "user_partial") {
+      if (event.text) this.note("user_partial");
+      return;
+    }
     this.note(String(type), {
       ...(event.speech_id ? { speech: event.speech_id } : {}),
       ...(typeof event.text === "string" ? { text: event.text } : {}),
       ...(event.tool ? { tool: event.tool } : {}),
+      ...(event.code ? { code: event.code } : {}),
     });
     if (type !== "tool_request") return;
     const result =
@@ -518,21 +558,23 @@ class Call {
 
   /** Speaks the segments (text, or a silent gap in ms) and resolves when done. */
   async say(
-    ...segments: Array<string | number | { distant: string; belowDb: number }>
+    ...segments: Array<string | number | { text: string; pcm: Int16Array }>
   ) {
     this.note("mic_start", {
       text: segments
-        .map((s) => (typeof s === "object" ? `(distant) ${s.distant}` : s))
-        .filter((s) => typeof s === "string")
+        .map((segment) =>
+          typeof segment === "object" ? segment.text : segment,
+        )
+        .filter((segment) => typeof segment === "string")
         .join(" … "),
     });
     for (const segment of segments) {
       const pcm =
         typeof segment === "number"
           ? new Int16Array(segment * 24)
-          : typeof segment === "object"
-            ? distantSpeech(segment.distant, segment.belowDb)
-            : speech(segment);
+          : typeof segment === "string"
+            ? speech(segment)
+            : segment.pcm;
       for (let offset = 0; offset < pcm.length; offset += 480) {
         const frame = new Int16Array(480);
         frame.set(pcm.subarray(offset, offset + 480));
@@ -543,6 +585,13 @@ class Call {
     this.note("mic_end");
   }
 
+  /** Every output frame as played (cleared audio is dropped). */
+  played() {
+    return (this.source?.frames ?? []).map((frame) => ({
+      start: frame.start - this.t0,
+      end: frame.end - this.t0,
+    }));
+  }
   /** Loud output frames, as heard (cleared audio is dropped). */
   heard() {
     return (this.source?.frames ?? [])
@@ -658,10 +707,163 @@ function talkedOver(call: Call, from: number, to: number) {
   );
 }
 
+// Both utterances use the same voice; only the interruption is 4 dB softer.
+async function quietInterruption(call: Call, text: string) {
+  const voice = "Tingting";
+  const question =
+    "\u8bf7\u8be6\u7ec6\u4ecb\u7ecd\u4e09\u79cd\u9002\u5408\u5468\u672b\u505a\u7684\u83dc\u3002";
+  const gain = 10 ** (-4 / 20);
+  const interruption = speech(text, voice).map((sample) =>
+    Math.round(sample * gain),
+  );
+  await call.say({ text: question, pcm: speech(question, voice) });
+  const asked = call.at();
+  if (
+    !(await call.wait(() => call.firstSoundAfter(asked) !== undefined, 20_000))
+  )
+    throw new Error("Reply audio never started");
+  await sleep(800);
+  await call.wait(() => call.playing(), 5_000);
+  const start = call.at();
+  const inputBefore = call.nonSilentInputMs;
+  const playingAtStart = call.playing();
+  await call.say({ text, pcm: interruption });
+  await call.wait(() => call.entries("user_turn", start).length > 0, 8_000);
+  await call.settle();
+  const clear = call.firstClearAfter(start);
+  return {
+    playingAtStart,
+    forwardedMs: Math.round(call.nonSilentInputMs - inputBefore),
+    interrupted: call.entries("reply_interrupted", start).length > 0,
+    clearedAfterMs: clear === undefined ? null : Math.round(clear - start),
+    transcribed: call
+      .entries("user_turn", start)
+      .some(
+        (entry) => typeof entry.text === "string" && entry.text.trim() !== "",
+      ),
+  };
+}
+
+async function measureBargeIn(call: Call, inputDelayMs: number) {
+  const voice = "Tingting";
+  const question =
+    "\u8bf7\u8be6\u7ec6\u4ecb\u7ecd\u4e09\u79cd\u9002\u5408\u5468\u672b\u505a\u7684\u83dc\u3002";
+  const correction =
+    inputDelayMs === 0
+      ? "\u7b49\u4e00\u4e0b\uff0c\u6211\u518d\u8865\u5145\u4e00\u70b9\uff0c\u6211\u4eec\u8fd9\u6b21\u8981\u53bb\u7684\u5730\u65b9\u6bd4\u8f83\u51b7\uff0c\u800c\u4e14\u8fd8\u4f1a\u4e0b\u96ea\uff0c\u8bf7\u6839\u636e\u5929\u6c14\u6362\u4e00\u4e2a\u5efa\u8bae\u3002"
+      : "\u7b49\u4e00\u4e0b\uff0c\u6211\u4e0d\u5403\u8fa3\uff0c\u7ed9\u6211\u6362\u4e00\u4e2a\u6e05\u6de1\u70b9\u7684\u3002";
+  const pcm = speech(correction, voice);
+  await call.say({ text: question, pcm: speech(question, voice) });
+  const asked = call.at();
+  if (
+    !(await call.wait(
+      () => call.firstSoundAfter(asked) !== undefined && call.playing(),
+      20_000,
+    ))
+  )
+    throw new Error("Reply audio never started");
+  await sleep(700);
+  const start = call.at();
+  const playingAtStart = call.playing();
+  call.providerInputDelayMs = inputDelayMs;
+  await call.say({ text: correction, pcm });
+  const micEnd = call.at();
+  await call.wait(() => call.entries("user_turn", start).length > 0, 18_000);
+  const clear = call.firstClearAfter(start);
+  const server = call
+    .entries("xai", start)
+    .find((e) => e.event === "input_audio_buffer.speech_started");
+  const stopped = call.entries("reply_interrupted", start)[0];
+  const partials = call
+    .entries("user_partial", start)
+    .filter((event) => event.t < micEnd);
+  return {
+    partialsWhileSpeaking: partials.length,
+    firstPartialMs: partials[0] ? partials[0].t - start : null,
+    playingAtStart,
+    clearedAfterMs: clear === undefined ? null : Math.round(clear - start),
+    interruptedAfterMs: stopped ? stopped.t - start : null,
+    providerAfterMs: server ? server.t - start : null,
+    oldAudioAfterClearMs:
+      clear === undefined
+        ? null
+        : Math.round(
+            call.soundBetween(
+              clear,
+              inputDelayMs
+                ? Math.min(server?.t ?? Infinity, start + inputDelayMs)
+                : micEnd,
+            ) * 1000,
+          ),
+    transcribed: call
+      .entries("user_turn", start)
+      .some((e) => typeof e.text === "string" && e.text.trim() !== ""),
+  };
+}
+
+const playbackText =
+  "\u8bf7\u8be6\u7ec6\u4ecb\u7ecd\u4e09\u79cd\u9002\u5408\u5468\u672b\u505a\u7684\u83dc\u3002";
+/** Synthesized before the call opens: `say` blocks the worker's event loop. */
+function playbackQuestion() {
+  return { text: playbackText, pcm: speech(playbackText, "Tingting") };
+}
+
 const scenarios: Record<
   string,
   (call: Call) => Promise<Record<string, unknown>>
 > = {
+  // A long reply heard whole: gaps in its playout are dropped audio.
+  async playback(call) {
+    const logsFrom = rtc.logs.length;
+    await call.say(playbackQuestion());
+    const asked = call.at();
+    if (
+      !(await call.wait(
+        () => call.firstSoundAfter(asked) !== undefined,
+        20_000,
+      ))
+    )
+      throw new Error("Reply audio never started");
+    const firstSound = call.firstSoundAfter(asked);
+    await call.settle();
+    const frames = call.played().filter((frame) => frame.start >= asked);
+    const gaps = frames
+      .slice(1)
+      .map((frame, index) => frame.start - frames[index]!.end)
+      .filter((gap) => gap >= 10);
+    const logged = rtc.logs.slice(logsFrom);
+    const stalls = logged.filter(
+      (entry) => entry.msg === "Voice live reply playback stalled",
+    );
+    const turns = logged.filter(
+      (entry) => entry.msg === "Voice live turn metrics",
+    );
+    const max = (values: unknown[]) =>
+      Math.max(0, ...values.map((value) => Number(value) || 0));
+    return {
+      firstSoundMs:
+        firstSound === undefined ? null : Math.round(firstSound - asked),
+      replySec: Math.round(call.soundBetween(asked) * 10) / 10,
+      heardGaps: gaps.length,
+      heardGapMs: Math.round(gaps.reduce((sum, gap) => sum + gap, 0)),
+      maxHeardGapMs: Math.round(max(gaps)),
+      workerStalls: stalls.reduce(
+        (sum, entry) => sum + Number(entry.fields.stalls),
+        0,
+      ),
+      workerStalledMs: stalls.reduce(
+        (sum, entry) => sum + Number(entry.fields.stalledMs),
+        0,
+      ),
+      loggedTurns: turns.length,
+      maxEventLoopDelayMs: max(
+        turns.map((entry) => entry.fields.maxEventLoopDelayMs),
+      ),
+      maxInputQueueWaitMs: max(
+        turns.map((entry) => entry.fields.maxInputQueueWaitMs),
+      ),
+    };
+  },
   // Turn latency and hand-off from real speech.
   async delegate(call) {
     await call.say("Research pricing for Notion, Linear and Feishu for me");
@@ -754,8 +956,14 @@ const scenarios: Record<
       updateSec: update ? +call.soundBetween(update.t).toFixed(1) : 0,
     };
   },
+  quietAcknowledgment: (call) => quietInterruption(call, "\u55ef"),
+  quietCorrection: (call) =>
+    quietInterruption(call, "\u7b49\u4e00\u4e0b\uff0c\u6211\u4e0d\u5403\u8fa3"),
+  lateBargeIn: (call) => measureBargeIn(call, 6_000),
+  interruptionCaptions: (call) => measureBargeIn(call, 0),
   // The user talks over the live voice; it stops at once.
   async bargeIn(call) {
+    speech("Wait, stop for a moment");
     await call.say(
       "Explain in detail why so many SaaS products charge per seat",
     );
@@ -794,11 +1002,12 @@ const scenarios: Record<
     await call.wait(() => call.firstSoundAfter(asked) !== undefined, 20_000);
     await sleep(2_000);
     const start = call.at();
-    await call.say({
-      distant:
+    await call.say(
+      distantSpeech(
         "Did anyone see where I left the charger, I think it was on the desk next to the window",
-      belowDb: distantDb,
-    });
+        distantDb,
+      ),
+    );
     const end = call.at();
     await call.settle();
     return {
@@ -814,17 +1023,24 @@ const scenarios: Record<
   },
   // A short aside nearby while the live voice replies.
   async backgroundAside(call) {
+    const aside = distantSpeech("Yeah, okay, sure", distantDb);
     await call.say(
       "Explain in detail why so many SaaS products charge per seat",
     );
     const asked = call.at();
     await call.wait(() => call.firstSoundAfter(asked) !== undefined, 20_000);
     await sleep(2_000);
+    await call.wait(() => call.playing(), 5_000);
     const start = call.at();
-    await call.say({ distant: "Yeah, okay, sure", belowDb: distantDb });
+    const playingAtStart = call.playing();
+    const inputBefore = call.nonSilentInputMs;
+    await call.say(aside);
     const end = call.at();
+    await call.wait(() => call.entries("user_turn", start).length > 0, 8_000);
     await call.settle();
     return {
+      playingAtStart,
+      forwardedMs: Math.round(call.nonSilentInputMs - inputBefore),
       interrupted: call.entries("reply_interrupted", start).length > 0,
       providerHeard: call
         .entries("xai", start)
@@ -926,6 +1142,7 @@ describe.skipIf(!apiKey || !contextFile)("live audio", () => {
       it.skipIf(only !== "" && !only.split(",").includes(name)).concurrent(
         `${name} #${rep}`,
         async () => {
+          if (name === "playback") playbackQuestion();
           const call = new Call();
           try {
             await call.open();

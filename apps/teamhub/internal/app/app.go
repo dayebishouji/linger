@@ -55,7 +55,6 @@ import (
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/permissionreview"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/personalinsight"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/personalprofile"
-	"github.com/simplexai-labs/linger/apps/teamhub/internal/platform/agenttemplates"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/proactive"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/realtime"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/reminder"
@@ -66,6 +65,7 @@ import (
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/taskdelegation"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/taskexecution"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/typedcard"
+	"github.com/simplexai-labs/linger/apps/teamhub/internal/urlpreview"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/voicecaptureqa"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/voicekey"
 	"github.com/simplexai-labs/linger/apps/teamhub/internal/voicemedia"
@@ -123,6 +123,8 @@ type App struct {
 	voiceKeys *voicekey.Service
 	// webSearch runs the Agents' web searches with the saved keys.
 	webSearch *websearch.Service
+	// urlPreview reads sites' framing rules for the Web link preview panel.
+	urlPreview *urlpreview.Prober
 	// reconcileVoiceWorkers wakes the Node Services voice workers after a key
 	// is saved and reports whether they are ready; nil without a Node Services
 	// link.
@@ -264,7 +266,7 @@ const (
 	PersonalInsightJobs
 	// PresentationLoop paces presentation sequence delivery.
 	PresentationLoop
-	// SkillInstall reconciles the built-in Skills and Agent templates.
+	// SkillInstall reconciles the built-in Skills.
 	SkillInstall
 	// SkillPackageProbe checks Skill Package storage before /readyz passes;
 	// skipping it reports ready at once.
@@ -534,6 +536,7 @@ func (a *App) registerFeatures(ctx context.Context, cfg config.Config, deps Deps
 	if err := a.registerWebSearch(cfg, deps); err != nil {
 		return err
 	}
+	a.urlPreview = urlpreview.New()
 	a.reminders = reminder.New(a.pool)
 	agentAuthorization := a.registerAgentAuthorization()
 	if err := a.registerExternalApps(ctx, cfg.ExternalApps, deps.Composio, agentAuthorization); err != nil {
@@ -719,9 +722,6 @@ func (a *App) StartWorkers(ctx context.Context, skip ...Worker) error {
 	if runs(SkillInstall) {
 		if err := skill.Ensure(ctx, a.pool, a.artifacts); err != nil {
 			return fmt.Errorf("install built-in platform Skills: %w", err)
-		}
-		if err := agenttemplates.Ensure(ctx, a.pool); err != nil {
-			return fmt.Errorf("install built-in Agent templates: %w", err)
 		}
 	}
 	if runs(JobQueue) {

@@ -32,19 +32,22 @@ take precedence.
 
 - Keep model/provider behavior behind the existing runtime interfaces. The only
   exception is `src/runtime-model-call.ts`: a stateless prompt on the owner's
-  Agent Runtime (Codex, Claude or Pi, using its default model) through the
+  Agent Runtime (Codex, Claude, Pi, or Antigravity) through the
   Daemon's one-shot `model.invoke`, for tool-less service work such as Agent
   Memory, also used by Memory, by the LLM Wiki, and exposed
-  to TeamHub as `POST /v1/model-calls`. Antigravity has no `model.invoke`, so
-  a call for an Antigravity owner runs on Claude on the same Computer, or on
-  Codex when only Codex is ready. Agent Memory skips Antigravity Agents,
-  because it reads native history that Antigravity does not expose.
+  to TeamHub as `POST /v1/model-calls`. On Computer 0.67.0 or later
+  (`FIRST_ANTIGRAVITY_MODEL_INVOKE_COMPUTER_VERSION`), an Antigravity owner
+  runs on Antigravity (tool-free, without workspace mode), falling back to
+  Claude and then Codex on the same Computer when Antigravity is unavailable
+  (such as on older Computers). Agent Memory supports Codex, Claude, Pi, and
+  Antigravity (reading Antigravity native transcripts on Computer 0.67.0 or
+  later, `FIRST_ANTIGRAVITY_HISTORY_COMPUTER_VERSION`).
   It is not a Runtime turn and never creates a Context, Local Run, or
   Operation. Callers name an owner (or an Agent placement) and a reasoning
   effort; never add a model name, gateway, or model environment variable. Pi
   stays on Pi, on whatever model Pi defaults to, and never falls back to
-  Codex or Claude. It serves structured and text calls without tools; workspace mode remains on
-  Codex and Claude.
+  Codex or Claude. Pi and Antigravity serve structured and text calls without
+  tools; workspace mode remains on Codex and Claude.
   Each background (non-interactive) call that ran on an Another Me's Computer
   and completed, or failed for a reason other than an offline Computer, a
   stopped call, a call the Daemon canceled (its connection closed or it is
@@ -80,23 +83,40 @@ take precedence.
   product authorization and Context availability.
 - The `ContextExecutor` and its Run loop (`run-loop.ts`) own the durable
   Local Run queue, active execution, steer,
-  cancellation, and the only Runtime execution path. Do not add a second
+  cancellation, and the only Runtime execution path. In a Meta Context a chat
+  steers the running Run from any Inbox; a Run not yet sent to its Runtime,
+  first or after a yield, goes back to the queue once the chat is queued, and
+  TeamHub claims the chat first. Do not add a second
   scheduler, execution store, or Runtime executor beside it, and do not
   restore TeamHub Run admission.
 - A Room Agent speaks only through TeamHub message writes, which the Computer
   classifies as `message` activities (`reply-delivery.ts`). Before a Room Run
   ends, the `room-reply-guard` feature (`onRunBeforeStop`) checks TeamHub's
-  persisted reply status (`GET /v0/agent-runtime/runs/reply-status`) and blocks
-  the Runtime's Stop hook at most once so the model can still send a visible
-  reply in the same turn. Before failing a Room Run for a missing reply (when a
-  Stop hook blocked once or when an older Daemon/Runtime never ran Stop hooks),
-  the Run loop re-checks TeamHub's persisted reply status so compound scripts,
-  decision cards, presentation sequences, and reactions that activity
-  classification missed are not misreported. A Room Run whose every write
-  failed finishes failed with `reply_undelivered`. One that left no reply while
-  a Human's Message that mentioned the Agent (a direct chat always does) waits
-  finishes failed with `reply_not_sent`. Its final text is private scratch and
-  is never posted for it.
+  persisted reply status (`GET /v0/agent-runtime/runs/reply-status`) for each
+  Inbox where a Human mentioned the Agent, so a chat steered in from another
+  Inbox needs its own reply, and blocks the Runtime's Stop hook at most once
+  so the model can still send a visible reply in the same turn. A Run woken
+  only by a Task report is blocked once too when it sent no visible message,
+  since the report is private. TeamHub does not count a message sent with
+  `--continuing` as the reply. When the Stop
+  hook confirms delivery (`replyConfirmed`), the Run loop skips both
+  `reply_undelivered` and `reply_not_sent` and avoids a redundant post-hoc check.
+  Otherwise (for instance, when a Stop hook blocked once, its check failed, or
+  an older Daemon/Runtime never ran Stop hooks), before failing a Room Run for
+  a missing reply while a Human's Message that mentioned the Agent (a direct
+  chat always does) waits, the Run loop re-checks TeamHub's persisted reply
+  status so compound scripts, decision cards, presentation sequences, and
+  reactions that activity classification missed are not misreported. When no
+  reply reached the Room while such a Human waits, a Run with at least one
+  failed write attempt finishes failed with `reply_undelivered`, and one with
+  no failed write attempt finishes failed with `reply_not_sent`. After a Stop
+  hook block that no reply confirmed, a delivered write may be only a
+  `--continuing` acknowledgement, so the Run loop asks TeamHub as well and
+  fails the Run with `reply_not_sent` only when TeamHub answers that no reply
+  landed; a failed check keeps the Run succeeded. Runs where no
+  Human waits on a reply are not failed as `reply_undelivered` or
+  `reply_not_sent`. The Runtime's final text is private scratch and is never
+  posted for it.
 - Ordinary Room/Meta execution reads effective Agent configuration before a new
   Local Run. Skill saves do not activate idle Contexts. If versions changed,
   reuse graceful activation to resume the same native history; running/steered
@@ -165,13 +185,22 @@ take precedence.
   `operation.prepare`, and `operation.start`) goes only to Computer 0.57.0 or
   later (`FIRST_STOP_HOOK_COMPUTER_VERSION`), because an older Computer rejects
   unknown envelope fields and closes the connection; Runs on older Computers
-  rely on `RunLoop`'s post-hoc `reply_not_sent` check.
-- `local_model_unavailable` in `runner.welcome`'s `service_features` goes to
-  every Computer that receives the field: the Go Daemon decodes the list as
-  strings and ignores a value it does not know. A Daemon that sees it reports a
-  Pi Run whose local model it could not load with the `local_model_unavailable`
-  failure code; otherwise it falls back to `model_unavailable`. TeamHub must
-  accept the code before an Agent Service announcing the feature reaches it.
+  rely on `RunLoop`'s post-hoc reply check (`reply_not_sent` / `reply_undelivered`).
+- `local_model_unavailable`, `model_gateway_unavailable`, and
+  `runtime_failure_detail` in `runner.welcome`'s `service_features` go to every
+  Computer that receives the field: the Go Daemon decodes the list as strings
+  and ignores a value it does not know. A Daemon that sees
+  `local_model_unavailable` reports a Pi Run whose local model it could not load
+  with that failure code (otherwise falling back to `model_unavailable`); one
+  that sees `model_gateway_unavailable` reports a Run whose local model gateway
+  it could not start or reach with `model_gateway_unavailable` (otherwise
+  falling back to `execution_failed`); one that sees `runtime_failure_detail`
+  attaches a redacted, bounded single-line `detail` to
+  `operation.failed.error.failure` (otherwise omitting it). For older TeamHub
+  releases that reject `terminal.failure.detail` with HTTP 400,
+  `ContextRuntimeState.finishLocalRun` drops `detail` and retries once.
+  TeamHub must accept each code before an Agent Service announcing the feature
+  reaches it.
 - Extended local-model diagnostics and debug metadata (`local_models_diagnostics`
   in `runner.welcome`'s `service_features`) are advertised only to Computer
   0.58.0 or later (`FIRST_LOCAL_MODELS_DIAGNOSTICS_COMPUTER_VERSION`), the
@@ -189,6 +218,74 @@ take precedence.
   or later (`FIRST_LOCAL_MODELS_ENGINE_COMPUTER_VERSION`); a Daemon talking to
   an older Agent Service strips `engine`, `engine_label`, `concurrency`, and
   `host_ram_bytes` from `LocalModel` rows.
+- Post-load local-model concurrency probing (`local_models_concurrency_probe`
+  in `runner.welcome`'s `service_features`) is advertised only to Computer
+  0.64.0 or later (`FIRST_LOCAL_MODELS_CONCURRENCY_PROBE_COMPUTER_VERSION`); a
+  Daemon talking to an older Agent Service strips `concurrency_probing` from
+  `LocalModel` rows. `ModelQueue` trusts `LocalModel.concurrency` only from
+  Computers at or above `FIRST_LOCAL_MODELS_CONCURRENCY_PROBE_COMPUTER_VERSION`:
+  a verified `1` locks `{ initial: 1, max: 1 }`, while a verified `N >= 2`
+  starts at `{ initial: N, max: 8 }` and retains adaptive growth above `N`
+  (older Computers and unprobed/unmeasured loads fall back to
+  `{ initial: 1, max: 8 }`). Loading another model in the library does not drop
+  the endpoint to `1` or reset an existing learned limit.
+- `local_models_external_holders` is advertised to every Computer (a Daemon
+  ignores an unknown feature); a Daemon talking to an older Agent Service
+  strips `external_holders` from `LocalModelPool` rows.
+- `operation_background_wait` in `runner.welcome`'s `service_features` is
+  advertised to every Computer (a Daemon ignores an unknown feature); only a
+  Daemon that sees it emits `run.background_waiting` and
+  `run.background_resumed` events. While an Antigravity turn enters
+  `waiting_background` (following `end_turn` or a `Stop` hook with
+  `fullyIdle: false` while native background tool calls remain open),
+  `RunnerOperation` tracks `phase: "waiting_background"` and active
+  `background_tools`, `ModelLease.suspend()` yields the `ModelQueue`
+  concurrency slot (`resume()` increments `active` immediately without waiting on
+  capacity, so a resumed Run may temporarily exceed the endpoint concurrency
+  limit), and incoming steers wake the session directly with `session/prompt`
+  while active turns receive steers via Antigravity's `PreInvocation` hook
+  (`injectSteps`).
+- `dynamic_reasoning_efforts` is advertised to every Computer (a Daemon
+  ignores an unknown feature); a Daemon filters `runner.hello` to the legacy
+  seven-value set so older Agent Services accept it, and publishes the full
+  model-advertised efforts in `runner.runtime_diagnostics` once welcome names
+  `dynamic_reasoning_efforts`.
+- `antigravity_usage_provider` in `runner.welcome`'s `service_features` is
+  advertised to every Computer (a Daemon ignores an unknown feature); a Daemon
+  that sees it reports `provider: "antigravity"` on Antigravity terminal
+  `RunUsage` entries, and downgrades to `"unknown"` (including on retained
+  event replay) when talking to an older Agent Service. TeamHub accepts both
+  `"antigravity"` and `"unknown"` for `antigravity` runs.
+- Explicit model selection on `execute` `model_invoke` (`model`) is sent only
+  to Computer 0.62.0 or later (`FIRST_MODEL_INVOKE_MODEL_COMPUTER_VERSION`),
+  because an older Computer rejects unknown envelope fields and closes the
+  connection. Background calls resolve the placed Agent's configured model on
+  its Runtime and fall back to the target Runtime's catalog default on
+  cross-Runtime fallback or when unconfigured.
+- `previous_session` on `operation.start` goes only to Computer 0.63.0 or later
+  (`FIRST_PREVIOUS_SESSION_COMPUTER_VERSION`), because older Computers reject
+  unknown envelope fields and close the connection. On `session_not_found` or
+  `context_too_long`, `RunLoop` requeues the Run once, clears the persisted
+  Runtime Session with `recovery_reason`, and reactivates in a fresh native
+  session so the Run resumes with inlined recent messages and (on Computer
+  0.63.0+) an exported `./playground/.previous-context.md` transcript.
+- Pi idle session compaction (`execute` `session_compact` with
+  `runtime_type: "pi"`) goes only to Computer 0.65.0 or later
+  (`FIRST_PI_SESSION_COMPACTION_COMPUTER_VERSION`), because older Computers
+  reject `"pi"` in `SessionCompact.runtime_type` and close the connection.
+  Codex and Claude session compaction stay enabled regardless of that gate.
+- Antigravity idle session compaction (`execute` `session_compact` with
+  `runtime_type: "antigravity"`) goes only to Computer 0.66.0 or later
+  (`FIRST_ANTIGRAVITY_SESSION_COMPACTION_COMPUTER_VERSION`), because Computers
+  on 0.65.0 and earlier reject `"antigravity"` in `SessionCompact.runtime_type`
+  and close the connection.
+- `antigravity_history` in `runner.welcome`'s `service_features` is advertised
+  to every Computer (a Daemon ignores an unknown feature); only a Daemon that
+  sees it returns `antigravity_transcript` history inspection results. Agent
+  Service gates detached Antigravity history reads
+  (`FIRST_ANTIGRAVITY_HISTORY_COMPUTER_VERSION`) and Antigravity `model_invoke`
+  (`FIRST_ANTIGRAVITY_MODEL_INVOKE_COMPUTER_VERSION`) on Computer 0.67.0 or
+  later.
 - Default unit, integration, and fixture smoke tests use deterministic adapters
   and do not call a live model provider. Explicitly named live suites such as
   `smoke:local-runner:live` may use an authenticated provider and must remain

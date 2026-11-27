@@ -15,7 +15,7 @@ import {
   unavailableShortCopy,
 } from "./local-models-copy";
 import {
-  collapsedRowBadges,
+  buildModelGroups,
   contextLabel,
   downloadPercent,
   downloadStatusDetail,
@@ -32,12 +32,15 @@ import {
   memoryReclaimable,
   memorySegments,
   memorySummary,
+  modelBaseName,
   modelCapabilities,
   modelEntries,
+  modelGroupKey,
   parametersLabel,
   placeName,
   poolLabel,
   poolOtherBytes,
+  poolUnaccountedBytes,
   safeModelSourceUrl,
   speedLabel,
   usedByBadge,
@@ -141,6 +144,7 @@ describe("local models rules", () => {
       componentBytes: gb(1.5),
       models: [{ bytes: gb(16), id: "shared:Q4", name: "Shared Model" }],
       otherBytes: gb(4),
+      unaccountedBytes: 0,
     });
 
     expect(memorySegments(macView())).toEqual({
@@ -149,7 +153,85 @@ describe("local models rules", () => {
         { bytes: gb(14.3), id: "gpt-oss-20b:Q4_K_M", name: "GPT-OSS 20B" },
       ],
       otherBytes: 0,
+      unaccountedBytes: 0,
     });
+  });
+
+  it("attributes other apps memory only to external holders and separates unaccounted overhead", () => {
+    // 16 GB card with 7.5 GB model, 15 GB total used.
+    // external_holders has desktop apps using 0.2 GB.
+    const poolWithHolders = {
+      ...gpuPool(0, 16, [
+        { gb: 7.5, id: "inkling-2-mini", name: "Inkling 2 Mini" },
+      ]),
+      external_holders: [{ bytes: gb(0.2), name: "browser" }],
+      used_bytes: gb(15),
+    };
+
+    // Residual is 15 - 7.5 = 7.5 GB.
+    // Other apps should only be the 0.2 GB from external_holders.
+    expect(poolOtherBytes(poolWithHolders)).toBe(gb(0.2));
+    // Remaining 7.3 GB is unaccounted (system/engine overhead).
+    expect(poolUnaccountedBytes(poolWithHolders)).toBe(gb(7.3));
+
+    // When external_holders is empty list (no closeable apps found)
+    const poolNoExternalApps = {
+      ...gpuPool(0, 16, [
+        { gb: 7.5, id: "inkling-2-mini", name: "Inkling 2 Mini" },
+      ]),
+      external_holders: [],
+      used_bytes: gb(15),
+    };
+    expect(poolOtherBytes(poolNoExternalApps)).toBe(0);
+    expect(poolUnaccountedBytes(poolNoExternalApps)).toBe(gb(7.5));
+
+    // When external_holders is undefined (legacy daemon/localmodels)
+    const legacyPool = {
+      ...gpuPool(0, 16, [
+        { gb: 7.5, id: "inkling-2-mini", name: "Inkling 2 Mini" },
+      ]),
+      used_bytes: gb(15),
+    };
+    expect(poolOtherBytes(legacyPool)).toBe(gb(7.5));
+    expect(poolUnaccountedBytes(legacyPool)).toBe(0);
+
+    // If external_holders report more bytes than the residual, cap to residual
+    const cappedPool = {
+      ...gpuPool(0, 16, [
+        { gb: 7.5, id: "inkling-2-mini", name: "Inkling 2 Mini" },
+      ]),
+      external_holders: [{ bytes: gb(10), name: "game" }],
+      used_bytes: gb(15),
+    };
+    expect(poolOtherBytes(cappedPool)).toBe(gb(7.5));
+    expect(poolUnaccountedBytes(cappedPool)).toBe(0);
+  });
+
+  it("does not trigger close-apps memory guidance when residual is system/engine overhead", () => {
+    // 16 GB card with 7.5 GB loaded model, 15 GB used (only 1 GB free).
+    // external_holders is empty. A 4 GB model cannot fit, but closing apps won't help.
+    const poolNoOtherApps = {
+      ...gpuPool(0, 16, [
+        { gb: 7.5, id: "inkling-2-mini", name: "Inkling 2 Mini" },
+      ]),
+      external_holders: [],
+      used_bytes: gb(15),
+    };
+    const view = labView({
+      models: [
+        modelView(
+          localModel({
+            id: "medium:Q4",
+            memory_bytes: gb(4),
+            name: "Medium",
+            pool: "gpu:0",
+          }),
+        ),
+      ],
+      pools: [poolNoOtherApps],
+    });
+    // memoryGuidance should be null because otherBytes is 0.
+    expect(memoryGuidance(view)).toBeNull();
   });
 
   it("detects external app memory and surfaces cleanup guidance when it blocks models", () => {
@@ -448,56 +530,23 @@ describe("local models rules", () => {
     ).toEqual(["vision"]);
   });
 
-  it("formats parameter scale, architecture, and collapsed row badges", () => {
+  it("formats parameter scale and architecture", () => {
     const moe = localModel({
       active_parameters: "3B",
       architecture: "moe",
-      capabilities: ["coding", "reasoning", "tool_use", "vision"],
       id: "qwen3-coder-30b:Q4_K_M",
       name: "Qwen3 Coder 30B",
       parameters: "30B",
-      vision: true,
     });
     expect(parametersLabel(moe, translate)).toBe("30B · 3B active (MoE)");
-    expect(collapsedRowBadges(moe, translate)).toEqual({
-      badges: ["3B active", "Vision", "Tool use", "+2"],
-      overflowTitle: "Reasoning, Coding",
-    });
 
     const dense = localModel({
       architecture: "dense",
-      capabilities: ["tool_use"],
       id: "qwen3-4b:Q4_K_M",
       name: "Qwen3 4B",
       parameters: "4B",
     });
     expect(parametersLabel(dense, translate)).toBe("4B (Dense)");
-    expect(collapsedRowBadges(dense, translate)).toEqual({
-      badges: ["4B", "Tool use"],
-    });
-
-    // Collapsed badges depend strictly on structured fields, never name or description.
-    expect(
-      collapsedRowBadges(
-        {
-          ...dense,
-          description: "Vision reasoning model with 70B scale.",
-          name: "Renamed Without Size",
-        },
-        translate,
-      ),
-    ).toEqual(collapsedRowBadges(dense, translate));
-
-    expect(
-      collapsedRowBadges(
-        localModel({
-          id: "llama3.3:Q4_K_M",
-          name: "Llama 3.3",
-          parameters: "70B",
-        }),
-        translate,
-      ),
-    ).toEqual({ badges: ["70B"] });
   });
 
   it("identifies models on the computer and formats Agent usage chips", () => {
@@ -897,6 +946,51 @@ describe("featured Inkling 2 Mini rules", () => {
     expect(featuredInklingEntry(modelEntries(iq3Loaded))?.model.id).toBe(
       "inkling-2-mini:UD-IQ3_S",
     );
+
+    // When all Inkling variants are unavailable (e.g. 16 GB Mac), prefer the smallest memory build.
+    const bothUnavailable = labView({
+      models: [
+        modelView(
+          localModel({
+            availability: {
+              downloadable: false,
+              reason: {
+                code: "MEMORY_INSUFFICIENT",
+                have_bytes: gb(10.5),
+                need_bytes: gb(17.9),
+              },
+            },
+            fit: "none",
+            id: "inkling-2-mini:UD-Q4_K_M",
+            memory_bytes: gb(21.4),
+            name: "Inkling 2 Mini (UD-Q4_K_M)",
+            pool: undefined,
+            quant: "UD-Q4_K_M",
+          }),
+        ),
+        modelView(
+          localModel({
+            availability: {
+              downloadable: false,
+              reason: {
+                code: "MEMORY_INSUFFICIENT",
+                have_bytes: gb(10.5),
+                need_bytes: gb(13.5),
+              },
+            },
+            fit: "none",
+            id: "inkling-2-mini-iq3xxs:UD-IQ3_XXS",
+            memory_bytes: gb(16.8),
+            name: "Inkling 2 Mini (UD-IQ3_XXS)",
+            pool: undefined,
+            quant: "UD-IQ3_XXS",
+          }),
+        ),
+      ],
+    });
+    expect(featuredInklingEntry(modelEntries(bothUnavailable))?.model.id).toBe(
+      "inkling-2-mini-iq3xxs:UD-IQ3_XXS",
+    );
   });
 });
 
@@ -1055,6 +1149,28 @@ describe("hostBlocker, RAM reclaimability, and diagnostics copy", () => {
       ),
     ).toBe("needs 16 GB RAM");
     expect(
+      unavailableShortCopy(
+        {
+          code: "MEMORY_INSUFFICIENT",
+          memory_kind: "vram",
+          need_bytes: gb(13.7),
+        },
+        translate,
+      ),
+    ).toBe("needs 13.7 GB VRAM");
+    expect(
+      unavailableCopy(
+        {
+          code: "MEMORY_INSUFFICIENT",
+          have_bytes: gb(8),
+          memory_kind: "vram",
+          need_bytes: gb(13.7),
+        },
+        false,
+        translate,
+      ),
+    ).toContain("GPU memory (VRAM)");
+    expect(
       unavailableCopy(
         {
           code: "MEMORY_INSUFFICIENT",
@@ -1163,5 +1279,346 @@ describe("hostBlocker, RAM reclaimability, and diagnostics copy", () => {
     expect(featuredInklingEntry([llamaEntry, polyEntry])?.model.id).toBe(
       "inkling-2-mini-q4-poly:UD-Q4_K_XL",
     );
+
+    // Among unavailable Inkling variants on a 12 GB CUDA 12.8 card, actionable
+    // driver upgrades beat hard memory misses and keep backend order (q3 before q4).
+    const driverQ3 = {
+      ...modelView(
+        localModel({
+          availability: {
+            downloadable: false,
+            reason: {
+              code: "DRIVER_UPDATE_REQUIRED",
+              detected_cuda: "12.8",
+              required_cuda: "13.0",
+            },
+          },
+          engine: "polystrata",
+          fit: "none",
+          id: "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+          memory_bytes: gb(5),
+          name: "Inkling 2 Mini (UD-Q3_K_XL)",
+          pool: undefined,
+          quant: "UD-Q3_K_XL",
+        }),
+      ),
+      status: "unavailable" as const,
+    };
+    const driverQ4 = {
+      ...modelView(
+        localModel({
+          availability: {
+            downloadable: false,
+            reason: {
+              code: "DRIVER_UPDATE_REQUIRED",
+              detected_cuda: "12.8",
+              required_cuda: "13.0",
+            },
+          },
+          engine: "polystrata",
+          fit: "none",
+          id: "inkling-2-mini-q4-poly:UD-Q4_K_XL",
+          memory_bytes: gb(19),
+          name: "Inkling 2 Mini (UD-Q4_K_XL)",
+          pool: undefined,
+          quant: "UD-Q4_K_XL",
+        }),
+      ),
+      status: "unavailable" as const,
+    };
+    const memMissIq3 = {
+      ...modelView(
+        localModel({
+          availability: {
+            downloadable: false,
+            reason: {
+              code: "MEMORY_INSUFFICIENT",
+              have_bytes: gb(11),
+              memory_kind: "vram",
+              need_bytes: gb(13.7),
+            },
+          },
+          engine: "llama.cpp",
+          fit: "none",
+          id: "inkling-2-mini-iq3xxs:UD-IQ3_XXS",
+          memory_bytes: gb(13.7),
+          name: "Inkling 2 Mini (UD-IQ3_XXS)",
+          pool: undefined,
+          quant: "UD-IQ3_XXS",
+        }),
+      ),
+      status: "unavailable" as const,
+    };
+    expect(
+      featuredInklingEntry([memMissIq3, driverQ3, driverQ4])?.model.id,
+    ).toBe("inkling-2-mini-q3-poly:UD-Q3_K_XL");
+
+    // On an 8 GB VRAM / 16 GB RAM host, compare actual shortfall (4 GB RAM < 6.7 GB VRAM).
+    const ramShortQ2 = {
+      ...modelView(
+        localModel({
+          availability: {
+            downloadable: false,
+            reason: {
+              code: "MEMORY_INSUFFICIENT",
+              have_bytes: gb(16),
+              memory_kind: "ram",
+              need_bytes: gb(20),
+            },
+          },
+          engine: "polystrata",
+          fit: "none",
+          id: "inkling-2-mini-q2-poly:UD-Q2_K_XL",
+          memory_bytes: gb(5),
+          name: "Inkling 2 Mini (UD-Q2_K_XL)",
+          pool: undefined,
+          quant: "UD-Q2_K_XL",
+        }),
+      ),
+      status: "unavailable" as const,
+    };
+    const vramShortIq3 = {
+      ...memMissIq3,
+      model: {
+        ...memMissIq3.model,
+        availability: {
+          downloadable: false,
+          reason: {
+            code: "MEMORY_INSUFFICIENT" as const,
+            have_bytes: gb(7),
+            memory_kind: "vram" as const,
+            need_bytes: gb(13.7),
+          },
+        },
+      },
+    };
+    expect(featuredInklingEntry([vramShortIq3, ramShortQ2])?.model.id).toBe(
+      "inkling-2-mini-q2-poly:UD-Q2_K_XL",
+    );
+  });
+
+  it("prefers a hardware-fitting driver-update Inkling variant over a VRAM-insufficient Q4 variant", () => {
+    const q4TooBig = {
+      ...modelView(
+        localModel({
+          availability: {
+            downloadable: false,
+            reason: {
+              code: "MEMORY_INSUFFICIENT",
+              have_bytes: gb(8),
+              memory_kind: "vram",
+              need_bytes: gb(20),
+            },
+          },
+          engine: "polystrata",
+          fit: "none",
+          id: "inkling-2-mini-q4-poly:UD-Q4_K_XL",
+          name: "Inkling 2 Mini (UD-Q4_K_XL)",
+          pool: undefined,
+          quant: "UD-Q4_K_XL",
+          recommended: false,
+        }),
+      ),
+      status: "unavailable" as const,
+    };
+    const q3DriverBlocked = {
+      ...modelView(
+        localModel({
+          availability: {
+            downloadable: false,
+            reason: {
+              code: "DRIVER_UPDATE_REQUIRED",
+              detected_cuda: "12.8",
+              driver_version: "572.83",
+              required_cuda: "13.0",
+            },
+          },
+          engine: "polystrata",
+          fit: "none",
+          id: "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+          name: "Inkling 2 Mini (UD-Q3_K_XL)",
+          pool: undefined,
+          quant: "UD-Q3_K_XL",
+          recommended: false,
+        }),
+      ),
+      status: "unavailable" as const,
+    };
+    expect(featuredInklingEntry([q4TooBig, q3DriverBlocked])?.model.id).toBe(
+      "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+    );
+    expect(
+      unavailableCopy(
+        q3DriverBlocked.model.availability.reason,
+        false,
+        translate,
+        "PolyStrata",
+      ),
+    ).toContain("PolyStrata requires NVIDIA driver 580+");
+  });
+
+  it("groups sibling quantizations by structured source_url, moves unavailable spotlight below available, and keeps extra active variants visible", () => {
+    const qwenRepo = "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF";
+    const flashRepo = "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF";
+    const inklingRepo = "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF";
+
+    expect(
+      modelBaseName(
+        localModel({
+          id: "qwen3.8-27b:UD-Q4_K_M",
+          name: "Qwen3.8 27B (UD-Q4_K_M)",
+          quant: "UD-Q4_K_M",
+        }),
+      ),
+    ).toBe("Qwen3.8 27B");
+    expect(
+      modelBaseName(
+        localModel({
+          id: "inkling-2-mini-iq3xxs:UD-IQ3_XXS",
+          name: "Inkling 2 Mini (IQ3_XXS)",
+          quant: "UD-IQ3_XXS",
+        }),
+      ),
+    ).toBe("Inkling 2 Mini");
+    expect(
+      modelGroupKey(
+        localModel({
+          id: "qwen3.8-27b:UD-Q4_K_M",
+          name: "Qwen3.8 27B (UD-Q4_K_M)",
+          source_url: qwenRepo,
+        }),
+      ),
+    ).toBe(`source:${qwenRepo.toLowerCase()}`);
+
+    // 16 GB Mac: Ornith fits (recommended), Inkling & Flash Next are unavailable.
+    const mac16Entries = modelEntries(
+      macView({
+        models: [
+          modelView(
+            localModel({
+              engine: "llama.cpp",
+              fit: "unified",
+              id: "ornith-1.5-9b:Q4_K_M",
+              memory_bytes: gb(10.4),
+              name: "Ornith 1.5 9B (Q4_K_M)",
+              pool: "unified",
+              quant: "Q4_K_M",
+              recommended: true,
+              source_url: "https://huggingface.co/unsloth/Ornith-1.5-9B-GGUF",
+            }),
+          ),
+          modelView(
+            localModel({
+              availability: {
+                downloadable: false,
+                reason: {
+                  code: "MEMORY_INSUFFICIENT",
+                  have_bytes: gb(13),
+                  need_bytes: gb(16.2),
+                },
+              },
+              engine: "llama.cpp",
+              fit: "none",
+              id: "inkling-2-mini-iq3xxs:UD-IQ3_XXS",
+              memory_bytes: gb(16.2),
+              name: "Inkling 2 Mini (UD-IQ3_XXS)",
+              pool: undefined,
+              quant: "UD-IQ3_XXS",
+              source_url: inklingRepo,
+            }),
+          ),
+          modelView(
+            localModel({
+              availability: {
+                downloadable: false,
+                reason: {
+                  code: "MEMORY_INSUFFICIENT",
+                  have_bytes: gb(13),
+                  need_bytes: gb(72),
+                },
+              },
+              engine: "llama.cpp",
+              fit: "none",
+              id: "qwen3.8-flash-next-iq2xs:GSQ-RCO-IQ2_XS",
+              memory_bytes: gb(72),
+              name: "Qwen3.8 Flash Next (GSQ-RCO-IQ2_XS)",
+              pool: undefined,
+              quant: "GSQ-RCO-IQ2_XS",
+              source_url: flashRepo,
+            }),
+          ),
+          modelView(
+            localModel({
+              availability: {
+                downloadable: false,
+                reason: {
+                  code: "MEMORY_INSUFFICIENT",
+                  have_bytes: gb(13),
+                  need_bytes: gb(88),
+                },
+              },
+              engine: "llama.cpp",
+              fit: "none",
+              id: "qwen3.8-flash-next-iq3s:GSQ-RCO-IQ3_S",
+              memory_bytes: gb(88),
+              name: "Qwen3.8 Flash Next (GSQ-RCO-IQ3_S)",
+              pool: undefined,
+              quant: "GSQ-RCO-IQ3_S",
+              source_url: flashRepo,
+            }),
+          ),
+        ],
+      }),
+    );
+    const mac16Sections = buildModelGroups(mac16Entries);
+    expect(mac16Sections.showEngineBadge).toBe(false);
+    expect(mac16Sections.spotlightPosition).toBe("afterAvailable");
+    expect(mac16Sections.available.map((g) => g.defaultEntry.model.id)).toEqual(
+      ["ornith-1.5-9b:Q4_K_M"],
+    );
+    expect(mac16Sections.unavailable).toHaveLength(1);
+    expect(
+      mac16Sections.unavailable[0]!.variants.map((v) => v.model.id),
+    ).toEqual([
+      "qwen3.8-flash-next-iq2xs:GSQ-RCO-IQ2_XS",
+      "qwen3.8-flash-next-iq3s:GSQ-RCO-IQ3_S",
+    ]);
+    expect(mac16Sections.unavailableAllMemory).toBe(true);
+
+    // When two variants of the same model are both active on computer, both surface in onComputer.
+    const dualActiveEntries = modelEntries(
+      macView({
+        models: [
+          modelView(
+            localModel({
+              engine: "llama.cpp",
+              fit: "unified",
+              id: "qwen3.8-27b:UD-Q4_K_M",
+              name: "Qwen3.8 27B (UD-Q4_K_M)",
+              pool: "unified",
+              quant: "UD-Q4_K_M",
+              source_url: qwenRepo,
+              state: "loaded",
+            }),
+          ),
+          modelView(
+            localModel({
+              engine: "llama.cpp",
+              fit: "unified",
+              id: "qwen3.8-27b-iq3s:UD-IQ3_S",
+              name: "Qwen3.8 27B (UD-IQ3_S)",
+              pool: "unified",
+              quant: "UD-IQ3_S",
+              source_url: qwenRepo,
+              state: "downloading",
+            }),
+          ),
+        ],
+      }),
+    );
+    const dualActiveSections = buildModelGroups(dualActiveEntries);
+    expect(
+      dualActiveSections.onComputer.map((g) => g.defaultEntry.model.id),
+    ).toEqual(["qwen3.8-27b:UD-Q4_K_M", "qwen3.8-27b-iq3s:UD-IQ3_S"]);
   });
 });

@@ -110,6 +110,16 @@ const (
 	// StatusComputerOffline is an owner with no online Computer running their
 	// AnotherMe.
 	StatusComputerOffline = "computer_offline"
+	// StatusNotConfigured is a lark-cli never set up with a Feishu app, which
+	// no login can fix.
+	StatusNotConfigured = "not_configured"
+)
+
+// The commands that install lark-cli and set it up with a Feishu app on the
+// owner's Computer. The Web receives the command for the current setup step.
+const (
+	InstallCommand = "npm install -g @larksuite/cli"
+	SetupCommand   = "lark-cli config init --new"
 )
 
 // ErrAuthorizationRequired reports an owner whose lark-cli is not logged in

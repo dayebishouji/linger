@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,6 +35,7 @@ import (
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/platform/privatefs"
 	localprocess "github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/process"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider"
+	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider/native"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider/redact"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/selfupdate"
 	localworkspace "github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/workspace"
@@ -54,6 +56,10 @@ func main() {
 	}
 	if len(os.Args) == 3 && os.Args[1] == "stop-hook" {
 		os.Exit(permission.CodexRunStopHook(os.Stdin, os.Stdout, os.Stderr, os.Args[2]))
+	}
+	// Antigravity runs this for managed PreInvocation, PreToolUse, and Stop hooks.
+	if len(os.Args) == 3 && os.Args[1] == "antigravity-hook" {
+		os.Exit(native.AntigravityRunHook(os.Stdin, os.Stdout, os.Stderr, os.Args[2]))
 	}
 	if handoff := recoverPendingUpgrade(os.Args[1:]); handoff != nil {
 		if execErr := handoff.Exec(); execErr != nil {
@@ -102,6 +108,9 @@ func run(args []string) (resultErr error) {
 	if handled, err := platformEntry(args); handled {
 		return err
 	}
+	if len(args) > 0 && args[0] == "probe-runtimes" {
+		return runProbeRuntimes(context.Background(), args[1:], computerconfig.ProcessEnvironment(), os.Stdout)
+	}
 	if len(args) != 2 || args[0] != "--config" || args[1] == "" {
 		return errors.New("linger-computer-daemon requires --config <path>")
 	}
@@ -140,6 +149,8 @@ func run(args []string) (resultErr error) {
 	} else if removed > 0 {
 		slog.Info("pruned abandoned Operation temp directories", "removed", removed, "bytes_freed", bytesFreed)
 	}
+	native.ConfigureAntigravityHookTempBase(operationTempBase)
+	defer func() { _ = native.CloseAntigravitySharedHookEndpoint() }()
 	baseProviderEnvironment := runtimeProviderEnvironment(environment, computer.GatewayToken, computer.CodexAuthFile)
 	var localModelsStateDir string
 	if computer.LocalModels != nil {
@@ -156,16 +167,31 @@ func run(args []string) (resultErr error) {
 	if computer.LocalModels != nil {
 		piCatalog = localmodels.NewPiCatalog(filepath.Join(computer.StateDirectory, "local-models"))
 	}
+	toolInstallation, err := localtools.Installed(executable)
+	if err != nil {
+		return err
+	}
+	if toolInstallation == nil {
+		// Agents on this computer then have no browser or computer-control
+		// tools; say so instead of leaving them silently missing.
+		slog.Warn("computer_tools.missing: browser and computer-control tools are disabled", "expected", localtools.ToolsDirectory(executable))
+	} else if toolInstallation.PowerShellPath != "" {
+		baseProviderEnvironment = withBundledPowerShellPath(baseProviderEnvironment, toolInstallation.PowerShellPath, runtime.GOOS)
+	}
 	currentDiscoveryOptions := func() provider.DiscoveryOptions {
 		var managedPi string
 		if localModels != nil {
 			managedPi = localModels.PiExecutable()
 		}
+		configuredPaths, managedPaths, bundledPaths := daemonDiscoveryPaths(computer.RuntimePaths, localModelsStateDir, managedPi, toolInstallation)
 		return provider.DiscoveryOptions{
-			ConfiguredPaths:  withManagedPiPath(localmodels.OverlayRuntimePaths(computer.RuntimePaths, localModelsStateDir), managedPi),
+			ConfiguredPaths:  configuredPaths,
+			ManagedPaths:     managedPaths,
+			BundledPaths:     bundledPaths,
 			Runtimes:         computer.EnabledRuntimes,
 			PreferredRuntime: computer.PreferredRuntime,
 			RuntimeHomeRoot:  filepath.Join(computer.StateDirectory, "runtime-homes"),
+			TempBase:         operationTempBase,
 			Environment:      currentProviderEnvironment(),
 		}
 	}
@@ -176,17 +202,23 @@ func run(args []string) (resultErr error) {
 		}
 		return shapeDiscoveredResult(result, localModelsStateDir, localModels != nil && localModels.PiProvisionFailed(), piCatalog, snapshot)
 	}
+	terminalCache := provider.NewTerminalEnvironmentCache()
 	discover := func(ctx context.Context, options provider.DiscoveryOptions) (provider.DiscoveryResult, error) {
-		result, err := provider.Discover(ctx, options)
+		result, err := terminalCache.Discover(ctx, options)
 		if err == nil {
 			result = shapeDiscovered(result)
 		}
 		return result, err
 	}
 	providerEnvironment := currentProviderEnvironment()
+	initialRuntimes, backfillRuntimes := startupDiscoverySplit(computer.PreferredRuntime, computer.EnabledRuntimes)
+	initialOptions := currentDiscoveryOptions()
+	if len(backfillRuntimes) > 0 {
+		initialOptions.Runtimes = initialRuntimes
+	}
 	// The monitor refreshes from what Discover found, not from the shaped
 	// result, so it gets the unshaped one.
-	rawDiscovered, err := provider.Discover(context.Background(), currentDiscoveryOptions())
+	rawDiscovered, err := terminalCache.Discover(context.Background(), initialOptions)
 	if err != nil {
 		return err
 	}
@@ -255,9 +287,10 @@ func run(args []string) (resultErr error) {
 		teamhubBin = managedToolsBin
 	}
 	resolver := lingercontext.ExecutionResolver{
-		ServiceCommand: serviceCommand,
-		TeamHubCLIBin:  teamhubBin,
-		ProviderLookup: providerCatalog.Lookup, WorkspaceGrants: workspaceGrants, Views: views,
+		ServiceCommand:       serviceCommand,
+		TeamHubCLIBin:        teamhubBin,
+		HostEnvironmentGuide: hostEnvironmentGuide(runtime.GOOS),
+		ProviderLookup:       providerCatalog.Lookup, WorkspaceGrants: workspaceGrants, Views: views,
 		CLICredentials: cliCredentials,
 		RegistrationLookup: func(ctx context.Context, registrationID string) (lingercontext.RegistrationBinding, bool, error) {
 			items, err := registrationStore.List(ctx)
@@ -276,15 +309,6 @@ func run(args []string) (resultErr error) {
 			return lingercontext.RegistrationBinding{}, false, nil
 		},
 	}
-	toolInstallation, err := localtools.Installed(executable)
-	if err != nil {
-		return err
-	}
-	if toolInstallation == nil {
-		// Agents on this computer then have no browser or computer-control
-		// tools; say so instead of leaving them silently missing.
-		slog.Warn("computer_tools.missing: browser and computer-control tools are disabled", "expected", localtools.ToolsDirectory(executable))
-	}
 	var toolManager *localtools.Manager
 	var toolBinder daemon.LocalToolBinder
 	var piExtension string
@@ -298,9 +322,14 @@ func run(args []string) (resultErr error) {
 		if override := os.Getenv("LINGER_COMPUTER_CUA_PATH"); override != "" {
 			cuaPath = override
 		}
+		var cuaSocket string
+		if computer.Desktop != nil {
+			cuaSocket = computer.Desktop.CuaSocket
+		}
 		toolManager, err = localtools.New(localtools.Options{
 			StateDirectory: computer.StateDirectory, Environment: providerEnvironment,
 			NodePath: toolInstallation.NodePath, PlaywrightEntry: toolInstallation.PlaywrightEntry, CuaPath: cuaPath,
+			CuaEmbedded: cuaSocket != "", CuaSocket: cuaSocket,
 		})
 		if err != nil {
 			return err
@@ -325,13 +354,20 @@ func run(args []string) (resultErr error) {
 	if computer.Desktop != nil {
 		desktop = newDesktopChannel(os.Stdout)
 		permissionOptions.Linger = desktop
+		permissionOptions.EmbeddedCua = computer.Desktop.CuaSocket != ""
 	}
 	if toolManager != nil {
 		permissionOptions.Cua = toolManager
 	}
-	inventory := &runtimeInventory{
-		computer: computer, rejected: provider.NewRejectedModels(runtimeCredentialFiles(providerEnvironment)),
-		runtimes: runtimes, diagnostics: discovered.Diagnostics, revision: runtimeObservationRevision,
+	inventory, err := newRuntimeInventory(
+		computer,
+		provider.NewRejectedModels(runtimeCredentialFiles(providerEnvironment)),
+		runtimes,
+		discovered.Diagnostics,
+		runtimeObservationRevision,
+	)
+	if err != nil {
+		return err
 	}
 	// A load or unload changes Pi's model list: the library asks for a
 	// full Runtime discovery.
@@ -344,6 +380,10 @@ func run(args []string) (resultErr error) {
 			Python: tool.Python, ModuleDirectory: tool.ModuleDirectory,
 			StateDirectory: tool.StateDirectory, BaseDirectory: tool.BaseDirectory,
 		}
+		if toolInstallation != nil && toolInstallation.PiEntry != "" {
+			localModelsTool.BundledPiBinDir = filepath.Dir(toolInstallation.PiEntry)
+			localModelsTool.BundledPiVersion = toolInstallation.PiVersion
+		}
 	}
 	jobDir := filepath.Join(computer.StateDirectory, "local-models", "jobs")
 	var nodePath string
@@ -352,15 +392,17 @@ func run(args []string) (resultErr error) {
 	}
 	piEnabled := len(computer.EnabledRuntimes) == 0 || slices.Contains(computer.EnabledRuntimes, "pi")
 	_, hasPi := discovered.Installations["pi"]
+	piDeferred := slices.Contains(backfillRuntimes, "pi")
 	libraryHarnessDir := ""
-	if piEnabled && !hasPi {
+	if piEnabled && !hasPi && !piDeferred {
 		libraryHarnessDir = localmodels.HarnessRoot(localModelsStateDir)
 	}
 	localModels = localmodels.New(localmodels.Options{
 		Tool: localModelsTool, Environment: baseProviderEnvironment,
-		JobDirectory:     jobDir,
-		HarnessDirectory: libraryHarnessDir,
-		NodePath:         nodePath,
+		JobDirectory:        jobDir,
+		ProbeCacheDirectory: filepath.Join(computer.StateDirectory, "local-models"),
+		HarnessDirectory:    libraryHarnessDir,
+		NodePath:            nodePath,
 		// The library publishes only from Act and Refresh, which the Daemon
 		// calls once it runs.
 		Publish: func(snapshot wire.LocalModelsSnapshot) { localDaemon.PublishLocalModels(snapshot) },
@@ -378,14 +420,21 @@ func run(args []string) (resultErr error) {
 		},
 	})
 	defer localModels.Close()
+	antigravityExecutable := &antigravityExecutableTracker{path: discovered.Installations["antigravity"].ExecutablePath}
 	applyDiscovered := func(publishCtx context.Context, next provider.DiscoveryResult) error {
-		logRuntimeDiagnostics(next.Diagnostics)
-		nextProviders, nextRuntimes := providerInstallations(next, currentProviderEnvironment(), localModelsStateDir)
-		providerCatalog.Replace(nextProviders)
-		if controller != nil {
-			controller.UpdateDiagnostics(next.Diagnostics)
+		reconcileLocalModelsHarness(localModels, piEnabled, localModelsStateDir, next)
+		if antigravityExecutable.changed(next) && localDaemon != nil {
+			localDaemon.InvalidateAntigravityResidents("executable_changed")
 		}
-		return inventory.publish(publishCtx, nextRuntimes, next.Diagnostics)
+		return applyRuntimeDiscovery(
+			publishCtx,
+			next,
+			currentProviderEnvironment(),
+			localModelsStateDir,
+			providerCatalog,
+			controller,
+			inventory,
+		)
 	}
 	modelSource := localmodels.NewModelSource(localmodels.ModelSourceOptions{
 		Tool:         localModelsTool,
@@ -409,13 +458,15 @@ func run(args []string) (resultErr error) {
 		},
 	})
 	codexModelSessions := &provider.CodexSessions{Root: filepath.Join(computer.StateDirectory, "model-invoke", "codex-sessions")}
+	antigravityHome, _ := localworkspace.AntigravitySourceHome(providerEnvironment)
 	localDaemon, err = daemon.New(daemon.Options{
 		ComputerID: computer.ComputerID, DisplayName: computer.DisplayName,
-		Capacity: computer.MaxConcurrentOperations, Runtimes: runtimes,
+		Runtimes:           runtimes,
 		EnabledRuntimes:    computer.EnabledRuntimes,
 		RuntimeDiagnostics: diagnostics, WorkspaceGrants: encodedGrants,
 		StateDirectory:      computer.StateDirectory,
 		RuntimeHomeRoot:     filepath.Join(computer.StateDirectory, "runtime-homes"),
+		AntigravityHome:     antigravityHome,
 		RuntimeObservations: runtimeObservations(computer, provider.GatewayDiagnostics(discovered.Diagnostics), runtimeObservationRevision),
 		OnModelUnavailable:  inventory.reject,
 		ModelInvokeUnready: func(runtimeType string) bool {
@@ -480,7 +531,6 @@ func run(args []string) (resultErr error) {
 	controller = &controlController{
 		daemon: localDaemon, assignments: assignmentStore, diagnostics: discovered.Diagnostics,
 		services: managedServices, computerID: computer.ComputerID,
-		capacity:    computer.MaxConcurrentOperations,
 		launchNonce: os.Getenv("LINGER_DAEMON_LAUNCH_NONCE"), cancel: cancel,
 	}
 	controlServer, err := lingercontrol.New(computer.StateDirectory, controller)
@@ -505,8 +555,10 @@ func run(args []string) (resultErr error) {
 		monitorDone <- provider.MonitorRuntimeDiagnostics(ctx, provider.RuntimeMonitorOptions{
 			Initial:               rawDiscovered,
 			InitialPublished:      &discovered,
+			BackfillRuntimes:      backfillRuntimes,
 			Discovery:             currentDiscoveryOptions(),
 			ResolveDiscovery:      currentDiscoveryOptions,
+			TerminalEnvironment:   terminalCache,
 			Shape:                 shapeDiscovered,
 			RefreshInterval:       15 * time.Second,
 			FullRefreshEveryTicks: 4,
@@ -550,7 +602,6 @@ type controlController struct {
 	diagnostics   []provider.RuntimeDiagnostic
 	diagnosticsMu sync.RWMutex
 	computerID    string
-	capacity      *int
 	launchNonce   string
 	cancel        context.CancelFunc
 }
@@ -571,9 +622,6 @@ func (c *controlController) Status(ctx context.Context) (map[string]any, error) 
 		"gateway_state":  c.daemon.GatewayState(),
 		"reconciled":     c.daemon.Reconciled(),
 		"active_runners": activeRunners, "active_operations": c.daemon.ActiveOperationCount(),
-	}
-	if c.capacity != nil {
-		result["capacity"] = *c.capacity
 	}
 	if c.launchNonce != "" {
 		result["launch_nonce"] = c.launchNonce
@@ -665,17 +713,78 @@ func runtimeRefreshAllowed(gatewayState string) bool {
 	}
 }
 
+// antigravityExecutableTracker detects changes to Antigravity's discovered
+// executable path across refreshes so parked residents are invalidated even
+// when status and version stay identical.
+type antigravityExecutableTracker struct {
+	mu   sync.Mutex
+	path string
+}
+
+func (t *antigravityExecutableTracker) changed(next provider.DiscoveryResult) bool {
+	nextPath := next.Installations["antigravity"].ExecutablePath
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.path == nextPath {
+		return false
+	}
+	t.path = nextPath
+	return true
+}
+
+func applyRuntimeDiscovery(
+	publishCtx context.Context,
+	next provider.DiscoveryResult,
+	environment map[string]string,
+	localModelsStateDir string,
+	providerCatalog *lingercontext.ProviderCatalog,
+	controller *controlController,
+	inventory *runtimeInventory,
+) error {
+	nextProviders, nextRuntimes := providerInstallations(next, environment, localModelsStateDir)
+	providerCatalog.Replace(nextProviders)
+	if controller != nil {
+		controller.UpdateDiagnostics(next.Diagnostics)
+	}
+	published, pubErr := inventory.publishIfChanged(publishCtx, nextRuntimes, next.Diagnostics)
+	if published && pubErr == nil {
+		logRuntimeDiagnostics(next.Diagnostics)
+	}
+	return pubErr
+}
+
 // runtimeInventory publishes the discovered Runtimes to the Gateway without
 // the models their current login refused.
 type runtimeInventory struct {
-	mu          sync.Mutex
-	daemon      *daemon.Daemon
-	ctx         context.Context
-	computer    computerconfig.Config
-	rejected    *provider.RejectedModels
-	runtimes    []string
-	diagnostics []provider.RuntimeDiagnostic
-	revision    uint64
+	mu                sync.Mutex
+	daemon            *daemon.Daemon
+	ctx               context.Context
+	computer          computerconfig.Config
+	rejected          *provider.RejectedModels
+	runtimes          []string
+	diagnostics       []provider.RuntimeDiagnostic
+	revision          uint64
+	hasPublished      bool
+	publishedRuntimes []string
+	publishedGateway  []byte
+}
+
+func newRuntimeInventory(computer computerconfig.Config, rejected *provider.RejectedModels, runtimes []string, diagnostics []provider.RuntimeDiagnostic, revision uint64) (*runtimeInventory, error) {
+	inventory := &runtimeInventory{
+		computer:    computer,
+		rejected:    rejected,
+		runtimes:    slices.Clone(runtimes),
+		diagnostics: slices.Clone(diagnostics),
+		revision:    revision,
+	}
+	payload, err := inventory.gatewayPayloadLocked(diagnostics)
+	if err != nil {
+		return nil, err
+	}
+	inventory.hasPublished = true
+	inventory.publishedRuntimes = slices.Clone(runtimes)
+	inventory.publishedGateway = payload
+	return inventory, nil
 }
 
 // start binds the running Daemon and makes expired refusals selectable again
@@ -700,24 +809,67 @@ func (i *runtimeInventory) start(ctx context.Context, localDaemon *daemon.Daemon
 	}()
 }
 
-func (i *runtimeInventory) publish(ctx context.Context, runtimes []string, diagnostics []provider.RuntimeDiagnostic) error {
+func (i *runtimeInventory) publishIfChanged(ctx context.Context, runtimes []string, diagnostics []provider.RuntimeDiagnostic) (bool, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	i.runtimes, i.diagnostics = runtimes, diagnostics
-	return i.publishLocked(ctx)
+	nextGateway, err := i.gatewayPayloadLocked(diagnostics)
+	if err != nil {
+		return false, err
+	}
+	clonedRuntimes := slices.Clone(runtimes)
+	clonedDiagnostics := slices.Clone(diagnostics)
+	if i.hasPublished && slices.Equal(i.publishedRuntimes, clonedRuntimes) && bytes.Equal(i.publishedGateway, nextGateway) {
+		i.runtimes, i.diagnostics = clonedRuntimes, clonedDiagnostics
+		return false, nil
+	}
+	i.runtimes, i.diagnostics = clonedRuntimes, clonedDiagnostics
+	if err := i.publishLocked(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (i *runtimeInventory) visibleDiagnosticsLocked(diagnostics []provider.RuntimeDiagnostic) []provider.RuntimeDiagnostic {
+	gateway := provider.GatewayDiagnostics(diagnostics)
+	if i.rejected == nil {
+		return gateway
+	}
+	return i.rejected.Filter(gateway)
+}
+
+func (i *runtimeInventory) gatewayPayloadLocked(diagnostics []provider.RuntimeDiagnostic) ([]byte, error) {
+	return gatewayDiagnosticsPayload(i.visibleDiagnosticsLocked(diagnostics))
+}
+
+func gatewayDiagnosticsPayload(visible []provider.RuntimeDiagnostic) ([]byte, error) {
+	normalized := make([]provider.RuntimeDiagnostic, len(visible))
+	copy(normalized, visible)
+	for index := range normalized {
+		normalized[index].CheckedAt = time.Time{}
+	}
+	return provider.DiagnosticsJSON(normalized)
 }
 
 func (i *runtimeInventory) publishLocked(ctx context.Context) error {
-	if i.daemon == nil {
-		return nil
-	}
-	visible := i.rejected.Filter(provider.GatewayDiagnostics(i.diagnostics))
-	encoded, err := provider.DiagnosticsJSON(visible)
+	visible := i.visibleDiagnosticsLocked(i.diagnostics)
+	gatewayPayload, err := gatewayDiagnosticsPayload(visible)
 	if err != nil {
 		return err
 	}
-	i.revision++
-	return i.daemon.UpdateRuntimeInventory(ctx, i.runtimes, encoded, runtimeObservations(i.computer, visible, i.revision))
+	if i.daemon != nil {
+		encoded, err := provider.DiagnosticsJSON(visible)
+		if err != nil {
+			return err
+		}
+		i.revision++
+		if err := i.daemon.UpdateRuntimeInventory(ctx, i.runtimes, encoded, runtimeObservations(i.computer, visible, i.revision)); err != nil {
+			return err
+		}
+	}
+	i.hasPublished = true
+	i.publishedRuntimes = slices.Clone(i.runtimes)
+	i.publishedGateway = gatewayPayload
+	return nil
 }
 
 // reject runs on the Operation terminal path, so it publishes asynchronously.
@@ -742,6 +894,10 @@ func (i *runtimeInventory) republish() {
 // account. A Claude login kept in the macOS keychain has no file; its
 // refusals expire by time only.
 func runtimeCredentialFiles(environment map[string]string) map[string]string {
+	home := environment["HOME"]
+	if home == "" {
+		home = environment["USERPROFILE"]
+	}
 	codexHome := environment["CODEX_HOME"]
 	if codexHome == "" {
 		codexHome = filepath.Join(environment["HOME"], ".codex")
@@ -750,10 +906,14 @@ func runtimeCredentialFiles(environment map[string]string) map[string]string {
 	if claudeHome == "" {
 		claudeHome = filepath.Join(environment["HOME"], ".claude")
 	}
-	return map[string]string{
+	files := map[string]string{
 		"codex":  filepath.Join(codexHome, "auth.json"),
 		"claude": filepath.Join(claudeHome, ".credentials.json"),
 	}
+	if home != "" {
+		files["antigravity"] = filepath.Join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token")
+	}
+	return files
 }
 
 func runtimeObservations(computer computerconfig.Config, diagnostics []provider.RuntimeDiagnostic, revision uint64) []transport.RegistrationObservation {
@@ -811,6 +971,13 @@ func providerInstallations(discovered provider.DiscoveryResult, environment map[
 	return providers, runtimes
 }
 
+func hostEnvironmentGuide(goos string) string {
+	if goos == "windows" {
+		return lingercontext.WindowsHostEnvironmentGuide
+	}
+	return ""
+}
+
 func installedTeamHubCLIBin() string {
 	executable, err := os.Executable()
 	if err != nil {
@@ -832,6 +999,60 @@ func installedTeamHubCLIBinAt(executable string) string {
 	return directory
 }
 
+func daemonDiscoveryPaths(configured map[string]string, stateDir, managedPi string, toolInstallation *localtools.Installation) (configuredPaths, managedPaths, bundledPaths map[string]string) {
+	var bundledPiVersion string
+	if toolInstallation != nil {
+		bundledPiVersion = toolInstallation.PiVersion
+	}
+	layers := localmodels.ResolveRuntimePathsWithBundled(configured, stateDir, bundledPiVersion)
+	filteredManagedPi := localmodels.FilterManagedPiPath(managedPi, stateDir, bundledPiVersion)
+	return layers.Configured, withManagedPiPath(layers.Managed, filteredManagedPi), bundledRuntimePaths(toolInstallation)
+}
+
+// startupDiscoverySplit splits startup Runtime discovery into an immediate
+// phase for the preferred Runtime and an asynchronous backfill phase for the
+// remaining enabled Runtimes when more than one Runtime is in scope.
+func startupDiscoverySplit(preferred string, enabled []string) (initial []string, backfill []string) {
+	full := enabled
+	if len(full) == 0 {
+		full = provider.AllRuntimeTypes()
+	}
+	if preferred == "" || len(full) <= 1 || !slices.Contains(full, preferred) {
+		return enabled, nil
+	}
+	backfill = make([]string, 0, len(full)-1)
+	for _, runtimeType := range provider.AllRuntimeTypes() {
+		if runtimeType != preferred && slices.Contains(full, runtimeType) {
+			backfill = append(backfill, runtimeType)
+		}
+	}
+	return []string{preferred}, backfill
+}
+
+func hasRuntimeDiagnostic(diagnostics []provider.RuntimeDiagnostic, runtimeType string) bool {
+	return slices.ContainsFunc(diagnostics, func(diagnostic provider.RuntimeDiagnostic) bool {
+		return diagnostic.Type == runtimeType
+	})
+}
+
+func reconcileLocalModelsHarness(library *localmodels.Library, piEnabled bool, localModelsStateDir string, next provider.DiscoveryResult) {
+	if library == nil || !piEnabled || !hasRuntimeDiagnostic(next.Diagnostics, "pi") {
+		return
+	}
+	if _, ok := next.Installations["pi"]; ok {
+		library.SetHarnessDirectory("")
+		return
+	}
+	library.SetHarnessDirectory(localmodels.HarnessRoot(localModelsStateDir))
+}
+
+func bundledRuntimePaths(installation *localtools.Installation) map[string]string {
+	if installation == nil || installation.PiEntry == "" {
+		return nil
+	}
+	return map[string]string{"pi": installation.PiEntry}
+}
+
 func withManagedPiPath(paths map[string]string, managed string) map[string]string {
 	if managed == "" || paths["pi"] != "" {
 		return paths
@@ -841,6 +1062,34 @@ func withManagedPiPath(paths map[string]string, managed string) map[string]strin
 		cloned = make(map[string]string, 1)
 	}
 	cloned["pi"] = managed
+	return cloned
+}
+
+func withBundledPowerShellPath(env map[string]string, powerShellPath, goos string) map[string]string {
+	if goos != "windows" || strings.TrimSpace(powerShellPath) == "" {
+		return env
+	}
+	cloned := maps.Clone(env)
+	if cloned == nil {
+		cloned = make(map[string]string, 1)
+	}
+	var existing string
+	if value, ok := cloned["PATH"]; ok {
+		existing = value
+		delete(cloned, "PATH")
+	}
+	var variantKeys []string
+	for key := range cloned {
+		if strings.EqualFold(key, "PATH") {
+			variantKeys = append(variantKeys, key)
+		}
+	}
+	sort.Strings(variantKeys)
+	for _, key := range variantKeys {
+		existing = provider.AppendWindowsSearchPath(existing, cloned[key])
+		delete(cloned, key)
+	}
+	cloned["PATH"] = provider.AppendWindowsSearchPath(existing, filepath.Dir(powerShellPath))
 	return cloned
 }
 

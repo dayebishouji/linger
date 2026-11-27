@@ -60,6 +60,7 @@ import {
 } from "./room-connectivity";
 import { requireRoomRouteParam } from "./room-route-params";
 import {
+  documentQueryKey,
   roomMembersQueryOptions,
   roomMessagesInfiniteQueryOptions,
   roomQueryOptions,
@@ -69,6 +70,7 @@ import {
   tenantAgentsQueryOptions,
   tenantRoomsQueryKey,
 } from "./room-queries";
+import { selectAutoOpenMessageFile } from "./auto-open-message-file";
 import { RoomDeleteDialog } from "./room-delete-dialog";
 import { useRoomPanelSidebar } from "./use-room-panel-sidebar";
 import { useRoomPresence } from "./use-room-presence";
@@ -81,7 +83,6 @@ import {
 import { readPanelSidebarWidth } from "./task-sidebar/panel-width";
 import { AuthenticatedRouteLoading } from "./route-loading-surface";
 import { RoomPresentationBoundary } from "./room-presentation-boundary";
-import { GENERAL_AGENT_DEFAULT_NAME } from "./general-agent-defaults";
 import { MobileNavigationButton } from "./mobile-navigation";
 import { roomSurfaceMessages } from "./room-surface.messages";
 
@@ -275,6 +276,7 @@ function RoomSurfaceContent({
   roomId,
   tenantId,
 }: RoomSurfaceContentProps) {
+  const queryClient = useQueryClient();
   const { client } = useTeamHubRuntime();
   const t = useT();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -344,7 +346,10 @@ function RoomSurfaceContent({
   const livePeerName = actorItems.find(
     (actor) => actor.id === room.direct_peer?.id,
   )?.display_name;
-  const roomTitle = isDirectRoom && livePeerName ? livePeerName : room.name;
+  // Deleted Agents leave the active actors catalog; fall back to direct_peer so
+  // the header, delete dialog, and sidebar always agree on the Direct Room name.
+  const peerName = livePeerName || room.direct_peer?.display_name;
+  const roomTitle = isDirectRoom && peerName ? peerName : room.name;
   const presentationRoom =
     roomTitle === room.name ? room : { ...room, name: roomTitle };
   const currentActorIsOwner = members.items.some(
@@ -390,18 +395,18 @@ function RoomSurfaceContent({
     roomSurfaceRef,
   });
 
-  // A canvas delivered while the Room is open opens in the panel at once.
-  function openCanvasMessage(message: TeamHubMessage) {
-    const canvas = message.segments.find(
-      (segment) =>
-        segment.type === "document" && segment.presentation === "canvas",
-    );
-    if (canvas?.type !== "document") return;
-    openPanelTabFromRoom({
-      kind: "file",
-      documentId: canvas.document_id,
-      title: canvas.content,
-    });
+  // A canvas or Agent-delivered previewable file arriving while the Room is
+  // open opens in the panel at once.
+  function openDeliveredMessageFile(message: TeamHubMessage) {
+    const target = selectAutoOpenMessageFile(message);
+    if (!target) return;
+    if (target.kind === "file" && target.documentId) {
+      queryClient.removeQueries({
+        queryKey: documentQueryKey(tenantId, target.documentId),
+        exact: true,
+      });
+    }
+    openPanelTabFromRoom(target);
   }
 
   // A team.md published while the Room is open opens Collaboration at once.
@@ -482,7 +487,7 @@ function RoomSurfaceContent({
                 isChatView={isChatView}
                 members={members.items}
                 onAppliedRoomSeq={setLastAppliedRoomSeq}
-                onMessageCreated={openCanvasMessage}
+                onMessageCreated={openDeliveredMessageFile}
                 onTeamMdPublished={openCollaboration}
                 onOpenAgent={openProfile}
                 onOpenDelete={() => setDeleteOpen(true)}
@@ -568,7 +573,7 @@ function RoomSurfaceContent({
             {deleteOpen ? (
               <RoomDeleteDialog
                 onClose={() => setDeleteOpen(false)}
-                room={room}
+                room={presentationRoom}
                 tenantId={tenantId}
               />
             ) : null}
@@ -782,16 +787,10 @@ function RoomHeader({
   const isDirectRoom = room.kind === "direct";
   const headerPeer =
     room.direct_peer?.kind === "agent" ? room.direct_peer : undefined;
-  const headerName =
-    headerPeer?.display_name &&
-    (room.name === headerPeer.display_name ||
-      room.name === GENERAL_AGENT_DEFAULT_NAME)
-      ? headerPeer.display_name
-      : room.name;
 
   return (
     <header
-      className={`room-chat-header room-header ${isChatView ? "room-header--chat" : ""} grid h-(--app-header-height) shrink-0 grid-cols-[minmax(0,1fr)_minmax(0,auto)_minmax(max-content,1fr)] items-center gap-2 border-b border-transparent bg-app-surface pl-3 pr-4`}
+      className={`room-chat-header room-header ${isChatView ? "room-header--chat" : ""} grid h-(--app-header-height) shrink-0 grid-cols-[minmax(0,1fr)_minmax(0,auto)_minmax(max-content,1fr)] items-center gap-2 bg-app-surface pl-3 pr-4`}
     >
       <div className="flex min-w-0 items-center">
         <MobileNavigationButton />
@@ -804,7 +803,7 @@ function RoomHeader({
             type="button"
             aria-expanded={panelOpen}
             aria-label={t(roomSurfaceMessages.openSettingsFromAvatar, {
-              name: headerName,
+              name: room.name,
             })}
             className="flex shrink-0 items-center justify-center rounded-full after:absolute after:inset-0 after:rounded-full after:content-[''] focus-visible:outline-none focus-visible:after:outline-2 focus-visible:after:outline-app-focus"
             onClick={() => {
@@ -818,7 +817,7 @@ function RoomHeader({
                 <ActorAvatar
                   actorId={headerPeer.id}
                   kind="agent"
-                  name={headerName}
+                  name={room.name}
                   size="xs"
                 />
                 {directAgent && directAgentAvailability ? (
@@ -839,7 +838,7 @@ function RoomHeader({
             aria-label={room.name}
             className="pointer-events-none min-w-0 truncate text-sm leading-[18px] font-medium text-foreground"
           >
-            {headerName}
+            {room.name}
           </h1>
         </div>
         {isDirectRoom && room.direct_peer_active === false ? (

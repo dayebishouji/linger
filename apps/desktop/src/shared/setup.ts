@@ -3,6 +3,12 @@
 // this computer and the system permissions it needs.
 
 import { INKLING_2_MINI_ANNOUNCEMENT_URL } from "@linger/service-kit/featured-models";
+import {
+  NVIDIA_DRIVER_DOWNLOAD_URL,
+  NVIDIA_DRIVER_GUIDE_URL,
+  type DesktopDriverInstallState,
+  type DesktopNvidiaAppKind,
+} from "@linger/service-kit/nvidia-driver";
 import type {
   SetupChoice,
   SetupMemory,
@@ -36,6 +42,10 @@ export interface SetupLocalServer {
   // in all, and the rate when the source reports one. partial: the counts
   // cover only the file downloading now, so nothing says what remains.
   readonly transfer?: SetupTransfer & { readonly label: string };
+  // While installing: what a step that has run a while still waits on;
+  // runtime: the installer is checking the AI runtime it set up, which on
+  // Windows can take minutes with the bar standing still.
+  readonly waiting?: "runtime";
   // Which installation this is; timers and the bar start over with each.
   readonly attempt: number;
   // Whether this computer can serve a local model; checked as the setup
@@ -47,6 +57,9 @@ export interface SetupLocalServer {
     readonly path: string;
     readonly custom: boolean;
     readonly error?: string;
+    readonly rejectedPath?: string;
+    readonly freeBytes?: number;
+    readonly minFreeBytes?: number;
   };
   // Which provider keys are saved there; the page never sees them.
   readonly keys: {
@@ -66,6 +79,10 @@ export interface SetupLocalServer {
   // While failed because the installer refused a folder as not private
   // (Windows): its code and reason, for the page to say what to do.
   readonly refusal?: WindowsPrivateRefusal;
+  // While failed for a reason the page words itself: checking the AI
+  // runtime did not finish in time, or the installer stopped answering
+  // while it ran.
+  readonly failure?: "runtime_lookup_timed_out" | "runtime_lookup_unreachable";
 }
 
 export type SetupByokProtocol =
@@ -179,6 +196,13 @@ export interface SetupReason {
   readonly driverVersion?: string;
 }
 
+export interface SetupDetectedRuntime {
+  readonly runtime: "codex" | "claude" | "pi";
+  readonly installed: boolean;
+  readonly authenticated: boolean;
+  readonly ready: boolean;
+}
+
 export type SetupLocalModelsCheck =
   | { readonly state: "unchecked" | "unavailable" }
   // While the check first downloads the localmodels tool: its bytes.
@@ -212,6 +236,8 @@ export type SetupLocalModelsCheck =
       // The localmodels tool's pick, which Quick Install installs:
       // "local-models" is the model above served by Pi.
       readonly recommendation?: SetupChoice;
+      // Harnesses discovered on this computer by local-daemon during inspect.
+      readonly runtimes?: readonly SetupDetectedRuntime[];
     };
 
 // The AI runtime the installer sets up; "recommended" lets it pick and
@@ -273,19 +299,39 @@ export interface SetupState {
   readonly permissions?: Readonly<
     Record<SetupPermission, SetupPermissionStatus>
   >;
+  // NVIDIA driver update helper capabilities and install state on this computer.
+  readonly driverUpdate?: {
+    readonly nvidiaApp: DesktopNvidiaAppKind;
+    readonly directInstallSupported?: boolean;
+    readonly installState?: DesktopDriverInstallState;
+  };
 }
 
 // Exact HTTPS URLs that the sandboxed setup page may ask the main process to
 // open in the system browser. Any other URL is rejected at the IPC boundary.
-export const SETUP_EXTERNAL_URLS = [INKLING_2_MINI_ANNOUNCEMENT_URL] as const;
+export const SETUP_EXTERNAL_URLS = [
+  INKLING_2_MINI_ANNOUNCEMENT_URL,
+  NVIDIA_DRIVER_DOWNLOAD_URL,
+  NVIDIA_DRIVER_GUIDE_URL,
+] as const;
 
 export type SetupExternalUrl = (typeof SETUP_EXTERNAL_URLS)[number];
 
-export { INKLING_2_MINI_ANNOUNCEMENT_URL };
+export {
+  INKLING_2_MINI_ANNOUNCEMENT_URL,
+  NVIDIA_DRIVER_DOWNLOAD_URL,
+  NVIDIA_DRIVER_GUIDE_URL,
+};
 
 export type SetupCommand =
   | { readonly op: "server.set"; readonly serverUrl: string }
   | { readonly op: "external.open"; readonly url: SetupExternalUrl }
+  | { readonly op: "driver.open-nvidia-app" }
+  | {
+      readonly op: "driver.start-install";
+      readonly requiredCuda?: string;
+    }
+  | { readonly op: "driver.clear-state" }
   | {
       readonly op: "local.start";
       readonly runtime?: SetupLocalRuntime;
@@ -356,6 +402,9 @@ export type SetupCommand =
 
 export interface LingerSetupApi {
   readonly featuredAnnouncementUrl: SetupExternalUrl;
+  readonly nvidiaDriverDownloadUrl: SetupExternalUrl;
+  readonly nvidiaDriverGuideUrl: SetupExternalUrl;
+  minDriverForCuda(requiredCuda: string | undefined): string | undefined;
   getState(): Promise<SetupState>;
   onState(callback: (state: SetupState) => void): () => void;
   run(command: SetupCommand): Promise<SetupState>;

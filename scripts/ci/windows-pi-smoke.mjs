@@ -18,17 +18,26 @@ export function probePi(executable, args, options, timeoutMs = 30_000) {
       finished = true;
       clearTimeout(timer);
       output.close();
-      child.kill();
-      if (reason) {
-        const diagnostic = stderr.trim().slice(-1500).replaceAll("\x1b", "");
-        reject(
-          new Error(
-            `Pi smoke: ${reason}${diagnostic ? `\n${diagnostic}` : ""}`,
-          ),
-        );
-      } else {
-        resolve();
-      }
+      const diagnostic = stderr.trim().slice(-1500).replaceAll("\x1b", "");
+      const settle = () =>
+        reason
+          ? reject(
+              new Error(
+                `Pi smoke: ${reason}${diagnostic ? `\n${diagnostic}` : ""}`,
+              ),
+            )
+          : resolve();
+      // Windows keeps the working directory busy until the process exits, so
+      // the caller may remove it only after that.
+      if (
+        child.pid === undefined ||
+        child.exitCode !== null ||
+        child.signalCode !== null
+      )
+        return settle();
+      child.once("exit", settle);
+      // A failed kill delivers no exit event.
+      if (!child.kill()) settle();
     }
     child.stderr.setEncoding("utf8").on("data", (chunk) => {
       stderr = (stderr + chunk).slice(-1500);
@@ -69,6 +78,126 @@ export function probePi(executable, args, options, timeoutMs = 30_000) {
   });
 }
 
+export async function assertNoFreshHarnessPi(home) {
+  const root = join(home, "runtime", "harness", "tools", "pi");
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  const downloaded = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = join(root, entry.name, "pi.exe");
+    if (
+      await access(candidate).then(
+        () => true,
+        () => false,
+      )
+    ) {
+      downloaded.push(candidate);
+    }
+  }
+  if (downloaded.length > 0) {
+    throw new Error(
+      `Expected bundled Pi reuse, but harness downloaded Pi into ${downloaded.join(", ")}`,
+    );
+  }
+}
+
+function runPowerShellCommand(executable, args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const env = { ...process.env };
+    delete env.ELECTRON_RUN_AS_NODE;
+    delete env.NODE_PATH;
+    delete env.NODE_OPTIONS;
+    const child = spawn(executable, args, {
+      env,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let finished = false;
+    const timer = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      child.kill();
+      reject(new Error(`PowerShell smoke: timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stdout?.setEncoding("utf8").on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr?.setEncoding("utf8").on("data", (chunk) => {
+      stderr = (stderr + chunk).slice(-1500);
+    });
+    child.on("error", (error) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      reject(
+        new Error(
+          `PowerShell smoke: process error: ${error.code ?? error.name}`,
+        ),
+      );
+    });
+    child.on("close", (code) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        const diagnostic = stderr.trim().slice(-1500);
+        reject(
+          new Error(
+            `PowerShell smoke: exited with ${code}${diagnostic ? `\n${diagnostic}` : ""}`,
+          ),
+        );
+        return;
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+export async function probeBundledPowerShell(
+  executable,
+  { nodeExecutable, expectedVersion = "7.6.10", timeoutMs = 15_000 } = {},
+) {
+  const versionOutput = await runPowerShellCommand(
+    executable,
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$PSVersionTable.PSVersion.ToString()",
+    ],
+    timeoutMs,
+  );
+  const actualVersion = versionOutput.trim();
+  if (actualVersion !== expectedVersion) {
+    throw new Error(
+      `PowerShell smoke: expected version ${expectedVersion}, got ${actualVersion || "(empty)"}`,
+    );
+  }
+  if (nodeExecutable) {
+    const quotedNode = nodeExecutable.replaceAll("'", "''");
+    const expectedArg = '[{"question":"a b"}]';
+    const command = `& '${quotedNode}' -e 'process.stdout.write(process.argv[1])' '${expectedArg}'`;
+    const echoed = await runPowerShellCommand(
+      executable,
+      ["-NoProfile", "-NonInteractive", "-Command", command],
+      timeoutMs,
+    );
+    if (echoed !== expectedArg) {
+      throw new Error(
+        `PowerShell smoke: native JSON argument mismatch: expected ${expectedArg}, got ${echoed}`,
+      );
+    }
+  }
+}
+
 async function main() {
   const home = process.env.LINGER_HOME;
   if (
@@ -82,7 +211,9 @@ async function main() {
     );
   const resources = join(dirname(process.execPath), "resources");
   const node = join(resources, "runtime", "bin", "node.exe");
+  const bundledPwsh = join(resources, "runtime", "pwsh", "pwsh.exe");
   const installer = join(resources, "app", "dist", "installer", "installer.js");
+  const bundledPi = join(resources, "cli", "computer-tools", "bin", "pi.exe");
   const extension = join(
     resources,
     "cli",
@@ -91,8 +222,20 @@ async function main() {
     "pi-mcp.mjs",
   );
   await access(node);
+  await access(bundledPwsh);
   await access(installer);
+  await access(bundledPi);
   await access(extension);
+  const pwshStart = performance.now();
+  await probeBundledPowerShell(bundledPwsh, { nodeExecutable: node });
+  console.log(
+    JSON.stringify({
+      phase: "bundled_pwsh",
+      version: "7.6.10",
+      result: "passed",
+      elapsed_ms: Math.round(performance.now() - pwshStart),
+    }),
+  );
   await mkdir(home);
   const source = join(home, "unused-source");
   await mkdir(source);
@@ -228,21 +371,7 @@ async function main() {
     if (job.state !== "succeeded")
       throw new Error("Packaged Pi preparation did not succeed");
 
-    const root = join(home, "runtime", "harness", "tools", "pi");
-    const candidates = [];
-    for (const entry of await readdir(root, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const candidate = join(root, entry.name, "pi.exe");
-      if (
-        await access(candidate).then(
-          () => true,
-          () => false,
-        )
-      )
-        candidates.push(candidate);
-    }
-    if (candidates.length !== 1)
-      throw new Error("Expected exactly one freshly installed Pi executable");
+    await assertNoFreshHarnessPi(home);
     const config = join(home, "mcp.json");
     await writeFile(config, '{"mcpServers":{}}', { flag: "wx", mode: 0o600 });
     const env = {
@@ -257,7 +386,7 @@ async function main() {
     // Resource flags match PiRPCResourceArgs in
     // apps/computer/local-daemon/internal/provider/native/pi_catalog.go.
     await probePi(
-      candidates[0],
+      bundledPi,
       [
         "--mode",
         "rpc",
@@ -272,6 +401,8 @@ async function main() {
         "",
         "--extension",
         extension,
+        "--tools",
+        "read,powershell,edit,write,grep,find,ls,mcp__*",
       ],
       { cwd: home, env },
     );

@@ -4,13 +4,19 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/permission"
+	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/platform/privatefs"
+	localworkspace "github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/workspace"
 )
 
 type agyHarness struct {
@@ -267,6 +273,28 @@ func TestAntigravityReportsStructuredFailures(t *testing.T) {
 	if _, outcome := drainAgy(t, run); outcome.Status != statusFailed || outcome.FailureCode != "model_not_offered" {
 		t.Fatalf("unknown model outcome=%+v", outcome)
 	}
+
+	inline := newAgyHarness(t, "inline-error", nil)
+	run, err = inline.runtime.Start(t.Context(), "hi", RunSpec{Dir: inline.dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, outcome := drainAgy(t, run); outcome.Status != statusFailed || outcome.Output != "" ||
+		outcome.Error != "\u26a0 FAILED_PRECONDITION (code 400): User location is not supported for the API use." ||
+		!outcome.ExitConfirmed || !outcome.Diagnostics.empty() {
+		t.Fatalf("inline error outcome=%+v", outcome)
+	}
+
+	empty := newAgyHarness(t, "empty-end-turn", nil)
+	run, err = empty.runtime.Start(t.Context(), "hi", RunSpec{Dir: empty.dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, outcome := drainAgy(t, run); outcome.Status != statusFailed || outcome.Output != "" ||
+		outcome.Error != "Antigravity ended the turn without a model response" ||
+		!outcome.ExitConfirmed || !outcome.Diagnostics.empty() {
+		t.Fatalf("empty end_turn outcome=%+v", outcome)
+	}
 }
 
 func TestAntigravityUsesAGeminiAPIKeyOnlyWhenSignedOut(t *testing.T) {
@@ -301,7 +329,7 @@ func TestAntigravityTimeoutStopsTheProcess(t *testing.T) {
 
 func TestAntigravityProbeListsModelFamiliesWithTheirLevels(t *testing.T) {
 	h := newAgyHarness(t, "turn", nil)
-	probe, err := ProbeAntigravity(t.Context(), h.inv)
+	probe, err := ProbeAntigravity(t.Context(), h.inv, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +348,7 @@ func TestAntigravityProbeListsModelFamiliesWithTheirLevels(t *testing.T) {
 	}
 
 	signedOut := newAgyHarness(t, "signed-out", nil)
-	if probe, err := ProbeAntigravity(t.Context(), signedOut.inv); err != nil || !probe.AuthenticationRequired {
+	if probe, err := ProbeAntigravity(t.Context(), signedOut.inv, ""); err != nil || !probe.AuthenticationRequired {
 		t.Fatalf("signed out probe=%+v err=%v", probe, err)
 	}
 }
@@ -343,7 +371,7 @@ func TestAntigravityProbeIsolatesStateAndSeedsCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	probe, err := ProbeAntigravity(t.Context(), h.inv)
+	probe, err := ProbeAntigravity(t.Context(), h.inv, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +428,7 @@ func TestAntigravityProbeIsolatesStateAndSeedsCredentials(t *testing.T) {
 
 func TestAntigravityProbeHandlesMissingUserGeminiDir(t *testing.T) {
 	h := newAgyHarness(t, "token-file", nil)
-	probe, err := ProbeAntigravity(t.Context(), h.inv)
+	probe, err := ProbeAntigravity(t.Context(), h.inv, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,6 +437,114 @@ func TestAntigravityProbeHandlesMissingUserGeminiDir(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(h.dir, ".gemini")); !os.IsNotExist(err) {
 		t.Fatalf("probe created .gemini under HOME: err=%v", err)
+	}
+}
+
+func TestAntigravityProbeUsesTempBaseAndCleansUp(t *testing.T) {
+	if _, _, err := PrepareAntigravityProtocolProbe("relative-temp-base"); !errors.Is(err, ErrAntigravityProbePrepare) {
+		t.Fatalf("PrepareAntigravityProtocolProbe(relative) err = %v, want ErrAntigravityProbePrepare", err)
+	}
+
+	tempBase := t.TempDir()
+	unrelatedFile := filepath.Join(tempBase, "keep-me")
+	if err := os.WriteFile(unrelatedFile, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	args1, release1, err := PrepareAntigravityProtocolProbe(tempBase)
+	if err != nil {
+		t.Fatalf("PrepareAntigravityProtocolProbe(%q) #1: %v", tempBase, err)
+	}
+	args2, release2, err := PrepareAntigravityProtocolProbe(tempBase)
+	if err != nil {
+		release1()
+		t.Fatalf("PrepareAntigravityProtocolProbe(%q) #2: %v", tempBase, err)
+	}
+	if len(args1) != 4 || args1[0] != "--gemini-dir" || args1[2] != "--log-file" {
+		release1()
+		release2()
+		t.Fatalf("unexpected args1 = %v", args1)
+	}
+	if len(args2) != 4 || args2[0] != "--gemini-dir" || args2[2] != "--log-file" {
+		release1()
+		release2()
+		t.Fatalf("unexpected args2 = %v", args2)
+	}
+	probeDir1 := filepath.Dir(args1[1])
+	probeDir2 := filepath.Dir(args2[1])
+	if probeDir1 == probeDir2 {
+		release1()
+		release2()
+		t.Fatalf("concurrent probes in the same tempBase collided on %q", probeDir1)
+	}
+	for _, probeDir := range []string{probeDir1, probeDir2} {
+		if filepath.Dir(probeDir) != tempBase || !strings.HasPrefix(filepath.Base(probeDir), localworkspace.TaskTempDirPrefix) {
+			release1()
+			release2()
+			t.Fatalf("probeDir = %q, want unique %s* child under %q", probeDir, localworkspace.TaskTempDirPrefix, tempBase)
+		}
+		for _, dir := range []string{tempBase, probeDir, filepath.Join(probeDir, "gemini"), filepath.Join(probeDir, "workspace")} {
+			if err := privatefs.CheckPath(dir, "directory", true); err != nil {
+				release1()
+				release2()
+				t.Fatalf("privatefs check failed for %q: %v", dir, err)
+			}
+		}
+	}
+	if args1[3] != filepath.Join(probeDir1, "acp.log") || args2[3] != filepath.Join(probeDir2, "acp.log") {
+		release1()
+		release2()
+		t.Fatalf("unexpected log files: args1=%v args2=%v", args1, args2)
+	}
+
+	release1()
+	release1() // idempotent
+	if _, err := os.Stat(probeDir1); !os.IsNotExist(err) {
+		release2()
+		t.Fatalf("probeDir1 survived release: %v", err)
+	}
+	if _, err := os.Stat(probeDir2); err != nil {
+		release2()
+		t.Fatalf("releasing probeDir1 disturbed active probeDir2: %v", err)
+	}
+	release2()
+	if _, err := os.Stat(probeDir2); !os.IsNotExist(err) {
+		t.Fatalf("probeDir2 survived release: %v", err)
+	}
+	if _, err := os.Stat(unrelatedFile); err != nil {
+		t.Fatalf("release removed unrelated file %q in tempBase: %v", unrelatedFile, err)
+	}
+
+	metaFile := filepath.Join(t.TempDir(), "probe-in-meta.json")
+	h := newAgyHarness(t, "turn", map[string]string{agyFakeMetaEnv: metaFile})
+	models, err := DiscoverAntigravityModels(t.Context(), h.inv, tempBase)
+	if err != nil {
+		t.Fatalf("DiscoverAntigravityModels: %v", err)
+	}
+	if len(models.Models) != 2 {
+		t.Fatalf("models = %+v, want 2 models", models)
+	}
+	rawMeta, err := os.ReadFile(metaFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta struct {
+		GeminiDir string `json:"geminiDir"`
+		LogFile   string `json:"logFile"`
+	}
+	if err := json.Unmarshal(rawMeta, &meta); err != nil {
+		t.Fatal(err)
+	}
+	usedProbeDir := filepath.Dir(meta.GeminiDir)
+	if filepath.Dir(usedProbeDir) != tempBase || !strings.HasPrefix(filepath.Base(usedProbeDir), localworkspace.TaskTempDirPrefix) ||
+		meta.GeminiDir != filepath.Join(usedProbeDir, "gemini") || meta.LogFile != filepath.Join(usedProbeDir, "acp.log") {
+		t.Fatalf("probe paths = %+v, want unique %s* subdir under %q", meta, localworkspace.TaskTempDirPrefix, tempBase)
+	}
+	if _, err := os.Stat(usedProbeDir); !os.IsNotExist(err) {
+		t.Fatalf("probe subdir survived DiscoverAntigravityModels: %v", err)
+	}
+	if _, err := os.Stat(unrelatedFile); err != nil {
+		t.Fatalf("DiscoverAntigravityModels removed unrelated file %q in tempBase: %v", unrelatedFile, err)
 	}
 }
 
@@ -430,12 +566,17 @@ func TestAntigravityTurnKeepsDefaultGeminiDir(t *testing.T) {
 		Args      []string `json:"args"`
 		GeminiDir string   `json:"geminiDir"`
 		LogFile   string   `json:"logFile"`
+		AddDir    string   `json:"addDir"`
 	}
 	if err := json.Unmarshal(rawMeta, &meta); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(meta.Args, []string{"acp"}) || meta.GeminiDir != "" || meta.LogFile != "" {
-		t.Fatalf("real turns must keep default agy store: %+v", meta)
+	ep, epErr := AntigravitySharedHookEndpoint()
+	if epErr != nil {
+		t.Fatal(epErr)
+	}
+	if !reflect.DeepEqual(meta.Args, []string{"acp", "--add-dir", ep.Dir()}) || meta.GeminiDir != "" || meta.LogFile != "" || meta.AddDir != ep.Dir() {
+		t.Fatalf("real turns must keep default agy store with only managed --add-dir: %+v", meta)
 	}
 }
 
@@ -516,28 +657,18 @@ func TestAntigravityStartsAResumedRunBeforeTheSessionLoads(t *testing.T) {
 	drainAgy(t, run)
 }
 
-func TestAntigravityContinuesAnEarlyStartedRunInANewSession(t *testing.T) {
+func TestAntigravityReturnsSessionNotFoundWhenResumedSessionIsMissing(t *testing.T) {
 	h := newAgyHarness(t, "unknown-session", nil)
-	moved := 0
-	run, err := h.runtime.Start(t.Context(), "again", RunSpec{Dir: h.dir, ResumeID: "moved-session", ExposeTurnStarted: true, FreshSession: func() { moved++ }})
+	run, err := h.runtime.Start(t.Context(), "again", RunSpec{Dir: h.dir, ResumeID: "moved-session", ExposeTurnStarted: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	events, outcome := drainAgy(t, run)
-	if outcome.Status != statusCompleted || outcome.SessionID != "fake-session" {
-		t.Fatalf("outcome=%+v", outcome)
+	_, outcome := drainAgy(t, run)
+	if outcome.Status != statusFailed || outcome.FailureCode != "session_not_found" {
+		t.Fatalf("outcome=%+v, want failed session_not_found", outcome)
 	}
-	var starts []Event
-	for _, event := range events {
-		if event.Kind == EventStatus && event.TurnID != "" {
-			starts = append(starts, event)
-		}
-	}
-	if len(starts) != 1 || starts[0].SessionID != "moved-session" || moved != 1 {
-		t.Fatalf("turn-started events=%+v, moved %d times", starts, moved)
-	}
-	if requests := h.requests(t); len(requests["session/new"]) != 1 || len(requests["session/prompt"]) != 1 {
-		t.Fatalf("requests=%v", requests)
+	if requests := h.requests(t); len(requests["session/new"]) != 0 || len(requests["session/prompt"]) != 0 {
+		t.Fatalf("requests=%v, want no silent session/new or session/prompt", requests)
 	}
 }
 
@@ -590,4 +721,965 @@ func TestAntigravityBoundsTheBackgroundWait(t *testing.T) {
 	if outcome.Status != statusCompleted || outcome.Output != "Running in the background." {
 		t.Fatalf("outcome=%+v", outcome)
 	}
+}
+
+func TestAntigravitySteersMidTurnViaPreInvocationHook(t *testing.T) {
+	h := newAgyHarness(t, "steer-hook", nil)
+	run, err := h.runtime.Start(t.Context(), "start task", RunSpec{Dir: h.dir, ExposeTurnStarted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Steer == nil {
+		t.Fatal("Run.Steer is nil for Antigravity")
+	}
+
+	var turnID string
+	var events []Event
+	steerStarted := false
+	steerRes := make(chan error, 1)
+	var steerAck SteerAck
+
+	timeout := time.After(15 * time.Second)
+drain:
+	for {
+		select {
+		case event, ok := <-run.Events:
+			if !ok {
+				break drain
+			}
+			events = append(events, event)
+			if event.Kind == EventStatus && event.TurnID != "" {
+				turnID = event.TurnID
+			}
+			if event.Kind == EventToolCall && !steerStarted {
+				steerStarted = true
+				go func() {
+					var steerErr error
+					steerAck, steerErr = run.Steer(t.Context(), SteerRequest{ExpectedTurnID: turnID, Input: "BANANA_STEER"})
+					steerRes <- steerErr
+				}()
+			}
+		case <-timeout:
+			t.Fatal("steer-hook run did not finish")
+		}
+	}
+	outcome := <-run.Outcome
+	if err := <-steerRes; err != nil || steerAck.TurnID != turnID {
+		t.Fatalf("steer ack=%+v err=%v want turnID=%q", steerAck, err, turnID)
+	}
+	if outcome.Status != statusCompleted || outcome.Output != "STEERED:BANANA_STEER" {
+		t.Fatalf("outcome=%+v events=%+v", outcome, events)
+	}
+}
+
+func TestAntigravityWaitingBackgroundStopHookAndPathBWake(t *testing.T) {
+	h := newAgyHarness(t, "waiting-background-v2", nil)
+	run, err := h.runtime.Start(t.Context(), "schedule work", RunSpec{Dir: h.dir, ExposeTurnStarted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var turnID string
+	var events []Event
+	woken := make(chan error, 1)
+	var wakeAck SteerAck
+
+	timeout := time.After(15 * time.Second)
+drain:
+	for {
+		select {
+		case event, ok := <-run.Events:
+			if !ok {
+				break drain
+			}
+			events = append(events, event)
+			if event.Kind == EventStatus && event.TurnID != "" {
+				turnID = event.TurnID
+			}
+			if event.Kind == EventBackgroundWaiting {
+				if len(event.BackgroundTools) != 1 || event.BackgroundTools[0].ToolName != "schedule" {
+					t.Fatalf("unexpected background tools: %+v", event.BackgroundTools)
+				}
+				go func() {
+					var steerErr error
+					wakeAck, steerErr = run.Steer(t.Context(), SteerRequest{ExpectedTurnID: turnID, Input: "check now"})
+					woken <- steerErr
+				}()
+			}
+		case <-timeout:
+			t.Fatal("waiting-background-v2 run did not finish")
+		}
+	}
+	outcome := <-run.Outcome
+	if err := <-woken; err != nil || wakeAck.TurnID != turnID {
+		t.Fatalf("wake steer ack=%+v err=%v", wakeAck, err)
+	}
+	if outcome.Status != statusCompleted || outcome.Output != "Woken:check now" {
+		t.Fatalf("outcome=%+v", outcome)
+	}
+	if usage := outcome.Usage[antigravityDefaultModel]; usage.Input != 30 || usage.Output != 7 {
+		t.Fatalf("aggregated usage=%+v, want input=30 output=7", usage)
+	}
+	var resumed []Event
+	for _, ev := range events {
+		if ev.Kind == EventBackgroundResumed {
+			resumed = append(resumed, ev)
+		}
+	}
+	if len(resumed) != 1 || resumed[0].BackgroundTrigger != "user_input" {
+		t.Fatalf("resumed=%+v", resumed)
+	}
+}
+
+func TestAntigravityLegacyAwaitBackgroundWakesOnSteer(t *testing.T) {
+	quiet := antigravityQuietWindow
+	antigravityQuietWindow = 250 * time.Millisecond
+	t.Cleanup(func() { antigravityQuietWindow = quiet })
+
+	h := newAgyHarness(t, "background-wake", nil)
+	run, err := h.runtime.Start(t.Context(), "start bg", RunSpec{Dir: h.dir, ExposeTurnStarted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var turnID string
+	var sawWaiting bool
+	var sawResumed bool
+	woken := make(chan error, 1)
+	timeout := time.After(15 * time.Second)
+drain:
+	for {
+		select {
+		case event, ok := <-run.Events:
+			if !ok {
+				break drain
+			}
+			if event.Kind == EventStatus && event.TurnID != "" {
+				turnID = event.TurnID
+			}
+			if event.Kind == EventBackgroundWaiting {
+				sawWaiting = true
+				go func() {
+					_, steerErr := run.Steer(t.Context(), SteerRequest{ExpectedTurnID: turnID, Input: "wake legacy"})
+					woken <- steerErr
+				}()
+			}
+			if event.Kind == EventBackgroundResumed && event.BackgroundTrigger == "user_input" {
+				sawResumed = true
+			}
+		case <-timeout:
+			t.Fatal("background-wake run did not finish")
+		}
+	}
+	outcome := <-run.Outcome
+	if err := <-woken; err != nil {
+		t.Fatalf("wake steer err=%v", err)
+	}
+	if !sawWaiting || !sawResumed || outcome.Status != statusCompleted || !strings.Contains(outcome.Output, "WokenLegacy:wake legacy") {
+		t.Fatalf("sawWaiting=%v sawResumed=%v outcome=%+v", sawWaiting, sawResumed, outcome)
+	}
+}
+
+func TestAntigravitySteerRefusalsAndCancellation(t *testing.T) {
+	h := newAgyHarness(t, "hang", nil)
+	ctx, cancelRun := context.WithCancel(t.Context())
+	run, err := h.runtime.Start(ctx, "hang", RunSpec{Dir: h.dir, ExposeTurnStarted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := <-run.Events
+	turnID := started.TurnID
+	if turnID == "" {
+		t.Fatal("expected TurnID on started event")
+	}
+
+	// Mismatched turn ID is rejected with target_mismatch.
+	var steerErr *SteerError
+	if _, err := run.Steer(t.Context(), SteerRequest{ExpectedTurnID: "wrong-turn", Input: "x"}); !errors.As(err, &steerErr) || steerErr.Effect != "definitely_not_applied" || steerErr.Reason != "target_mismatch" || steerErr.ActualTurnID != turnID {
+		t.Fatalf("mismatch err=%v steerErr=%+v", err, steerErr)
+	}
+
+	// Cancelling the steer context withdraws unconsumed steer cleanly.
+	steerCtx, cancelSteer := context.WithCancel(t.Context())
+	steerDone := make(chan error, 1)
+	go func() {
+		_, err := run.Steer(steerCtx, SteerRequest{ExpectedTurnID: turnID, Input: "withdrawn"})
+		steerDone <- err
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancelSteer()
+	steerErr = nil
+	if err := <-steerDone; !errors.As(err, &steerErr) || steerErr.Effect != "definitely_not_applied" {
+		t.Fatalf("withdrawn steer err=%v steerErr=%+v", err, steerErr)
+	}
+
+	// Ending the turn while a steer is queued rejects it with definitely_not_applied.
+	pendingErr := make(chan error, 1)
+	go func() {
+		_, err := run.Steer(t.Context(), SteerRequest{ExpectedTurnID: turnID, Input: "too late"})
+		pendingErr <- err
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancelRun()
+	drainAgy(t, run)
+	steerErr = nil
+	if err := <-pendingErr; !errors.As(err, &steerErr) || steerErr.Effect != "definitely_not_applied" || steerErr.Reason != "no_active_turn" {
+		t.Fatalf("ended steer err=%v steerErr=%+v", err, steerErr)
+	}
+
+	// Steering after turn completion is also rejected.
+	steerErr = nil
+	if _, err := run.Steer(t.Context(), SteerRequest{ExpectedTurnID: turnID, Input: "after"}); !errors.As(err, &steerErr) || steerErr.Effect != "definitely_not_applied" || steerErr.Reason != "no_active_turn" {
+		t.Fatalf("post-end steer err=%v steerErr=%+v", err, steerErr)
+	}
+}
+
+func TestAntigravityEmptyWakeDoesNotWedgeTurn(t *testing.T) {
+	t.Run("finishes_after_withdrawn_steer", func(t *testing.T) {
+		quiet := antigravityQuietWindow
+		antigravityQuietWindow = 600 * time.Millisecond
+		t.Cleanup(func() { antigravityQuietWindow = quiet })
+		t.Cleanup(func() { antigravityBeforeWakePrompt = nil })
+
+		h := newAgyHarness(t, "background", nil)
+		run, err := h.runtime.Start(t.Context(), "run bg", RunSpec{Dir: h.dir, ExposeTurnStarted: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		steerCtx, cancelSteer := context.WithCancel(t.Context())
+		defer cancelSteer()
+		steerDone := make(chan error, 1)
+		var steerErrResult error
+		intercepted := make(chan struct{})
+		var interceptOnce sync.Once
+		antigravityBeforeWakePrompt = func() {
+			interceptOnce.Do(func() {
+				cancelSteer()
+				select {
+				case steerErrResult = <-steerDone:
+				case <-time.After(5 * time.Second):
+				}
+				close(intercepted)
+			})
+		}
+
+		var turnID string
+		var steerStarted bool
+		timeout := time.After(15 * time.Second)
+	drain:
+		for {
+			select {
+			case event, ok := <-run.Events:
+				if !ok {
+					break drain
+				}
+				if event.Kind == EventStatus && event.TurnID != "" {
+					turnID = event.TurnID
+				}
+				if event.Kind == EventBackgroundWaiting && !steerStarted {
+					steerStarted = true
+					id := turnID
+					go func() {
+						_, steerErr := run.Steer(steerCtx, SteerRequest{ExpectedTurnID: id, Input: "withdrawn wake"})
+						steerDone <- steerErr
+					}()
+				}
+			case <-timeout:
+				t.Fatal("background run wedged after empty wake")
+			}
+		}
+		select {
+		case <-intercepted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("expected empty wake interception")
+		}
+		var steerErr *SteerError
+		if !errors.As(steerErrResult, &steerErr) || steerErr.Effect != "definitely_not_applied" {
+			t.Fatalf("steerErr=%v", steerErrResult)
+		}
+		outcome := <-run.Outcome
+		if outcome.Status != statusCompleted || !strings.Contains(outcome.Output, "Found a.txt") {
+			t.Fatalf("outcome=%+v", outcome)
+		}
+	})
+
+	t.Run("cancels_after_withdrawn_steer", func(t *testing.T) {
+		t.Cleanup(func() { antigravityBeforeWakePrompt = nil })
+
+		h := newAgyHarness(t, "background-stuck", nil)
+		runCtx, cancelRun := context.WithCancel(t.Context())
+		defer cancelRun()
+		run, err := h.runtime.Start(runCtx, "stuck bg", RunSpec{Dir: h.dir, ExposeTurnStarted: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		steerCtx, cancelSteer := context.WithCancel(t.Context())
+		defer cancelSteer()
+		steerDone := make(chan error, 1)
+		intercepted := make(chan struct{})
+		var interceptOnce sync.Once
+		antigravityBeforeWakePrompt = func() {
+			interceptOnce.Do(func() {
+				cancelSteer()
+				select {
+				case <-steerDone:
+				case <-time.After(5 * time.Second):
+				}
+				close(intercepted)
+			})
+		}
+
+		var turnID string
+		var steerStarted bool
+		timeout := time.After(15 * time.Second)
+	waitIntercept:
+		for {
+			select {
+			case event, ok := <-run.Events:
+				if !ok {
+					t.Fatal("run ended unexpectedly before cancellation")
+				}
+				if event.Kind == EventStatus && event.TurnID != "" {
+					turnID = event.TurnID
+				}
+				if event.Kind == EventBackgroundWaiting && !steerStarted {
+					steerStarted = true
+					id := turnID
+					go func() {
+						_, steerErr := run.Steer(steerCtx, SteerRequest{ExpectedTurnID: id, Input: "withdrawn wake"})
+						steerDone <- steerErr
+					}()
+				}
+			case <-intercepted:
+				break waitIntercept
+			case <-timeout:
+				t.Fatal("timed out waiting for empty wake interception")
+			}
+		}
+		cancelRun()
+		_, outcome := drainAgy(t, run)
+		if outcome.Status != statusAborted {
+			t.Fatalf("outcome=%+v, want aborted", outcome)
+		}
+	})
+}
+
+func TestAntigravityStopHookBlocksOnceAndGuardsReentry(t *testing.T) {
+	t.Run("blocks_once_even_when_continuation_active_is_false", func(t *testing.T) {
+		h := newAgyHarness(t, "stop-hook", nil)
+		var calls []StopHookRequest
+		run, err := h.runtime.Start(t.Context(), "say hi", RunSpec{
+			Dir: h.dir,
+			StopHook: func(_ context.Context, req StopHookRequest) StopHookDecision {
+				calls = append(calls, req)
+				if !req.StopHookActive {
+					return StopHookDecision{Action: "block", Reason: "Send the Room message first."}
+				}
+				return StopHookDecision{Action: "allow"}
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, outcome := drainAgy(t, run)
+		if outcome.Status != statusCompleted {
+			t.Fatalf("outcome=%+v", outcome)
+		}
+		if len(calls) != 2 {
+			t.Fatalf("stop hook calls=%+v, want 2", calls)
+		}
+		if calls[0].Runtime != "antigravity" || calls[0].StopHookActive {
+			t.Fatalf("call[0]=%+v, want antigravity StopHookActive=false", calls[0])
+		}
+		if calls[1].Runtime != "antigravity" || !calls[1].StopHookActive {
+			t.Fatalf("call[1]=%+v, want antigravity StopHookActive=true", calls[1])
+		}
+		if outcome.Output != "Continued:Send the Room message first." {
+			t.Fatalf("output=%q, want continuation text only", outcome.Output)
+		}
+	})
+
+	t.Run("skips_on_error_termination", func(t *testing.T) {
+		h := newAgyHarness(t, "stop-hook-error", nil)
+		called := false
+		run, err := h.runtime.Start(t.Context(), "say hi", RunSpec{
+			Dir: h.dir,
+			StopHook: func(_ context.Context, _ StopHookRequest) StopHookDecision {
+				called = true
+				return StopHookDecision{Action: "block", Reason: "should not fire"}
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, outcome := drainAgy(t, run)
+		if outcome.Status != statusCompleted || called {
+			t.Fatalf("outcome=%+v called=%v, want completed with stop hook skipped", outcome, called)
+		}
+	})
+
+	t.Run("cancellation_unblocks_stop_hook", func(t *testing.T) {
+		h := newAgyHarness(t, "stop-hook", nil)
+		runCtx, cancelRun := context.WithCancel(t.Context())
+		defer cancelRun()
+		inHook := make(chan struct{})
+		hookExited := make(chan struct{})
+		run, err := h.runtime.Start(runCtx, "say hi", RunSpec{
+			Dir: h.dir,
+			StopHook: func(ctx context.Context, _ StopHookRequest) StopHookDecision {
+				close(inHook)
+				<-ctx.Done()
+				close(hookExited)
+				return StopHookDecision{Action: "allow"}
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-inHook:
+		case <-time.After(10 * time.Second):
+			t.Fatal("stop hook was not invoked")
+		}
+		cancelRun()
+		select {
+		case <-hookExited:
+		case <-time.After(5 * time.Second):
+			t.Fatal("stop hook context was not cancelled on turn cancellation")
+		}
+		_, outcome := drainAgy(t, run)
+		if outcome.Status != statusAborted {
+			t.Fatalf("outcome=%+v, want aborted", outcome)
+		}
+	})
+}
+
+func TestAntigravityPreToolUseShellTextHook(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell text check is disabled on Windows PowerShell")
+	}
+
+	t.Run("denies_rewritten_teamhub_command_before_permission_review", func(t *testing.T) {
+		h := newAgyHarness(t, "pretooluse-shell", map[string]string{
+			agyFakeCommandEnv: `teamhub message send --content "$180"`,
+		})
+		requester := agyDenyingRequester{asked: make(chan string, 1)}
+		reviewer := &permission.Reviewer{Requester: requester, Timeout: time.Minute}
+		run, err := h.runtime.Start(t.Context(), "send", RunSpec{
+			Dir:                h.dir,
+			ShellTextHook:      "/opt/linger/linger-computer-daemon",
+			PermissionReviewer: reviewer,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, outcome := drainAgy(t, run)
+		if outcome.Status != statusCompleted {
+			t.Fatalf("outcome=%+v", outcome)
+		}
+		select {
+		case id := <-requester.asked:
+			t.Fatalf("permission reviewer should not be called when PreToolUse denies shell text (got %q)", id)
+		default:
+		}
+		if outcome.Output != "DENIED:"+permission.ShellTextMessage {
+			t.Fatalf("output=%q, want DENIED with ShellTextMessage", outcome.Output)
+		}
+	})
+
+	t.Run("allows_safe_teamhub_command_and_still_runs_permission_reviewer", func(t *testing.T) {
+		h := newAgyHarness(t, "pretooluse-shell", map[string]string{
+			agyFakeCommandEnv: `teamhub message send --content 'hello $180'`,
+		})
+		requester := agyDenyingRequester{asked: make(chan string, 1)}
+		reviewer := &permission.Reviewer{Requester: requester, Timeout: time.Minute}
+		run, err := h.runtime.Start(t.Context(), "send", RunSpec{
+			Dir:                h.dir,
+			ShellTextHook:      "/opt/linger/linger-computer-daemon",
+			PermissionReviewer: reviewer,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, outcome := drainAgy(t, run)
+		if outcome.Status != statusCompleted {
+			t.Fatalf("outcome=%+v", outcome)
+		}
+		select {
+		case <-requester.asked:
+		default:
+			t.Fatal("expected permission reviewer to run after PreToolUse allow")
+		}
+		if outcome.Output != "ALLOWED:deny" {
+			t.Fatalf("output=%q, want ALLOWED:deny", outcome.Output)
+		}
+	})
+
+	t.Run("skips_check_when_shell_text_hook_disabled", func(t *testing.T) {
+		h := newAgyHarness(t, "pretooluse-shell", map[string]string{
+			agyFakeCommandEnv: `teamhub message send --content "$180"`,
+		})
+		run, err := h.runtime.Start(t.Context(), "send", RunSpec{
+			Dir:           h.dir,
+			ShellTextHook: "",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, outcome := drainAgy(t, run)
+		if outcome.Status != statusCompleted || outcome.Output != "ALLOWED:allow" {
+			t.Fatalf("outcome=%+v, want ALLOWED:allow when ShellTextHook is empty", outcome)
+		}
+	})
+}
+
+func TestAntigravityStartPassesRuntimeHomeGeminiDirAndLogFile(t *testing.T) {
+	metaFile := filepath.Join(t.TempDir(), "runtime-home-meta.json")
+	runtimeHome := filepath.Join(t.TempDir(), "isolated-home")
+	if err := os.MkdirAll(filepath.Join(runtimeHome, "gemini", "antigravity-cli"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h := newAgyHarness(t, "turn", map[string]string{agyFakeMetaEnv: metaFile})
+	run, err := h.runtime.Start(t.Context(), "hi", RunSpec{Dir: h.dir, RuntimeHome: runtimeHome})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, outcome := drainAgy(t, run); outcome.Status != statusCompleted {
+		t.Fatalf("outcome=%+v", outcome)
+	}
+	rawMeta, err := os.ReadFile(metaFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta struct {
+		Args      []string `json:"args"`
+		GeminiDir string   `json:"geminiDir"`
+		LogFile   string   `json:"logFile"`
+		AddDir    string   `json:"addDir"`
+	}
+	if err := json.Unmarshal(rawMeta, &meta); err != nil {
+		t.Fatal(err)
+	}
+	wantGemini := filepath.Join(runtimeHome, "gemini")
+	wantLog := filepath.Join(runtimeHome, "acp.log")
+	if meta.GeminiDir != wantGemini || meta.LogFile != wantLog {
+		t.Fatalf("meta=%+v, want geminiDir=%q logFile=%q", meta, wantGemini, wantLog)
+	}
+	if _, err := h.runtime.Start(t.Context(), "hi", RunSpec{Dir: h.dir, RuntimeHome: "relative-home"}); err == nil {
+		t.Fatal("Start accepted relative RuntimeHome")
+	}
+}
+
+func TestAntigravityProbeContextWindowsFromUsageUpdates(t *testing.T) {
+	shortenForTest(t, &antigravityProbeUsageWait, 120*time.Millisecond)
+	shortenForTest(t, &antigravityProbeUsageSettle, 25*time.Millisecond)
+
+	t.Run("distinct_deduplicated_and_failed_models", func(t *testing.T) {
+		h := newAgyHarness(t, "turn", map[string]string{
+			agyFakeExtraModelsEnv: "gemini-same,gemini-broken,gemini-small",
+			agyFakeFailModelEnv:   "gemini-broken",
+			agyFakeUsageWindowsEnv: `{
+				"gemini-pro": 1048576,
+				"gemini-flash": 200000,
+				"gemini-same": 200000,
+				"gemini-small": 128000
+			}`,
+		})
+		probe, err := ProbeAntigravity(t.Context(), h.inv, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if probe.AuthenticationRequired {
+			t.Fatalf("unexpected authentication required: %+v", probe)
+		}
+		got := map[string]int{}
+		for _, m := range probe.Models.Models {
+			got[m.ID] = m.ContextWindow
+		}
+		want := map[string]int{
+			"gemini-pro":    1048576,
+			"gemini-flash":  200000,
+			"gemini-same":   200000,
+			"gemini-broken": 0,
+			"gemini-small":  128000,
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("context windows = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("ignores_invalid_usage_sizes", func(t *testing.T) {
+		for name, rawSize := range map[string]string{
+			"zero":     `0`,
+			"negative": `-1024`,
+			"overflow": `100000001`,
+			"string":   `"1048576"`,
+			"float":    `1048576.5`,
+		} {
+			t.Run(name, func(t *testing.T) {
+				h := newAgyHarness(t, "turn", map[string]string{
+					agyFakeUsageWindowsEnv: `{"gemini-pro": ` + rawSize + `}`,
+				})
+				probe, err := ProbeAntigravity(t.Context(), h.inv, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, m := range probe.Models.Models {
+					if m.ContextWindow != 0 {
+						t.Fatalf("%s: model %s got ContextWindow=%d, want 0", name, m.ID, m.ContextWindow)
+					}
+				}
+				if got := len(h.requests(t)["session/set_config_option"]); got != 0 {
+					t.Fatalf("%s: expected zero set_config_option calls when initial usage is invalid, got %d", name, got)
+				}
+			})
+		}
+	})
+
+	t.Run("no_usage_update_skips_model_switching", func(t *testing.T) {
+		h := newAgyHarness(t, "turn", nil)
+		probe, err := ProbeAntigravity(t.Context(), h.inv, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range probe.Models.Models {
+			if m.ContextWindow != 0 {
+				t.Fatalf("model %s got ContextWindow=%d, want 0", m.ID, m.ContextWindow)
+			}
+		}
+		if got := len(h.requests(t)["session/set_config_option"]); got != 0 {
+			t.Fatalf("expected zero set_config_option calls when session/new emits no usage_update, got %d", got)
+		}
+	})
+
+	t.Run("silent_switch_timeout_leaves_window_unknown", func(t *testing.T) {
+		h := newAgyHarness(t, "turn", map[string]string{
+			agyFakeExtraModelsEnv: "gemini-silent,gemini-small",
+			agyFakeSilentModelEnv: "gemini-silent",
+			agyFakeUsageWindowsEnv: `{
+				"gemini-pro": 1048576,
+				"gemini-flash": 200000,
+				"gemini-small": 128000
+			}`,
+		})
+		probe, err := ProbeAntigravity(t.Context(), h.inv, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]int{}
+		for _, m := range probe.Models.Models {
+			got[m.ID] = m.ContextWindow
+		}
+		want := map[string]int{
+			"gemini-pro":    1048576,
+			"gemini-flash":  200000,
+			"gemini-silent": 0,
+			"gemini-small":  128000,
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("context windows = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("invalid_usage_size_on_switched_model_does_not_inherit_previous", func(t *testing.T) {
+		for name, rawInvalid := range map[string]string{
+			"zero":     `0`,
+			"overflow": `100000001`,
+			"string":   `"bad"`,
+		} {
+			t.Run(name, func(t *testing.T) {
+				h := newAgyHarness(t, "turn", map[string]string{
+					agyFakeExtraModelsEnv: "gemini-invalid,gemini-after-invalid,gemini-valid",
+					agyFakeUsageWindowsEnv: `{
+						"gemini-pro": 1048576,
+						"gemini-flash": 200000,
+						"gemini-invalid": ` + rawInvalid + `,
+						"gemini-after-invalid": ` + rawInvalid + `,
+						"gemini-valid": 128000
+					}`,
+				})
+				probe, err := ProbeAntigravity(t.Context(), h.inv, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := map[string]int{}
+				for _, m := range probe.Models.Models {
+					got[m.ID] = m.ContextWindow
+				}
+				want := map[string]int{
+					"gemini-pro":           1048576,
+					"gemini-flash":         200000,
+					"gemini-invalid":       0,
+					"gemini-after-invalid": 0,
+					"gemini-valid":         128000,
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("%s: context windows = %v, want %v", name, got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("silent_switch_timeout_invalidates_carry_forward_baseline", func(t *testing.T) {
+		h := newAgyHarness(t, "turn", map[string]string{
+			agyFakeExtraModelsEnv: "gemini-silent,gemini-after-silent,gemini-small",
+			agyFakeSilentModelEnv: "gemini-silent",
+			agyFakeUsageWindowsEnv: `{
+				"gemini-pro": 1048576,
+				"gemini-flash": 200000,
+				"gemini-silent": 300000,
+				"gemini-after-silent": 300000,
+				"gemini-small": 128000
+			}`,
+		})
+		probe, err := ProbeAntigravity(t.Context(), h.inv, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]int{}
+		for _, m := range probe.Models.Models {
+			got[m.ID] = m.ContextWindow
+		}
+		// gemini-silent never emits usage_update so it stays unknown (0), while
+		// clean-session anchor verification recovers gemini-after-silent's real
+		// 300000 window instead of inheriting gemini-flash's 200000 baseline.
+		want := map[string]int{
+			"gemini-pro":          1048576,
+			"gemini-flash":        200000,
+			"gemini-silent":       0,
+			"gemini-after-silent": 300000,
+			"gemini-small":        128000,
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("context windows = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("initial_usage_update_after_settle_window_is_still_captured", func(t *testing.T) {
+		shortenForTest(t, &antigravityProbeUsageWait, 300*time.Millisecond)
+		shortenForTest(t, &antigravityProbeUsageSettle, 25*time.Millisecond)
+		h := newAgyHarness(t, "turn", map[string]string{
+			agyFakeInitialUsageDelayEnv: "60",
+			agyFakeUsageWindowsEnv: `{
+				"gemini-pro": 1048576,
+				"gemini-flash": 200000
+			}`,
+		})
+		probe, err := ProbeAntigravity(t.Context(), h.inv, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]int{}
+		for _, m := range probe.Models.Models {
+			got[m.ID] = m.ContextWindow
+		}
+		want := map[string]int{
+			"gemini-pro":   1048576,
+			"gemini-flash": 200000,
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("context windows = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("delayed_usage_update_does_not_misattribute_or_poison_next_model", func(t *testing.T) {
+		t.Run("delayed_flash", func(t *testing.T) {
+			shortenForTest(t, &antigravityProbeUsageWait, 1200*time.Millisecond)
+			shortenForTest(t, &antigravityProbeUsageSettle, 25*time.Millisecond)
+			h := newAgyHarness(t, "turn", map[string]string{
+				agyFakeExtraModelsEnv:  "gemini-small,gemini-same-as-pro",
+				agyFakeDelayedUsageEnv: "gemini-flash:120",
+				agyFakeUsageWindowsEnv: `{
+					"gemini-pro": 1048576,
+					"gemini-flash": 200000,
+					"gemini-small": 128000,
+					"gemini-same-as-pro": 1048576
+				}`,
+			})
+			probe, err := ProbeAntigravity(t.Context(), h.inv, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := map[string]int{}
+			for _, m := range probe.Models.Models {
+				got[m.ID] = m.ContextWindow
+			}
+			want := map[string]int{
+				"gemini-pro":         1048576,
+				"gemini-flash":       200000,
+				"gemini-small":       128000,
+				"gemini-same-as-pro": 1048576,
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("context windows = %v, want %v", got, want)
+			}
+		})
+
+		t.Run("late_frame_during_next_switch", func(t *testing.T) {
+			shortenForTest(t, &antigravityProbeUsageWait, 1200*time.Millisecond)
+			shortenForTest(t, &antigravityProbeUsageSettle, 25*time.Millisecond)
+			h := newAgyHarness(t, "turn", map[string]string{
+				agyFakeExtraModelsEnv:  "gemini-small,gemini-same-as-pro",
+				agyFakeDelayedUsageEnv: "gemini-flash:100,gemini-small:180,gemini-same-as-pro:120",
+				agyFakeUsageWindowsEnv: `{
+					"gemini-pro": 1048576,
+					"gemini-flash": 200000,
+					"gemini-small": 128000,
+					"gemini-same-as-pro": 1048576
+				}`,
+			})
+			probe, err := ProbeAntigravity(t.Context(), h.inv, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := map[string]int{}
+			for _, m := range probe.Models.Models {
+				got[m.ID] = m.ContextWindow
+			}
+			want := map[string]int{
+				"gemini-pro":         1048576,
+				"gemini-flash":       200000,
+				"gemini-small":       128000,
+				"gemini-same-as-pro": 1048576,
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("context windows = %v, want %v", got, want)
+			}
+		})
+	})
+
+	t.Run("identical_windows_without_alternate_anchor_stay_unknown", func(t *testing.T) {
+		h := newAgyHarness(t, "turn", map[string]string{
+			agyFakeUsageWindowsEnv: `{
+				"gemini-pro": 1048576,
+				"gemini-flash": 1048576
+			}`,
+		})
+		probe, err := ProbeAntigravity(t.Context(), h.inv, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]int{}
+		for _, m := range probe.Models.Models {
+			got[m.ID] = m.ContextWindow
+		}
+		want := map[string]int{
+			"gemini-pro":   1048576,
+			"gemini-flash": 0,
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("context windows = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestAntigravityOutcomeCompactionCount(t *testing.T) {
+	t.Run("zero_when_no_checkpoints", func(t *testing.T) {
+		runtimeHome := t.TempDir()
+		h := newAgyHarness(t, "turn", nil)
+		run, err := h.runtime.Start(t.Context(), "hi", RunSpec{Dir: h.dir, RuntimeHome: runtimeHome})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, outcome := drainAgy(t, run)
+		if outcome.Status != statusCompleted || outcome.CompactionCount == nil || *outcome.CompactionCount != 0 {
+			t.Fatalf("outcome=%+v, want CompactionCount=0", outcome)
+		}
+	})
+
+	t.Run("counts_done_checkpoints_and_excludes_prior_turn_and_non_done", func(t *testing.T) {
+		runtimeHome := t.TempDir()
+		sessionID := "compact-session-1"
+		transcriptPath := filepath.Join(runtimeHome, "gemini", "antigravity-cli", "brain", sessionID, ".system_generated", "logs", "transcript.jsonl")
+		if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// Earlier turn already recorded a CHECKPOINT that must not be double-counted.
+		prior := `{"type":"CHECKPOINT","status":"DONE"}` + "\n" +
+			`{"type":"USER_INPUT","status":"DONE"}` + "\n"
+		if err := os.WriteFile(transcriptPath, []byte(prior), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		turnLines := strings.Join([]string{
+			`{"type":"CHECKPOINT","status":"DONE"}`,
+			`{"type":"CHECKPOINT","status":"ERROR"}`,
+			`{"type":"CHECKPOINT","status":"CANCELED"}`,
+			`{"type":"CHECKPOINT","status":"CORTEX_STEP_STATUS_DONE"}`,
+			`{"type":"PLANNER_RESPONSE","status":"DONE"}`,
+			`not-json`,
+		}, "\n") + "\n"
+		h := newAgyHarness(t, "turn", map[string]string{
+			agyFakeSessionIDEnv:        sessionID,
+			agyFakeTranscriptAppendEnv: turnLines,
+		})
+		run, err := h.runtime.Start(t.Context(), "work", RunSpec{Dir: h.dir, RuntimeHome: runtimeHome})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, outcome := drainAgy(t, run)
+		if outcome.Status != statusCompleted || outcome.CompactionCount == nil || *outcome.CompactionCount != 2 {
+			t.Fatalf("outcome=%+v CompactionCount=%v, want 2", outcome, outcome.CompactionCount)
+		}
+
+		// A subsequent turn on the same session without new checkpoints reports 0.
+		h2 := newAgyHarness(t, "turn", map[string]string{agyFakeSessionIDEnv: sessionID})
+		run2, err := h2.runtime.Start(t.Context(), "follow up", RunSpec{Dir: h2.dir, RuntimeHome: runtimeHome, ResumeID: sessionID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, outcome2 := drainAgy(t, run2)
+		if outcome2.Status != statusCompleted || outcome2.CompactionCount == nil || *outcome2.CompactionCount != 0 {
+			t.Fatalf("second turn outcome=%+v CompactionCount=%v, want 0", outcome2, outcome2.CompactionCount)
+		}
+	})
+
+	t.Run("rejects_hostile_session_ids_and_symlinks", func(t *testing.T) {
+		appDataDir := filepath.Join(t.TempDir(), "antigravity-cli")
+		if err := os.MkdirAll(filepath.Join(appDataDir, "brain"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		outside := t.TempDir()
+		outsideTranscript := filepath.Join(outside, "transcript.jsonl")
+		if err := os.WriteFile(outsideTranscript, []byte(`{"type":"CHECKPOINT","status":"DONE"}`+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		for _, hostile := range []string{"", ".", "..", "../escape", "a/b", `a\b`, "bad space"} {
+			if got := countAntigravityTurnCheckpoints(appDataDir, hostile, 0); got != 0 {
+				t.Fatalf("hostile sessionID %q returned %d, want 0", hostile, got)
+			}
+		}
+
+		// Symlinked transcript.jsonl must return 0.
+		logsDir := filepath.Join(appDataDir, "brain", "sym-file", ".system_generated", "logs")
+		if err := os.MkdirAll(logsDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideTranscript, filepath.Join(logsDir, "transcript.jsonl")); err == nil {
+			if got := countAntigravityTurnCheckpoints(appDataDir, "sym-file", 0); got != 0 {
+				t.Fatalf("symlinked transcript returned %d, want 0", got)
+			}
+		}
+
+		// Symlinked parent directory must return 0.
+		outsideLogs := filepath.Join(outside, "logs")
+		if err := os.MkdirAll(outsideLogs, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(outsideLogs, "transcript.jsonl"), []byte(`{"type":"CHECKPOINT","status":"DONE"}`+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		sysDir := filepath.Join(appDataDir, "brain", "sym-dir", ".system_generated")
+		if err := os.MkdirAll(sysDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideLogs, filepath.Join(sysDir, "logs")); err == nil {
+			if got := countAntigravityTurnCheckpoints(appDataDir, "sym-dir", 0); got != 0 {
+				t.Fatalf("symlinked logs dir returned %d, want 0", got)
+			}
+		}
+	})
 }

@@ -433,7 +433,7 @@ func TestPageActionContinuesFromReceiptAndReadsMissingSnapshotOnce(t *testing.T)
 		}
 		return json.Marshal(map[string]any{"content": []map[string]string{{"type": "text", "text": text}}})
 	}, Limits{})
-	result := execute(t, r, `const page=await ui.page(), first=await page.observe();
+	result := execute(t, r, `const first=await ui.page();
 const typed=await first.type("textbox","Reference","AB");
 try { await first.type("textbox","Reference","AB"); return false; } catch {}
 const saved=await typed.click("button","Save");
@@ -499,7 +499,7 @@ func TestFormBatchResolvesEveryTargetBeforeDispatch(t *testing.T) {
 			return nil, errors.New("unexpected method")
 		}
 	}, Limits{})
-	result := execute(t, r, `let v=await (await ui.page()).observe();
+	result := execute(t, r, `let v=await ui.page();
 const id={type:"textbox",name:"ID",value:"12"},route={type:"combobox",name:"Route",value:"East"};
 for (const invalid of [[id,{...route,name:"Missing"}],[id,id]]) {
   try {await v.fill(invalid); return false;} catch {}
@@ -511,6 +511,33 @@ return after.text.includes("Route");`)
 		t.Fatalf("batch count=%d result=%+v", fills, result)
 	}
 }
+func TestPageReturnsObservationAndConsoleJoinsOutput(t *testing.T) {
+	r := nodeRuntime(t, func(_ context.Context, c Call) (json.RawMessage, error) {
+		if c.Method == "navigate" {
+			return json.RawMessage(`{}`), nil
+		}
+		return json.RawMessage(`{"content":[{"type":"text","text":"- heading \"Example\""}]}`), nil
+	}, Limits{MaxOutputBytes: 128})
+	result := execute(t, r, `const v=await ui.page("https://example.com");
+console.log("title", {n:1}); console.error(new Error("boom")); console.log("x".repeat(100));
+const again=await v.observe();
+try { ui.window(1,2).text; return false; } catch {}
+return v.text.includes("Example") && again.text === v.text;`)
+	if string(result.Value) != "true" || len(result.Output) != 2 || string(result.Output[0]) != `"title {\"n\":1}"` || string(result.Output[1]) != `"boom"` {
+		t.Fatalf("result=%+v output=%s", result, result.Output)
+	}
+	failed, err := r.Exec(context.Background(), context.Background(), `console.log("before"); null.x;`)
+	if err == nil || !strings.Contains(err.Error(), "TypeError: ") || len(failed.Output) != 1 || string(failed.Output[0]) != `"before"` {
+		t.Fatalf("err=%v output=%s", err, failed.Output)
+	}
+	// Multi-byte logs stay within the console's share, so a return value that
+	// fits the rest of the budget still completes the script.
+	logged := execute(t, r, `for (let i = 0; i < 20; i++) console.log("\u00e9\u00e9\u00e9\u00e9\u00e9"); return "x".repeat(80);`)
+	if len(logged.Output) == 0 || len(logged.Output) >= 20 {
+		t.Fatalf("console share was not enforced: %s", logged.Output)
+	}
+}
+
 func TestLateHandledRejectionKeepsState(t *testing.T) {
 	r := nodeRuntime(t, noCalls(t), Limits{})
 	first := execute(t, r, `state.kept = 1; const p = Promise.reject(new Error("x")); await null; try { await p } catch {} return "caught";`)
@@ -555,5 +582,61 @@ func TestBridgeSetupIgnoresGuestCPUBudget(t *testing.T) {
 	r := nodeRuntime(t, noCalls(t), Limits{PumpTimeout: time.Millisecond})
 	if got := execute(t, r, `return 1;`); string(got.Value) != "1" {
 		t.Fatalf("result=%+v", got)
+	}
+}
+
+func TestWindowClickMatchesNonAXAndAXRoles(t *testing.T) {
+	var calls []string
+	r := nodeRuntime(t, func(_ context.Context, c Call) (json.RawMessage, error) {
+		calls = append(calls, c.Method)
+		var args struct {
+			Token string `json:"element_token"`
+		}
+		_ = json.Unmarshal(c.Arguments, &args)
+		var view string
+		switch len(calls) {
+		case 1:
+			view = "window_id=8 pid=42 snapshot_id=s01\n- [4] AXButton \"Cancel\"\n- [5] Button \"Save\"\n- [6] MenuItem \"Export\""
+		case 2:
+			if args.Token != "s01:5" {
+				return nil, errors.New("unexpected first token: " + args.Token)
+			}
+			view = "window_id=8 pid=42 snapshot_id=s02\n- [4] AXButton \"Cancel\"\n- [6] MenuItem \"Export\""
+		case 3:
+			if args.Token != "s02:6" {
+				return nil, errors.New("unexpected second token: " + args.Token)
+			}
+			view = "window_id=8 pid=42 snapshot_id=s03\n- [4] AXButton \"Cancel\"\n- [8] Button \"Done\""
+		case 4:
+			if args.Token != "s03:4" {
+				return nil, errors.New("unexpected third token: " + args.Token)
+			}
+			view = "window_id=8 pid=42 snapshot_id=s04\n- [8] Button \"Done\""
+		default:
+			return nil, errors.New("unexpected driver call")
+		}
+		return json.Marshal(map[string]any{"content": []map[string]string{{"type": "text", "text": view}}})
+	}, Limits{})
+
+	result := execute(t, r, `const w = ui.window(42, 8);
+const v1 = await w.observe();
+const v2 = await v1.click("Button", "Save");
+const v3 = await v2.click("MenuItem", "Export");
+const v4 = await v3.click("AXButton", "Cancel");
+try {
+  await v4.click("AXButton", "Done");
+  return "unexpected";
+} catch (error) {
+  return error.message;
+}`)
+	if strings.Join(calls, ",") != "get_window_state,click,click,click" {
+		t.Fatalf("calls=%v", calls)
+	}
+	var errMsg string
+	if err := json.Unmarshal(result.Value, &errMsg); err != nil {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if !strings.Contains(errMsg, "copy the role and the quoted name exactly from v.text") || strings.Contains(errMsg, "copy the AX role") {
+		t.Fatalf("unexpected unmatched role error: %q", errMsg)
 	}
 }

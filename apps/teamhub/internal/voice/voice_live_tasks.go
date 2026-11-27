@@ -124,7 +124,7 @@ func alterEgoContextKeyPrefix(agentManagementID string) string {
 // startVoiceLiveTask starts the work as its own delegated Task of the Room's
 // Agent, so several tasks run side by side. Irreversible work
 // starts only from a confirmation the user gave in a later turn.
-func (s *Service) startVoiceLiveTask(ctx context.Context, session voicelive.Session, request teamhubinternal.VoiceLiveToolCall) (string, error) {
+func (s *Service) startVoiceLiveTask(ctx context.Context, session voicelive.Session, request teamhubinternal.VoiceLiveToolCall) (output string, callErr error) {
 	var args voicelive.StartTaskArguments
 	if voicelive.DecodeArguments(request.Arguments, &args) != nil {
 		return "", voicelive.ErrInvalid
@@ -155,7 +155,7 @@ func (s *Service) startVoiceLiveTask(ctx context.Context, session voicelive.Sess
 		}); err != nil {
 			return "", err
 		}
-		return voicelive.Output(map[string]string{"status": "needs_confirmation", "goal": goal, "confirmation_id": id}), nil
+		return voicelive.Output(map[string]string{"status": "needs_confirmation", "goal": goal, "confirmation_id": id, "next": "Ask for spoken confirmation once and wait for the next user turn. This request has no chat card."}), nil
 	}
 	computer, err := s.queries.GetVoiceLiveAgentComputer(ctx, store.GetVoiceLiveAgentComputerParams{ActorID: session.Agent.ID, TenantID: session.TenantID})
 	if errors.Is(err, pgx.ErrNoRows) || err == nil && computer.AgentManagementID == "" {
@@ -188,7 +188,16 @@ func (s *Service) startVoiceLiveTask(ctx context.Context, session voicelive.Sess
 	if err != nil {
 		return "", err
 	}
-	defer tx.Rollback(ctx)
+	// A successful rollback proves that the task never started. A commit
+	// with a lost response stays uncertain and must not be retried blindly.
+	defer func() {
+		if rollbackErr := tx.Rollback(context.WithoutCancel(ctx)); rollbackErr == nil && callErr != nil && !errors.Is(callErr, voicelive.ErrInvalid) {
+			if s.logger != nil {
+				s.logger.ErrorContext(ctx, "voice.task_start_failed", "call_id", request.CallId, "error", callErr)
+			}
+			output, callErr = voicelive.ErrorOutput("task_not_started"), nil
+		}
+	}()
 	queries := store.New(tx)
 	// Numbering and repeats are per Room and user.
 	if err := queries.AcquireAdvisoryTransactionLock(ctx, "voice-live-task|"+session.RoomID+"|"+session.HumanActorID); err != nil {
@@ -299,12 +308,16 @@ func (s *Service) replyToVoiceLiveTask(ctx context.Context, session voicelive.Se
 		return "", err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := taskexecution.AppendTaskInput(ctx, store.New(tx), taskexecution.TaskInput{
+	result, err := taskexecution.AppendTaskInput(ctx, store.New(tx), taskexecution.TaskInput{
 		TaskID: task.WorkItemID, Cause: taskexecution.TaskInputSystem, Body: voicelive.TaskAnswer(details), Steer: true,
-	}); errors.Is(err, taskexecution.ErrNotFound) {
+	})
+	if errors.Is(err, taskexecution.ErrNotFound) {
 		return voicelive.ErrorOutput("task_not_found"), nil
 	} else if err != nil {
 		return "", err
+	}
+	if result.Delivery == "ignored" {
+		return voicelive.ErrorOutput("task_canceled"), nil
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return "", err
@@ -519,6 +532,18 @@ func (s *Service) LiveTasks(ctx context.Context, voiceSessionID string) (teamhub
 		}
 		text, _ := voicelive.Truncate(strings.TrimSpace(strings.TrimPrefix(wake.Body, notify)), 20000)
 		alerts = append(alerts, teamhubinternal.VoiceLiveAlert{AlertId: wake.ID, Text: text})
+	}
+	reports, err := s.queries.ListVoiceLiveRoomReports(ctx, session.ID)
+	if err != nil {
+		return teamhubinternal.VoiceLiveTaskList{}, fmt.Errorf("read live Room reports: %w", err)
+	}
+	if len(reports) > 0 {
+		result := make([]teamhubinternal.VoiceLiveRoomReport, 0, len(reports))
+		for _, report := range reports {
+			text, _ := voicelive.Truncate(report.Body, 20000)
+			result = append(result, teamhubinternal.VoiceLiveRoomReport{MessageId: report.MessageID, HandoffId: report.HandoffID, RoomId: report.RoomID, RoomName: report.RoomName, State: teamhubinternal.VoiceLiveRoomReportState(report.State), Text: text})
+		}
+		response.RoomReports = &result
 	}
 	if len(alerts) > 0 {
 		response.Alerts = &alerts

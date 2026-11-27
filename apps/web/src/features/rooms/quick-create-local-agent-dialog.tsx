@@ -6,22 +6,38 @@ import { Link } from "react-router";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { ModalDialog } from "@/components/ui/modal-dialog";
-import { Select, SelectItem } from "@/components/ui/select";
+import { SelectItem } from "@/components/ui/select";
+import { Spinner } from "@/components/ui/spinner";
+import {
+  appNames,
+  runtimeStatusLabels,
+} from "@/features/local-computer/computer-readiness";
 import { ComputerSetupInstructions } from "@/features/local-computer/computer-setup-instructions";
-import { useDesktopComputer } from "@/features/local-computer/desktop-computer";
+import { computerSetupMessages } from "@/features/local-computer/computer-setup.messages";
+import {
+  useCliInstallAvailable,
+  useDesktopComputer,
+} from "@/features/local-computer/desktop-computer";
 import { DesktopComputerSetup } from "@/features/local-computer/desktop-computer-setup";
 import { subscribeLocalComputerEnrollment } from "@/features/local-computer/local-computer-enrollment-events";
 import { localComputersQueryKey } from "@/features/local-computer/local-computer-queries";
 import { LocalRuntimeAuthenticationGuidance } from "@/features/local-computer/local-runtime-authentication-guidance";
 import { LocalRuntimeInstallGuidance } from "@/features/local-computer/local-runtime-install-guidance";
+import { LocalRuntimeUpdateGuidance } from "@/features/local-computer/local-runtime-update-guidance";
+import {
+  classifyPiLocalModelsState,
+  piAuthRequiredStatusMessage,
+  PiRuntimeSetupGuidance,
+} from "@/features/local-computer/pi-runtime-setup-guidance";
+import { RuntimeLogo } from "@/features/local-computer/runtime-logo";
 import { ServerConnection } from "@/features/local-computer/server-connection";
+import { localModelsQueryOptions } from "@/features/local-models/local-models-queries";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
 import type {
   TeamHubAgentReasoningEffort,
   TeamHubLocalComputerPage,
   TeamHubLocalRuntimeType,
 } from "@/features/teamhub/teamhub-types";
-import type { Message } from "@/i18n/messages";
 import { RichMessage, useT } from "@/i18n/use-translation";
 
 import {
@@ -31,22 +47,19 @@ import {
 import { AgentCreationProgress } from "./agent-creation-progress";
 import { createAgentMessages } from "./create-agent.messages";
 import { runtimeModelLabel } from "./members/runtime-model-label";
+import {
+  ComputerStatus,
+  ChoiceLabel,
+  SettingSelect,
+  StatusDot,
+} from "./members/runtime-setting-rows";
+import { reasoningEffortLabel } from "./members/use-agent-model-selection";
 
 const localRuntimeLabels: Record<TeamHubLocalRuntimeType, string> = {
   claude: "Claude Code",
   codex: "Codex",
   pi: "Pi",
   antigravity: "Antigravity",
-};
-
-const effortLabels: Record<TeamHubAgentReasoningEffort, Message<string>> = {
-  none: createAgentMessages.effortNone,
-  low: createAgentMessages.effortLow,
-  medium: createAgentMessages.effortMedium,
-  high: createAgentMessages.effortHigh,
-  xhigh: createAgentMessages.effortExtraHigh,
-  max: createAgentMessages.effortMaximum,
-  ultra: createAgentMessages.effortUltra,
 };
 
 export function QuickCreateLocalAgentDialog({
@@ -64,6 +77,7 @@ export function QuickCreateLocalAgentDialog({
   const [effort, setEffort] = useState<TeamHubAgentReasoningEffort>();
   const [target, setTarget] = useState<LocalAgentTarget>();
   const desktop = useDesktopComputer();
+  const cliInstallAvailable = useCliInstallAvailable();
   const desktopComputerId = desktop?.status?.computerId;
   const [connection, setConnection] = useState<{
     knownIds: ReadonlySet<string>;
@@ -107,8 +121,15 @@ export function QuickCreateLocalAgentDialog({
   const desktopComputer = selectableComputers.find(
     (computer) => computer.computer_id === desktopComputerId,
   );
-  // In the desktop app the computer it runs on is chosen by default.
-  const selectedComputerId = computerId || desktopComputer?.computer_id || "";
+  // A Computer is always chosen, as in the desktop app, so the Agent's
+  // settings show at once: the one the desktop app runs on, else the first
+  // online one, else the first; an offline one takes the Agent once it
+  // connects.
+  const defaultComputer =
+    desktopComputer ??
+    selectableComputers.find((computer) => computer.status === "online") ??
+    selectableComputers[0];
+  const selectedComputerId = computerId || defaultComputer?.computer_id || "";
   const selectedComputer = selectableComputers.find(
     (computer) => computer.computer_id === selectedComputerId,
   );
@@ -168,6 +189,20 @@ export function QuickCreateLocalAgentDialog({
     : selectedRuntime?.status === "authentication_required"
       ? selectedRuntime
       : undefined;
+  const localModels = useQuery({
+    ...localModelsQueryOptions(client, tenantId, selectedComputerId),
+    // The Runtime list words Pi's status from its local models, so they load
+    // whenever Pi waits on them, not only once Pi is the chosen Runtime.
+    enabled: Boolean(
+      !setupOpen &&
+      selectedComputerId &&
+      selectedComputer?.runtimes.some(
+        (runtime) =>
+          runtime.type === "pi" && runtime.status === "authentication_required",
+      ),
+    ),
+  });
+  const piModelsState = classifyPiLocalModelsState(localModels.data);
 
   function selectComputer(value: string) {
     setComputerId(value);
@@ -179,7 +214,7 @@ export function QuickCreateLocalAgentDialog({
   // Where the downloaded models of the selected Computer are managed.
   const modelsLink = (text: string) => (
     <Link
-      className="font-medium text-foreground underline underline-offset-2"
+      className="whitespace-nowrap font-medium text-foreground underline underline-offset-2"
       onClick={onClose}
       to={`/t/${encodeURIComponent(tenantId)}/settings/models?computer=${encodeURIComponent(selectedComputerId)}`}
     >
@@ -209,11 +244,6 @@ export function QuickCreateLocalAgentDialog({
       onClose={onClose}
       size="md"
       title={t(createAgentMessages.title)}
-      description={t(
-        setupOpen
-          ? createAgentMessages.connectDescription
-          : createAgentMessages.chooseDescription,
-      )}
       footer={
         !pending ? (
           <>
@@ -264,7 +294,9 @@ export function QuickCreateLocalAgentDialog({
         ) : undefined
       }
     >
-      <div className="space-y-4 px-5 py-4">
+      <div
+        className={`min-w-0 ${pending || computers.error || setupOpen ? "space-y-4 px-5 py-4" : "space-y-1 px-3 pb-2"}`}
+      >
         {pending ? (
           <div className="flex justify-center px-4 py-3">
             <AgentCreationProgress stage="preparing" />
@@ -313,140 +345,187 @@ export function QuickCreateLocalAgentDialog({
           </>
         ) : (
           <>
-            <div>
-              <div className="mb-1.5 flex items-center justify-between gap-3">
-                <label
-                  className="text-sm font-medium"
-                  htmlFor="local-agent-computer"
-                >
-                  {t(createAgentMessages.computer)}
-                </label>
-                <Button
-                  size="compact"
-                  tone="ghost"
-                  onClick={() =>
-                    setConnection({
-                      knownIds: new Set(
-                        computers.data?.items.map(
-                          (computer) => computer.computer_id,
-                        ),
-                      ),
-                    })
+            <SettingSelect
+              aria-label={t(createAgentMessages.computer)}
+              label={t(createAgentMessages.computer)}
+              onValueChange={selectComputer}
+              placeholder={t(createAgentMessages.selectComputer)}
+              value={selectedComputerId}
+            >
+              {selectableComputers.map((computer) => (
+                <SelectItem
+                  key={computer.computer_id}
+                  triggerLabel={
+                    <ChoiceLabel
+                      name={computer.display_name}
+                      status={<ComputerStatus computer={computer} />}
+                    />
                   }
+                  value={computer.computer_id}
                 >
-                  <span className="inline-flex items-center gap-1.5 text-app-info">
-                    <Icon icon={Add01Icon} size={14} />{" "}
-                    {t(createAgentMessages.connectNewComputer)}
-                  </span>
-                </Button>
-              </div>
-              <Select
-                id="local-agent-computer"
-                aria-label={t(createAgentMessages.computer)}
-                className="min-w-0 w-full"
-                onValueChange={selectComputer}
-                placeholder={t(createAgentMessages.selectComputer)}
-                value={selectedComputerId}
-              >
-                {selectableComputers.map((computer) => (
-                  <SelectItem
-                    key={computer.computer_id}
-                    value={computer.computer_id}
-                  >
-                    {computer.status === "online"
-                      ? computer.display_name
-                      : t(createAgentMessages.offlineComputer, {
-                          name: computer.display_name,
-                        })}
-                  </SelectItem>
-                ))}
-              </Select>
-              {selectedComputer?.status === "offline" ? (
-                <p className="mt-1.5 text-xs text-app-muted" role="status">
-                  {t(createAgentMessages.offlineComputerHint)}
-                </p>
-              ) : null}
-            </div>
-            {selectedComputer ? (
-              <>
-                <label className="block">
-                  <span className="mb-1.5 block text-sm font-medium">
-                    {t(createAgentMessages.runtime)}
-                  </span>
-                  <Select
-                    aria-label={t(createAgentMessages.runtime)}
-                    className="min-w-0 w-full"
-                    disabled={!selectedComputer.runtimes.length}
-                    placeholder={t(createAgentMessages.noRuntimes)}
-                    value={selectedRuntime?.type ?? ""}
-                    onValueChange={(value) => {
-                      setRuntimeType(value as TeamHubLocalRuntimeType);
-                      setModelId("");
-                      setEffort(undefined);
-                    }}
-                  >
-                    {selectedComputer.runtimes.map((runtime) => (
-                      <SelectItem key={runtime.type} value={runtime.type}>
-                        {localRuntimeLabels[runtime.type]}
-                      </SelectItem>
-                    ))}
-                  </Select>
-                </label>
-                <div className="space-y-1.5">
-                  <label className="block">
-                    <span className="mb-1.5 block text-sm font-medium">
-                      {t(createAgentMessages.model)}
-                    </span>
-                    <Select
-                      aria-label={t(createAgentMessages.model)}
-                      className="min-w-0 w-full"
-                      disabled={!modelOptions.length}
-                      placeholder={t(createAgentMessages.noModels)}
-                      value={selectedModel?.id ?? ""}
-                      onValueChange={(value) => {
-                        setModelId(value);
-                        setEffort(undefined);
-                      }}
-                    >
-                      {modelOptions.map((model) => (
-                        <SelectItem key={model.id} value={model.id}>
-                          {runtimeModelLabel(model, t)}
-                        </SelectItem>
-                      ))}
-                    </Select>
-                  </label>
-                  {selectedRuntime?.type === "pi" && modelOptions.length > 0 ? (
-                    <p className="text-xs text-muted-foreground">
-                      <RichMessage
-                        message={createAgentMessages.manageModels}
-                        tags={{ link: modelsLink }}
-                      />
-                    </p>
-                  ) : null}
-                </div>
-                <label className="block">
-                  <span className="mb-1.5 block text-sm font-medium">
-                    {t(createAgentMessages.thinkingEffort)}
-                  </span>
-                  <Select
-                    aria-label={t(createAgentMessages.thinkingEffort)}
-                    className="min-w-0 w-full"
-                    disabled={!allowedEfforts.length}
-                    placeholder={t(createAgentMessages.effortNotSupported)}
-                    value={selectedEffort ?? ""}
-                    onValueChange={(value) =>
-                      setEffort(value as TeamHubAgentReasoningEffort)
+                  <ChoiceLabel
+                    name={computer.display_name}
+                    status={<ComputerStatus computer={computer} labelled />}
+                  />
+                </SelectItem>
+              ))}
+            </SettingSelect>
+            {selectedComputer?.status === "offline" || cliInstallAvailable ? (
+              <div className="flex items-center justify-between gap-3 pb-1 pl-[calc(7rem+0.75rem)]">
+                {selectedComputer?.status === "offline" ? (
+                  <p className="text-xs text-app-muted" role="status">
+                    {t(createAgentMessages.offlineComputerHint)}
+                  </p>
+                ) : (
+                  <span />
+                )}
+                {cliInstallAvailable ? (
+                  <Button
+                    size="compact"
+                    tone="ghost"
+                    onClick={() =>
+                      setConnection({
+                        knownIds: new Set(
+                          computers.data?.items.map(
+                            (computer) => computer.computer_id,
+                          ),
+                        ),
+                      })
                     }
                   >
-                    {allowedEfforts.map((value) => (
-                      <SelectItem key={value} value={value}>
-                        {t(effortLabels[value])}
-                      </SelectItem>
-                    ))}
-                  </Select>
-                </label>
+                    <span className="inline-flex items-center gap-1.5 text-app-info">
+                      <Icon icon={Add01Icon} size={14} />{" "}
+                      {t(createAgentMessages.connectNewComputer)}
+                    </span>
+                  </Button>
+                ) : null}
+              </div>
+            ) : null}
+            {selectedComputer ? (
+              <>
+                <SettingSelect
+                  aria-label={t(createAgentMessages.runtime)}
+                  disabled={!selectedComputer.runtimes.length}
+                  label={t(createAgentMessages.runtime)}
+                  onValueChange={(value) => {
+                    setRuntimeType(value as TeamHubLocalRuntimeType);
+                    setModelId("");
+                    setEffort(undefined);
+                  }}
+                  placeholder={t(createAgentMessages.noRuntimes)}
+                  value={selectedRuntime?.type ?? ""}
+                >
+                  {selectedComputer.runtimes.map((runtime) => (
+                    <SelectItem
+                      key={runtime.type}
+                      triggerLabel={
+                        <ChoiceLabel
+                          leading={<RuntimeLogo type={runtime.type} />}
+                          name={localRuntimeLabels[runtime.type]}
+                        />
+                      }
+                      value={runtime.type}
+                    >
+                      <ChoiceLabel
+                        leading={<RuntimeLogo type={runtime.type} />}
+                        name={localRuntimeLabels[runtime.type]}
+                        status={
+                          <>
+                            <StatusDot
+                              tone={runtime.status === "ready" ? "ok" : "warn"}
+                            />
+                            {t(
+                              runtime.type === "pi" &&
+                                runtime.status === "authentication_required"
+                                ? piAuthRequiredStatusMessage(piModelsState)
+                                : runtimeStatusLabels[runtime.status],
+                            )}
+                          </>
+                        }
+                      />
+                    </SelectItem>
+                  ))}
+                </SettingSelect>
+                <SettingSelect
+                  aria-label={t(createAgentMessages.model)}
+                  disabled={!modelOptions.length}
+                  label={t(createAgentMessages.model)}
+                  onValueChange={(value) => {
+                    setModelId(value);
+                    setEffort(undefined);
+                  }}
+                  placeholder={t(createAgentMessages.noModels)}
+                  value={selectedModel?.id ?? ""}
+                >
+                  {modelOptions.map((model) => (
+                    <SelectItem key={model.id} value={model.id}>
+                      {runtimeModelLabel(model, t)}
+                    </SelectItem>
+                  ))}
+                </SettingSelect>
+                {selectedRuntime?.type === "pi" && modelOptions.length > 0 ? (
+                  <p className="pb-1 pl-[calc(7rem+0.75rem)] text-xs text-muted-foreground">
+                    <RichMessage
+                      message={createAgentMessages.manageModels}
+                      tags={{ link: modelsLink }}
+                    />
+                  </p>
+                ) : null}
+                <SettingSelect
+                  aria-label={t(createAgentMessages.thinkingEffort)}
+                  disabled={!allowedEfforts.length}
+                  label={t(createAgentMessages.thinkingEffort)}
+                  onValueChange={(value) => setEffort(value)}
+                  placeholder={t(createAgentMessages.effortNotSupported)}
+                  value={selectedEffort ?? ""}
+                >
+                  {allowedEfforts.map((value) => (
+                    <SelectItem key={value} value={value}>
+                      {reasoningEffortLabel(value, t)}
+                    </SelectItem>
+                  ))}
+                </SettingSelect>
                 {!selectedModel && !loginRuntime ? (
-                  selectedRuntime?.type === "pi" ? (
+                  selectedComputer &&
+                  selectedRuntime?.status === "incompatible" ? (
+                    <LocalRuntimeUpdateGuidance
+                      computerName={selectedComputer.display_name}
+                      diagnosticMessage={selectedRuntime.message}
+                      platform={selectedComputer.platform}
+                      runtimeType={selectedRuntime.type}
+                    />
+                  ) : selectedComputer &&
+                    selectedRuntime?.status === "unknown" ? (
+                    <div
+                      className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 p-3 text-xs text-muted-foreground"
+                      role="status"
+                    >
+                      <Spinner size={14} />
+                      <span>
+                        {t(computerSetupMessages.checkingRuntimeBody, {
+                          app: appNames[selectedRuntime.type],
+                          computer: selectedComputer.display_name,
+                        })}
+                      </span>
+                    </div>
+                  ) : selectedComputer &&
+                    selectedRuntime?.status === "error" ? (
+                    <div
+                      className="rounded-lg border border-[var(--app-status-warning-border)] bg-[var(--app-status-warning-surface)] p-3 text-xs text-app-body"
+                      role="alert"
+                    >
+                      <p className="font-medium text-foreground">
+                        {t(computerSetupMessages.runtimeCheckFailedTitle, {
+                          app: appNames[selectedRuntime.type],
+                        })}
+                      </p>
+                      {selectedRuntime.message ? (
+                        <p className="mt-1 font-mono text-muted-foreground">
+                          {selectedRuntime.message}
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : selectedRuntime?.type === "pi" ? (
                     <p className="text-xs text-muted-foreground" role="status">
                       <RichMessage
                         message={createAgentMessages.downloadModel}
@@ -473,13 +552,23 @@ export function QuickCreateLocalAgentDialog({
           </>
         )}
         {loginComputer && loginRuntime ? (
-          <div className="text-xs text-app-muted" role="status">
-            <LocalRuntimeAuthenticationGuidance
+          !setupOpen && loginRuntime.type === "pi" ? (
+            <PiRuntimeSetupGuidance
               computer={loginComputer}
               computerName={loginComputer.display_name}
-              runtimeType={loginRuntime.type}
+              isLoadingModels={localModels.isLoading}
+              modelsLink={modelsLink}
+              state={piModelsState}
             />
-          </div>
+          ) : (
+            <div className="text-xs text-app-muted" role="status">
+              <LocalRuntimeAuthenticationGuidance
+                computer={loginComputer}
+                computerName={loginComputer.display_name}
+                runtimeType={loginRuntime.type}
+              />
+            </div>
+          )
         ) : null}
       </div>
     </ModalDialog>

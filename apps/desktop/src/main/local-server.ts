@@ -8,7 +8,9 @@ import {
   readFileSync,
 } from "node:fs";
 import {
+  chmod,
   constants as fsConstants,
+  copyFile,
   cp,
   mkdir,
   readdir,
@@ -33,12 +35,24 @@ import {
   readLocalIdentity,
   readLocalLogin,
 } from "@linger/local-installation/account";
+import { extractArchiveFallback } from "@linger/local-installation/archive";
 import { downloadInRegion } from "@linger/local-installation/region";
 import { latestLegacyBackup } from "@linger/local-installation/legacy-database";
 import { legacyMigrationPending } from "@linger/local-installation/home";
 import { loadInstance } from "@linger/local-installation/instance";
+import { foldersInUse } from "@linger/local-installation/native-process";
+import {
+  bundledToolArchivePath,
+  ensureLocalmodelsTool,
+  readPublishedTool,
+} from "@linger/local-installation/localmodels-tool";
 import { normalizeFailurePunctuation } from "@linger/local-installation/localmodels-failure";
-import { validateSourceRepository } from "@linger/local-installation/source-checkout";
+import {
+  canBuildNativeServicesFromSource,
+  canCompileTeamhubFromSource,
+  localRunnerGatewayUrl,
+  validateSourceRepository,
+} from "@linger/local-installation/source-checkout";
 import type { LegacyInstanceSkipped } from "@linger/local-installation/legacy-migration";
 import {
   type SetupChoice,
@@ -58,11 +72,14 @@ import {
 import { linuxNodeFdHygieneArgs } from "@linger/local-installation/native-process-fds";
 import {
   installTeamhubBinaries,
+  readTeamhubBinaries,
   TEAMHUB_BINARY_DIRECTORY,
+  teamhubBinaryStampsFile,
 } from "@linger/local-installation/teamhub-binaries";
 import { redact } from "@linger/local-installation/redaction";
 import { isInkling2MiniModelId } from "@linger/service-kit/featured-models";
 import {
+  windowsPrivateLocation,
   windowsPrivateRefusal,
   type WindowsPrivateRefusal,
 } from "@linger/local-installation/windows-private";
@@ -73,6 +90,7 @@ import {
   NODE_RUNTIME_VERSION,
   nodeRuntimeDownloadUrls,
 } from "../../../../scripts/local-computer-node-distributions.mjs";
+import type { DesktopConfig } from "./config.js";
 import type { Logger } from "./log.js";
 import type { Module, ModuleContext, StopReason } from "./modules.js";
 import {
@@ -84,6 +102,10 @@ import { humanTenant, type EnrollmentModule } from "./enrollment.js";
 import { compareVersions } from "./update-manifest.js";
 import { systemProxy } from "./system-proxy.js";
 import type { WindowManagerModule } from "./window-manager.js";
+import type {
+  DefaultWorkspaceGrantFailure,
+  WorkspaceGrantsModule,
+} from "./workspace-grants.js";
 import {
   installerKeyChanges,
   savedProviderKeys,
@@ -95,6 +117,7 @@ import type {
   SetupByokEndpoint,
   SetupByokModels,
   SetupByokProtocol,
+  SetupDetectedRuntime,
   SetupReason,
 } from "../shared/setup.js";
 
@@ -156,6 +179,8 @@ export type LocalModelsCheck =
       // The localmodels tool's pick for this computer, which Quick Install
       // installs; the page adds no rule of its own.
       readonly recommendation?: SetupChoice;
+      // Harnesses discovered on this computer during inspect.
+      readonly runtimes?: readonly SetupDetectedRuntime[];
     };
 
 // A download under way: its bytes so far and in all, and the rate when the
@@ -249,6 +274,12 @@ export interface LocalServerLocation {
   readonly custom: boolean;
   // Why the folder last chosen cannot be used.
   readonly error?: string;
+  // The folder last chosen that failed validation (when `error` is set).
+  readonly rejectedPath?: string;
+  // Available disk space on the target path's filesystem (read-only statfs).
+  readonly freeBytes?: number;
+  // Base free space required for services before any local model disk budget.
+  readonly minFreeBytes?: number;
 }
 
 export type LocalRuntime = "codex" | "claude" | "pi";
@@ -285,6 +316,17 @@ export interface RuntimeSignIn {
 // finished it in time; ended: the login stopped without a sign-in.
 export type RuntimeLoginReason = "unavailable" | "timed_out" | "ended";
 
+// Why an installation stopped, for failures the setup page words itself:
+// the runtime lookup outlasted RUNTIME_LOOKUP_LIMIT_MS, or the installer
+// stopped answering while it ran.
+export type LocalServerFailure =
+  | "runtime_lookup_timed_out"
+  | "runtime_lookup_unreachable";
+
+// What a running step still waits on once it has taken a while; the page
+// says so, since the bar does not move meanwhile.
+export type LocalServerWaiting = "runtime";
+
 // Codex's two logins: browser calls back to this computer, so the browser
 // must run here; device shows a code to enter in any browser, which needs
 // device-code sign-in turned on in the person's ChatGPT settings.
@@ -306,6 +348,8 @@ export interface LocalServerStatus {
   readonly progress: number;
   // While the current step downloads: what and how far.
   readonly transfer?: Transfer & { readonly label: string };
+  // While installing: what a step that has run a while still waits on.
+  readonly waiting?: LocalServerWaiting;
   // Which installation this is; each Install or Try Again starts a new one.
   readonly attempt: number;
   readonly localModels: LocalModelsCheck;
@@ -326,6 +370,8 @@ export interface LocalServerStatus {
   // While failed because the installer refused a folder as not private
   // (Windows): its code and reason.
   readonly refusal?: WindowsPrivateRefusal;
+  // While failed for a reason the page words itself.
+  readonly failure?: LocalServerFailure;
   // While ready after a degraded resume where local models could not be restored.
   readonly localModelsDegraded?: LocalModelsDegradedStatus;
 }
@@ -343,8 +389,22 @@ export interface LocalServerOptions {
   readonly home: string;
   // This app's version, recorded with the source package it unpacks.
   readonly version: string;
+  // The resolved user terminal environment passed ONLY to read-only setup
+  // inspection (--inspect) so daemon runtime probing can read profile
+  // variables (e.g. ANTHROPIC_BASE_URL, OPENAI_API_KEY, CODEX_HOME). Never
+  // forwarded to --resume, BYOK checks, or the serving installer that starts
+  // local services.
+  readonly inspectEnv?:
+    | Readonly<Record<string, string>>
+    | Promise<Readonly<Record<string, string>>>;
+  // Bundled linger-computer-daemon executable used as the single source of
+  // truth for AI Runtime discovery and authentication probing during setup.
+  readonly daemonExecutable?: string;
   // The bundled installer (installer.js, web/, native-process-worker.mjs).
   readonly installerDirectory: string;
+  // Shared bundled Node.js executable shipped with Computer tools
+  // (resources/runtime/bin/node(.exe)), reused for Native services.
+  readonly bundledNodePath?: string;
   readonly sourceArchive?: SourceArchive;
   readonly sourceDependencies?: SourceDependencies;
   // A linger checkout installed instead of the source package, for developers
@@ -375,6 +435,16 @@ export interface LocalServerOptions {
   readonly pollMs?: number;
   // The free space a picked folder needs; LOCATION_FREE_BYTES by default.
   readonly freeBytes?: number;
+  // Read-only free-space lookup for the install location; freeDiskBytes by default.
+  readonly freeDiskBytes?: (directory: string) => Promise<number | undefined>;
+  // Where the Desktop Computer daemon stores its config and state
+  // (<userData>/computer); validated on Windows during setup preflight so
+  // private-path validation failures (such as symlink/junction ancestors or
+  // foreign target ownership) fail immediately instead of after installation.
+  readonly daemonDirectory?: string;
+  // Checks Windows private-path safety for a candidate directory without
+  // creating it or mutating ACLs; windowsPrivateLocation by default on Windows.
+  readonly checkPrivateLocation?: (directory: string) => Promise<void>;
   // How long setup waits for the Another Me; AGENTS_TIMEOUT_MS by default.
   readonly agentsTimeoutMs?: number;
   // Opens the runtime's sign-in page in the browser.
@@ -389,6 +459,11 @@ export interface LocalServerOptions {
   // Chromium's proxy for a URL (session.resolveProxy); without it the
   // services get no system proxy.
   readonly resolveProxy?: (url: string) => Promise<string>;
+  // How often the running server the window shows is checked, and how long
+  // one that does not answer gets to come back by itself before a resume;
+  // WATCH_MS and UNREACHABLE_GRACE_MS by default.
+  readonly watchMs?: number;
+  readonly unreachableGraceMs?: number;
 }
 
 // The starter Room the server makes for a new owner, with their Agents.
@@ -399,6 +474,34 @@ const SIGN_IN_POLL_MS = 3_000;
 // How long one check that the installed server still answers as itself
 // serves the pages that ask whether to offer the owner account.
 const SERVER_CHECK_TTL_MS = 2_000;
+const WATCH_MS = 30_000;
+// Longer than a service supervisor's restart delays (1, 2 and 5 seconds)
+// plus a web start, so a restart it has under way is not doubled.
+const UNREACHABLE_GRACE_MS = 20_000;
+// A ready server counts as stopped only after this many unanswered checks in
+// a row, spread over the grace, each waiting longer than a launch's fast
+// check: one under heavy load (such as local model inference) can answer
+// slowly for a while, and resuming it would send the window to Starting.
+const UNREACHABLE_PROBES = 3;
+const UNREACHABLE_PROBE_TIMEOUT_MS = 5_000;
+// A server that keeps going away is resumed at most this often on its own;
+// Retry is never held back.
+const RECOVERY_INTERVAL_MS = 60_000;
+
+// Short initial polling interval while fast setup steps settle, before
+// relaxing back to the caller's steady-state interval.
+export const FAST_POLL_MS = 200;
+export const FAST_POLL_WINDOW_MS = 10_000;
+
+export function pollDelayMs(
+  startedAt: number,
+  basePollMs: number,
+  now = Date.now(),
+): number {
+  return now - startedAt < FAST_POLL_WINDOW_MS
+    ? Math.min(FAST_POLL_MS, basePollMs)
+    : basePollMs;
+}
 
 // The instance the desktop installs.
 export const LOCAL_INSTANCE = "desktop";
@@ -453,6 +556,19 @@ const GiB = 1024 * MiB;
 // a local model needs its own on top.
 export const LOCATION_FREE_BYTES = 20 * GiB;
 
+interface PrestageTask {
+  readonly home: string;
+  readonly abort: AbortController;
+  readonly promise: Promise<string>;
+  readonly startedAt: number;
+}
+
+interface BifrostPrefetchTask {
+  readonly home: string;
+  readonly abort: AbortController;
+  readonly promise: Promise<void>;
+}
+
 // Runs Linger on this computer: fetches a pinned Node 26 and the linger
 // source, drives the bundled installer through its local API and signs the
 // window in to the result. The desktop itself is the Computer, so the
@@ -484,12 +600,32 @@ export class LocalServerModule implements Module {
   #home: string;
   #location: string | undefined;
   #locationError: string | undefined;
+  #locationRejectedPath: string | undefined;
+  #locationFreeBytes: number | undefined;
+  #locationChoiceSeq = 0;
   #refusal: WindowsPrivateRefusal | undefined;
+  #failure: LocalServerFailure | undefined;
+  #waiting: LocalServerWaiting | undefined;
   #localModelsDegraded: LocalModelsDegradedStatus | undefined;
   #node: Promise<string> | undefined;
   #abort = new AbortController();
+  #inspectAbort: AbortController | undefined;
+  #pruning: Promise<void> = Promise.resolve();
+  #preStagedSources = new Map<string, PreStagedSourceState>();
+  #stagingSources = new Map<string, Promise<void>>();
+  #abortedStaging = new WeakSet<Promise<void>>();
+  #prestage: PrestageTask | undefined;
+  #prestageAllowed = true;
+  readonly #prestageSettling = new Map<string, Promise<unknown>>();
+  #bifrostPrefetch: BifrostPrefetchTask | undefined;
+  readonly #bifrostPrefetchSettling = new Map<string, Promise<unknown>>();
   #offRetry: (() => void) | undefined;
+  #offUnreachable: (() => void) | undefined;
+  #watch: ReturnType<typeof setInterval> | undefined;
+  #recovering = false;
+  #recoveredAt: number | undefined;
   #offReset: (() => void) | undefined;
+  #offServerChanged: (() => void) | undefined;
   #offDaemon: (() => void) | undefined;
   #offDaemonConnection: (() => void) | undefined;
   #offComputerChanged: (() => void) | undefined;
@@ -543,6 +679,16 @@ export class LocalServerModule implements Module {
       config.serverUrl !== undefined &&
       sameOrigin(config.serverUrl, record.origin) &&
       !!config.computerId;
+    if (
+      !record &&
+      !migrationFailure &&
+      (await this.#isOrphanedLocalServer(config))
+    ) {
+      ctx.log.warn("local_server.orphaned_config_reset", {
+        server_url: config.serverUrl,
+      });
+      await this.#reset();
+    }
     this.#started = true;
     if (migrationFailure) {
       // Resume would fail on the legacy record with a less useful error;
@@ -563,6 +709,10 @@ export class LocalServerModule implements Module {
       this.#daemonConnection = undefined;
     });
     this.#offRetry = ctx.bus.on("local-server.retry", () => {
+      if (this.#phase === "ready") {
+        void this.#recoverUnreachable("retry", 0, false);
+        return;
+      }
       if (this.#phase !== "failed") return;
       void this.#readRecord().then((latest) => {
         const target = latest ?? record;
@@ -576,16 +726,36 @@ export class LocalServerModule implements Module {
       record = undefined;
       void this.#reset();
     });
+    this.#offServerChanged = ctx.bus.on("server.changed", (serverUrl) => {
+      if (this.#origin && sameOrigin(this.#origin, serverUrl)) return;
+      this.#origin = undefined;
+      if (ctx.config.get().localServer !== false)
+        ctx.config.update({ localServer: false });
+    });
+    const grace = this.#options.unreachableGraceMs ?? UNREACHABLE_GRACE_MS;
+    this.#offUnreachable = ctx.bus.on("local-server.unreachable", () => {
+      void this.#recoverUnreachable("load_failed", grace, true);
+    });
+    this.#watch = setInterval(
+      () => void this.#recoverUnreachable("watch", grace, true),
+      this.#options.watchMs ?? WATCH_MS,
+    );
+    this.#watch.unref?.();
   }
 
   async stop(reason: StopReason): Promise<void> {
     this.#offRetry?.();
+    this.#offUnreachable?.();
+    clearInterval(this.#watch);
     this.#offReset?.();
+    this.#offServerChanged?.();
     this.#offDaemon?.();
     this.#offDaemonConnection?.();
     this.#offComputerChanged?.();
     // The installer manager keeps running a started installation; it exits
     // by itself once idle.
+    this.#cancelPrestage("stopped");
+    this.#cancelBifrostPrefetch("stopped");
     this.#abort.abort();
     if (this.#busyCount > 0) {
       this.#busyCount = 0;
@@ -683,6 +853,195 @@ export class LocalServerModule implements Module {
     return false;
   }
 
+  // Pre-fetches the updated release's pinned localmodels tool and pre-stages
+  // its bundled source checkout, TeamHub binaries, offline runtime, and
+  // shared Node.js binary before the user restarts to apply an update.
+  async prepareUpdateTool(
+    stagedBundle: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const effectiveSignal = AbortSignal.any([signal, this.#abort.signal]);
+    effectiveSignal.throwIfAborted();
+    const record = await this.#readRecord();
+    const config = this.#ctx?.config.get();
+    if (
+      !record ||
+      config?.serverUrl === undefined ||
+      !sameOrigin(config.serverUrl, record.origin) ||
+      !config.computerId
+    )
+      return;
+    const installerDirectory = path.join(
+      stagedBundle,
+      "Contents",
+      "Resources",
+      "app",
+      "dist",
+      "installer",
+    );
+    const prepareTool = async (): Promise<void> => {
+      const distributionFile = path.join(
+        installerDirectory,
+        "distribution.json",
+      );
+      const source = await readPublishedTool(distributionFile);
+      if (!source) return;
+      const startedAt = Date.now();
+      await ensureLocalmodelsTool(
+        record.home,
+        { signal: effectiveSignal },
+        {
+          source,
+          bundledArchivePath: bundledToolArchivePath(distributionFile),
+          fetcher: followHttps(this.#options.fetch ?? fetch),
+        },
+      );
+      this.#ctx?.log.info("local_server.update_tool_prepared", {
+        sha256: source.sha256.slice(0, 12),
+        ms: Date.now() - startedAt,
+      });
+    };
+    const results = await Promise.allSettled([
+      prepareTool(),
+      this.#prepareUpdateSource(
+        record.home,
+        record.repo,
+        installerDirectory,
+        effectiveSignal,
+      ),
+      this.#prepareUpdateNode(installerDirectory, effectiveSignal),
+    ]);
+    effectiveSignal.throwIfAborted();
+    const rejected = results.find((result) => result.status === "rejected");
+    if (rejected) throw rejected.reason;
+  }
+
+  async #prepareUpdateNode(
+    installerDirectory: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    signal.throwIfAborted();
+    const bundle = await this.#bundledRuntime(installerDirectory);
+    signal.throwIfAborted();
+    const spec = this.#sharedNodeSpec(bundle, false);
+    if (!spec) return;
+    const source = this.#sharedBundledNodePath(false, installerDirectory);
+    if (!source) return;
+    const directory = this.#desktopDirectory("node", `v${spec.version}`);
+    const relativeBinary = path.join("bin", "node");
+    if (existsSync(path.join(directory, relativeBinary))) return;
+    const startedAt = Date.now();
+    const copied = await this.#copySharedNode(
+      source,
+      directory,
+      relativeBinary,
+      spec.sha256,
+      false,
+      signal,
+    );
+    if (copied) {
+      this.#ctx?.log.info("local_server.update_node_prepared", {
+        version: spec.version,
+        ms: Date.now() - startedAt,
+      });
+    }
+  }
+
+  async #resolveUpdateSource(
+    installerDirectory: string,
+  ): Promise<{ archiveFile: string; sha256: string } | undefined> {
+    const entries = await readdir(path.join(installerDirectory, "source"), {
+      withFileTypes: true,
+    }).catch(() => undefined);
+    const archives = entries?.filter(
+      (entry) =>
+        entry.isFile() &&
+        !entry.name.startsWith(".") &&
+        !entry.name.endsWith(".partial") &&
+        entry.name.endsWith(".tar.gz"),
+    );
+    if (archives?.length !== 1) return undefined;
+    const target = this.#target();
+    const [teamhubManifest, runtimeManifest] = await Promise.all([
+      readTeamhubBinaries(
+        path.join(installerDirectory, "native", `teamhub-${target}`),
+      ).catch(() => undefined),
+      this.#bundledRuntime(installerDirectory),
+    ]);
+    const teamhubDigest =
+      teamhubManifest?.target === target
+        ? teamhubManifest.sourceArchiveSha256
+        : undefined;
+    const runtimeDigest =
+      runtimeManifest?.target === target &&
+      typeof runtimeManifest.sourceArchiveSha256 === "string" &&
+      /^[0-9a-f]{64}$/.test(runtimeManifest.sourceArchiveSha256)
+        ? runtimeManifest.sourceArchiveSha256
+        : undefined;
+    if (!teamhubDigest && !runtimeDigest) return undefined;
+    if (teamhubDigest && runtimeDigest && teamhubDigest !== runtimeDigest)
+      return undefined;
+    return {
+      archiveFile: archives[0]!.name,
+      sha256: (teamhubDigest ?? runtimeDigest)!,
+    };
+  }
+
+  async #prepareUpdateSource(
+    home: string,
+    currentRepo: string,
+    installerDirectory: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (this.#options.checkout) return;
+    signal.throwIfAborted();
+    const resolvedSource = await this.#resolveUpdateSource(installerDirectory);
+    signal.throwIfAborted();
+    if (!resolvedSource) return;
+    const { archiveFile, sha256 } = resolvedSource;
+    const directory = path.join(home, "desktop", "source", sha256.slice(0, 16));
+    if (
+      path.resolve(directory) === path.resolve(currentRepo) ||
+      path.basename(currentRepo) === sha256.slice(0, 16)
+    )
+      return;
+    const resolved = path.resolve(directory);
+    let entry = this.#preStagedSources.get(resolved);
+    if (!entry) {
+      entry = { active: 0, completed: false };
+      this.#preStagedSources.set(resolved, entry);
+    }
+    entry.active += 1;
+    const sourceStartedAt = Date.now();
+    let succeeded = false;
+    try {
+      await this.#stageSourceFromInstaller(
+        home,
+        { file: path.join("source", archiveFile), sha256 },
+        signal,
+        { installerDirectory, reportProgress: false },
+      );
+      entry.completed = true;
+      succeeded = true;
+    } finally {
+      entry.active -= 1;
+      if (!succeeded && entry.active === 0 && !entry.completed) {
+        const hasMarker = await isFile(path.join(directory, SOURCE_MARKER));
+        if (
+          !hasMarker &&
+          this.#preStagedSources.get(resolved) === entry &&
+          entry.active === 0 &&
+          !entry.completed
+        )
+          this.#preStagedSources.delete(resolved);
+      }
+    }
+    this.#ctx?.log.info("local_server.update_source_prepared", {
+      source: path.basename(directory),
+      ms: Date.now() - sourceStartedAt,
+    });
+  }
+
   status(): LocalServerStatus {
     // The services run natively, so the build must carry PostgreSQL for
     // this computer.
@@ -708,12 +1067,24 @@ export class LocalServerModule implements Module {
       step: this.#step,
       progress: this.#progress,
       ...(this.#transfer ? { transfer: this.#transfer } : {}),
+      ...(this.#waiting && this.#phase === "installing"
+        ? { waiting: this.#waiting }
+        : {}),
       attempt: this.#attempt,
       localModels: this.#check,
       location: {
         path: this.#location ?? this.#home,
         custom: this.#location !== undefined,
         ...(this.#locationError ? { error: this.#locationError } : {}),
+        ...(this.#locationRejectedPath
+          ? { rejectedPath: this.#locationRejectedPath }
+          : {}),
+        ...(this.#locationFreeBytes !== undefined
+          ? {
+              freeBytes: this.#locationFreeBytes,
+              minFreeBytes: this.#freeBytes(),
+            }
+          : {}),
       },
       keys: {
         composio: !!keys.composio,
@@ -724,6 +1095,7 @@ export class LocalServerModule implements Module {
       ...(this.#byokModels ? { byokModels: this.#byokModels } : {}),
       ...(this.#legacyBackup ? { legacyBackup: this.#legacyBackup } : {}),
       ...(this.#refusal ? { refusal: this.#refusal } : {}),
+      ...(this.#failure ? { failure: this.#failure } : {}),
       ...(this.#localModelsDegraded
         ? { localModelsDegraded: this.#localModelsDegraded }
         : {}),
@@ -735,27 +1107,115 @@ export class LocalServerModule implements Module {
   begin(plan: LocalServerPlan = QUICK_INSTALL): Promise<void> {
     this.#running ??= this.#install(plan).finally(() => {
       this.#running = undefined;
+      if (this.#phase === "failed") void this.refreshLocationSpace();
     });
     return this.#running;
+  }
+
+  // Refreshes the target install location's free disk space non-destructively
+  // (statfs only). Emits local-server.changed only when freeBytes changes.
+  async refreshLocationSpace(): Promise<void> {
+    if (
+      this.#abort.signal.aborted ||
+      this.#running ||
+      (this.#phase !== "idle" && this.#phase !== "failed") ||
+      !this.status().available
+    )
+      return;
+    const target = this.#location ?? this.#home;
+    const free = await this.#probeLocationSpace(target);
+    if (
+      this.#abort.signal.aborted ||
+      this.#running ||
+      (this.#phase !== "idle" && this.#phase !== "failed") ||
+      (this.#location ?? this.#home) !== target
+    )
+      return;
+    if (free !== this.#locationFreeBytes) {
+      this.#locationFreeBytes = free;
+      this.#ctx?.bus.emit("local-server.changed");
+    }
+  }
+
+  async #probeLocationSpace(target: string): Promise<number | undefined> {
+    try {
+      return await (this.#options.freeDiskBytes ?? freeDiskBytes)(target);
+    } catch {
+      return undefined;
+    }
   }
 
   // Installs into a folder the person picked, once it can hold Linger; null
   // goes back to the default.
   async chooseLocation(picked: string | null): Promise<void> {
     if (this.#running) return;
-    const previous = this.#location;
+    const choiceSeq = ++this.#locationChoiceSeq;
+    let nextLocation: string | undefined;
+    let nextError: string | undefined;
+    let nextRejectedPath: string | undefined;
+    let nextFreeBytes: number | undefined;
+    let updateFreeBytes = false;
     if (picked === null) {
-      this.#location = undefined;
-      this.#locationError = undefined;
+      nextLocation = undefined;
+      nextError = undefined;
+      nextRejectedPath = undefined;
+      nextFreeBytes = await this.#probeLocationSpace(this.#home);
+      updateFreeBytes = true;
     } else {
       const home = await installLocation(picked);
-      this.#locationError = await checkLocation(home, this.#freeBytes());
-      if (!this.#locationError)
-        this.#location = home === this.#home ? undefined : home;
+      let locationError = await checkLocation(home, this.#freeBytes());
+      if (
+        !locationError &&
+        (this.#options.platform ?? process.platform) === "win32"
+      ) {
+        try {
+          await (this.#options.checkPrivateLocation ?? windowsPrivateLocation)(
+            home,
+          );
+        } catch (error) {
+          locationError =
+            error instanceof Error ? error.message : String(error);
+        }
+      }
+      nextError = locationError;
+      if (!nextError) {
+        nextLocation = home === this.#home ? undefined : home;
+        nextRejectedPath = undefined;
+        nextFreeBytes = await this.#probeLocationSpace(home);
+        updateFreeBytes = true;
+      } else {
+        nextRejectedPath = home;
+      }
     }
-    if (previous !== this.#location && this.#check.state !== "unchecked")
-      this.recheck();
+    if (
+      this.#running ||
+      this.#abort.signal.aborted ||
+      choiceSeq !== this.#locationChoiceSeq
+    )
+      return;
+    const previous = this.#location;
+    this.#locationError = nextError;
+    this.#locationRejectedPath = nextRejectedPath;
+    if (updateFreeBytes) {
+      this.#location = nextLocation;
+      this.#locationFreeBytes = nextFreeBytes;
+    }
+    if (previous !== this.#location) {
+      this.#cancelPrestage("location_changed");
+      this.#cancelBifrostPrefetch("location_changed");
+      if (this.#check.state !== "unchecked") this.recheck();
+    }
     this.#ctx?.bus.emit("local-server.changed");
+  }
+
+  // Stops idle background source pre-staging and Bifrost pre-fetch (such as
+  // when the setup window closes before Install starts). Active installations
+  // keep running unaffected.
+  cancelPrestage(): void {
+    if (this.#running) return;
+    this.#prestageAllowed = false;
+    this.#cancelPrestage("setup_closed");
+    this.#cancelBifrostPrefetch("setup_closed");
   }
 
   // Asks the installer whether this computer can serve a local model; the
@@ -763,6 +1223,8 @@ export class LocalServerModule implements Module {
   // through recheck(). Then fetches the Node runtime an installation starts
   // with.
   inspect(): void {
+    if (!this.#running && (this.#phase === "idle" || this.#phase === "failed"))
+      this.#prestageAllowed = true;
     if (
       this.#check.state !== "unchecked" ||
       this.#running ||
@@ -773,10 +1235,16 @@ export class LocalServerModule implements Module {
     this.#check = { state: "checking" };
     this.#checkedAt = undefined;
     this.#ctx?.bus.emit("local-server.changed");
+    void this.refreshLocationSpace();
     const started = Date.now();
-    const signal = this.#abort.signal;
-    if (!signal.aborted) void this.#ensureNode(signal).catch(() => undefined);
+    const appSignal = this.#abort.signal;
+    const inspectAbort = new AbortController();
+    this.#inspectAbort = inspectAbort;
+    const signal = AbortSignal.any([appSignal, inspectAbort.signal]);
+    if (!appSignal.aborted)
+      void this.#ensureNode(appSignal).catch(() => undefined);
     const home = this.#location ?? this.#home;
+    if (!this.#location) this.#startPrestage(home);
     void this.#inspect(home, signal, (download) => {
       if (this.#check.state !== "checking") return;
       this.#check = { state: "checking", download };
@@ -784,6 +1252,8 @@ export class LocalServerModule implements Module {
     })
       .then(
         ({ check, reasonLog }) => {
+          if (inspectAbort.signal.aborted && !appSignal.aborted)
+            return { state: "unchecked" } as const;
           this.#ctx?.log.info("local_server.inspected", {
             ms: Date.now() - started,
             eligible: check.state === "checked" && check.eligible,
@@ -803,6 +1273,8 @@ export class LocalServerModule implements Module {
           return check;
         },
         (error: unknown) => {
+          if (inspectAbort.signal.aborted && !appSignal.aborted)
+            return { state: "unchecked" } as const;
           this.#ctx?.log.warn("local_server.inspect_failed", {
             ms: Date.now() - started,
             error: error instanceof Error ? error.message : String(error),
@@ -811,7 +1283,14 @@ export class LocalServerModule implements Module {
         },
       )
       .then((check) => {
-        if (signal.aborted) return;
+        if (this.#inspectAbort === inspectAbort) this.#inspectAbort = undefined;
+        if (appSignal.aborted) return;
+        if (inspectAbort.signal.aborted) {
+          this.#check = { state: "unchecked" };
+          this.#checkedAt = undefined;
+          this.#ctx?.bus.emit("local-server.changed");
+          return;
+        }
         if (home !== (this.#location ?? this.#home)) {
           this.#check = { state: "unchecked" };
           this.inspect();
@@ -821,18 +1300,25 @@ export class LocalServerModule implements Module {
         this.#checkedAt =
           check.state === "unavailable" ? undefined : Date.now();
         this.#ctx?.bus.emit("local-server.changed");
+        if (
+          this.#prestageAllowed &&
+          check.state !== "unavailable" &&
+          !this.#running &&
+          !this.#location
+        )
+          this.#startBifrostPrefetch(home);
       });
   }
 
   // Checks again, for example after the person closed other programs to free
   // the memory the local model needs.
   recheck(): void {
-    if (
-      this.#check.state === "checking" ||
-      this.#running ||
-      (this.#phase !== "idle" && this.#phase !== "failed")
-    )
+    if (this.#running || (this.#phase !== "idle" && this.#phase !== "failed"))
       return;
+    if (this.#check.state === "checking") {
+      void this.refreshLocationSpace();
+      return;
+    }
     this.#check = { state: "unchecked" };
     this.inspect();
   }
@@ -841,6 +1327,7 @@ export class LocalServerModule implements Module {
   // the outcome from byokCheck in the state its command returns, and tells
   // a test in flight by itself.
   async checkByok(byok: SetupByokConfig): Promise<void> {
+    this.#startBifrostPrefetch(this.#location ?? this.#home);
     const out = await this.#byokCommand("--check-byok", byok, 50_000);
     this.#byokCheck =
       out.ok === true &&
@@ -866,6 +1353,7 @@ export class LocalServerModule implements Module {
   // Lists the models the endpoint serves at its base URL + path + /models,
   // read back like a test from byokModels.
   async listByokModels(endpoint: SetupByokEndpoint): Promise<void> {
+    this.#startBifrostPrefetch(this.#location ?? this.#home);
     const out = await this.#byokCommand("--list-byok-models", endpoint, 35_000);
     this.#byokModels =
       typeof out.url === "string" && Array.isArray(out.models)
@@ -896,6 +1384,26 @@ export class LocalServerModule implements Module {
           };
   }
 
+  #daemonEnv(): NodeJS.ProcessEnv {
+    return this.#options.daemonExecutable
+      ? {
+          ...process.env,
+          LINGER_COMPUTER_DAEMON: this.#options.daemonExecutable,
+        }
+      : { ...process.env };
+  }
+
+  async #inspectEnv(): Promise<NodeJS.ProcessEnv> {
+    const resolved = await this.#options.inspectEnv;
+    const base: NodeJS.ProcessEnv = resolved
+      ? { ...resolved }
+      : { ...process.env };
+    if (this.#options.daemonExecutable) {
+      base.LINGER_COMPUTER_DAEMON = this.#options.daemonExecutable;
+    }
+    return base;
+  }
+
   // Runs the installer's headless BYOK command: the endpoint and key go on
   // stdin, never in argv, and its last stdout line is the JSON answer. A
   // failure to run it comes back as { ok: false, message }.
@@ -920,7 +1428,7 @@ export class LocalServerModule implements Module {
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
             env: {
-              ...process.env,
+              ...this.#daemonEnv(),
               ELECTRON_RUN_AS_NODE: "1",
               LINGER_HOME: home,
             },
@@ -956,6 +1464,7 @@ export class LocalServerModule implements Module {
     // The tool's codes with its words, for the log only.
     reasonLog: string[];
   }> {
+    const inspectEnv = await this.#inspectEnv();
     // The app's own Node runs the check, so it needs no download of its own;
     // installing still uses the pinned Node runtime.
     const output = await new Promise<string>((resolve, reject) => {
@@ -974,7 +1483,7 @@ export class LocalServerModule implements Module {
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
           env: {
-            ...process.env,
+            ...inspectEnv,
             ELECTRON_RUN_AS_NODE: "1",
             LINGER_HOME: this.#options.home,
           },
@@ -1016,6 +1525,7 @@ export class LocalServerModule implements Module {
     // A failed check prints null; its cause is in the logged stderr.
     const report = JSON.parse(output) as {
       recommendation?: unknown;
+      runtimes?: unknown;
       localModels?: {
         eligible?: unknown;
         state?: unknown;
@@ -1111,6 +1621,38 @@ export class LocalServerModule implements Module {
       (pick !== "local-models" || eligible)
         ? (pick as SetupChoice)
         : undefined;
+    const validRuntimes = new Set<SetupDetectedRuntime["runtime"]>([
+      "codex",
+      "claude",
+      "pi",
+    ]);
+    const runtimes: SetupDetectedRuntime[] = Array.isArray(report.runtimes)
+      ? report.runtimes.flatMap((entry): SetupDetectedRuntime[] => {
+          if (!entry || typeof entry !== "object") return [];
+          const row = entry as {
+            choice?: unknown;
+            installed?: unknown;
+            auth?: unknown;
+            status?: unknown;
+          };
+          if (
+            typeof row.choice !== "string" ||
+            !validRuntimes.has(row.choice as SetupDetectedRuntime["runtime"])
+          )
+            return [];
+          const installed = row.installed === true;
+          const authenticated = row.auth === "authenticated";
+          const ready = row.status === "ready" || (installed && authenticated);
+          return [
+            {
+              runtime: row.choice as SetupDetectedRuntime["runtime"],
+              installed,
+              authenticated,
+              ready,
+            },
+          ];
+        })
+      : [];
     const check: LocalModelsCheck = {
       state: "checked",
       eligible,
@@ -1137,12 +1679,17 @@ export class LocalServerModule implements Module {
         : {}),
       ...(reasons.length ? { reasons } : {}),
       ...(recommendation ? { recommendation } : {}),
+      ...(runtimes.length ? { runtimes } : {}),
     };
     return { check, reasonLog };
   }
 
   // Logs how long one part of setup took, so a slow setup says which part.
-  async #timed<T>(step: string, run: () => Promise<T>): Promise<T> {
+  async #timed<T>(
+    step: string,
+    run: () => Promise<T>,
+    extra?: Record<string, unknown>,
+  ): Promise<T> {
     const started = Date.now();
     try {
       return await run();
@@ -1150,6 +1697,406 @@ export class LocalServerModule implements Module {
       this.#ctx?.log.info("local_server.timing", {
         step,
         ms: Date.now() - started,
+        ...extra,
+      });
+    }
+  }
+
+  #cancelPrestage(reason?: string): void {
+    const prestage = this.#prestage;
+    if (!prestage) return;
+    this.#prestage = undefined;
+    prestage.abort.abort(reason);
+  }
+
+  #cancelBifrostPrefetch(reason?: string): void {
+    const prefetch = this.#bifrostPrefetch;
+    if (!prefetch) return;
+    this.#bifrostPrefetch = undefined;
+    prefetch.abort.abort(reason);
+  }
+
+  async #awaitSettling(
+    previous: Promise<unknown> | undefined,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!previous) return;
+    signal.throwIfAborted();
+    let onAbort: (() => void) | undefined;
+    try {
+      await Promise.race([
+        previous.catch(() => undefined),
+        new Promise<never>((_resolve, reject) => {
+          onAbort = () => reject(signal.reason);
+          signal.addEventListener("abort", onAbort, { once: true });
+        }),
+      ]);
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
+    signal.throwIfAborted();
+  }
+
+  // Silently unpacks a bundled local source archive and its offline runtimes
+  // into the default home while the setup window is open, without mutating
+  // setup UI state. Never runs for remote URLs, developer checkouts, or
+  // unconfirmed custom locations.
+  #startPrestage(home: string): void {
+    if (
+      this.#abort.signal.aborted ||
+      this.#running ||
+      (this.#phase !== "idle" && this.#phase !== "failed") ||
+      this.#options.checkout ||
+      !this.#options.sourceArchive ||
+      !("file" in this.#options.sourceArchive)
+    )
+      return;
+    const macos = this.#macos();
+    if (macos && !atLeast(macos, MIN_MACOS)) return;
+    const resolvedHome = path.resolve(home);
+    if (resolvedHome !== path.resolve(this.#home)) return;
+    if (this.#prestage) {
+      if (this.#prestage.home === resolvedHome) return;
+      this.#cancelPrestage("home_changed");
+    }
+    const previous = this.#prestageSettling.get(resolvedHome);
+    const abort = new AbortController();
+    const signal = AbortSignal.any([this.#abort.signal, abort.signal]);
+    const startedAt = Date.now();
+    const run = async (): Promise<string> => {
+      await this.#awaitSettling(previous, signal);
+      if ((this.#options.platform ?? process.platform) === "win32") {
+        const checkPrivate =
+          this.#options.checkPrivateLocation ?? windowsPrivateLocation;
+        await checkPrivate(home);
+        signal.throwIfAborted();
+      }
+      return this.#ensureSource(home, signal, { silent: true });
+    };
+    const promise = run().then(
+      (repo) => {
+        this.#ctx?.log.info("local_server.prestage", {
+          status: "completed",
+          ms: Date.now() - startedAt,
+        });
+        return repo;
+      },
+      (error: unknown) => {
+        if (this.#prestage === entry) this.#prestage = undefined;
+        if (signal.aborted) {
+          this.#ctx?.log.info("local_server.prestage", {
+            status: "aborted",
+            ms: Date.now() - startedAt,
+          });
+        } else {
+          this.#ctx?.log.warn("local_server.prestage", {
+            status: "failed",
+            ms: Date.now() - startedAt,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        throw error;
+      },
+    );
+    const entry: PrestageTask = {
+      home: resolvedHome,
+      abort,
+      startedAt,
+      promise,
+    };
+    promise.catch(() => undefined);
+    // Keep the full transitive chain in #prestageSettling until every earlier
+    // cancelled task's finally cleanup for this home has also settled.
+    const settled = Promise.allSettled([previous, promise]);
+    this.#prestageSettling.set(resolvedHome, settled);
+    void settled.finally(() => {
+      if (this.#prestageSettling.get(resolvedHome) === settled)
+        this.#prestageSettling.delete(resolvedHome);
+    });
+    this.#prestage = entry;
+  }
+
+  // Joins an in-flight or completed background pre-stage for `home` when
+  // available; falls through seamlessly to #ensureSource otherwise.
+  async #joinOrEnsureSource(
+    home: string,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const resolvedHome = path.resolve(home);
+    const prestage = this.#prestage;
+    if (prestage && prestage.home !== resolvedHome) {
+      this.#cancelPrestage("location_changed");
+    } else if (prestage) {
+      const waitStarted = Date.now();
+      const onAbort = () => prestage.abort.abort(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+      let repo: string | undefined;
+      try {
+        if (signal.aborted) {
+          prestage.abort.abort(signal.reason);
+          throw signal.reason;
+        }
+        repo = await prestage.promise;
+      } catch (error) {
+        if (signal.aborted) throw error;
+        repo = undefined;
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+        if (this.#prestage === prestage) this.#prestage = undefined;
+      }
+      if (repo && (await isFile(path.join(repo, SOURCE_MARKER)))) {
+        this.#ctx?.log.info("local_server.prestage", {
+          status: "joined",
+          wait_ms: Date.now() - waitStarted,
+        });
+        return repo;
+      }
+    }
+    await this.#awaitSettling(this.#prestageSettling.get(resolvedHome), signal);
+    return this.#ensureSource(home, signal);
+  }
+
+  // Fire-and-forget pre-fetch of the pinned Bifrost archive through the
+  // installer helper so local-model and BYOK installs reuse the locked cache.
+  #startBifrostPrefetch(home: string): void {
+    if (this.#abort.signal.aborted || !this.status().available) return;
+    const resolvedHome = path.resolve(home);
+    if (this.#bifrostPrefetch) {
+      if (this.#bifrostPrefetch.home === resolvedHome) return;
+      this.#cancelBifrostPrefetch("home_changed");
+    }
+    const prevSettling = this.#bifrostPrefetchSettling.get(resolvedHome);
+    const abort = new AbortController();
+    const signal = AbortSignal.any([this.#abort.signal, abort.signal]);
+    const startedAt = Date.now();
+    const promise = this.#runBifrostPrefetch(home, signal, startedAt, () => {
+      if (this.#bifrostPrefetch === entry) this.#bifrostPrefetch = undefined;
+    });
+    const entry: BifrostPrefetchTask = {
+      home: resolvedHome,
+      abort,
+      promise,
+    };
+    const settled = Promise.allSettled([prevSettling, promise]);
+    this.#bifrostPrefetchSettling.set(resolvedHome, settled);
+    void settled.finally(() => {
+      if (this.#bifrostPrefetchSettling.get(resolvedHome) === settled)
+        this.#bifrostPrefetchSettling.delete(resolvedHome);
+    });
+    this.#bifrostPrefetch = entry;
+  }
+
+  // Stops any active or settling Bifrost pre-fetch and waits for its child
+  // process tree to exit so localmodels' hosts.file_lock is never held when
+  // an installer job starts.
+  async #stopBifrostPrefetch(
+    reason: string,
+    home?: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const prefetch = this.#bifrostPrefetch;
+    if (prefetch) {
+      this.#bifrostPrefetch = undefined;
+      prefetch.abort.abort(reason);
+    }
+    const pending: Promise<unknown>[] = [];
+    if (prefetch) pending.push(prefetch.promise);
+    if (home) {
+      const settling = this.#bifrostPrefetchSettling.get(path.resolve(home));
+      if (settling) pending.push(settling);
+    }
+    if (!pending.length) return;
+    const all = Promise.allSettled(pending);
+    if (!signal) {
+      await all;
+      return;
+    }
+    await this.#awaitSettling(all, signal);
+  }
+
+  async #runBifrostPrefetch(
+    home: string,
+    signal: AbortSignal,
+    startedAt: number,
+    onRetryableExit: () => void,
+  ): Promise<void> {
+    try {
+      const inspectEnv = await this.#inspectEnv();
+      if (signal.aborted) {
+        onRetryableExit();
+        this.#ctx?.log.info("local_server.bifrost_prefetch", {
+          status: "aborted",
+          ms: Date.now() - startedAt,
+        });
+        return;
+      }
+      const sendSigterm =
+        (this.#options.platform ?? process.platform) !== "win32";
+      const output = await new Promise<{
+        code: number | null;
+        last: string;
+        stderr: string;
+      }>((resolve, reject) => {
+        if (signal.aborted) {
+          reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+          return;
+        }
+        const child = spawn(
+          process.execPath,
+          [
+            ...linuxNodeFdHygieneArgs(this.#options.platform),
+            this.#installerScript(),
+            "--home",
+            home,
+            "--prefetch-bifrost",
+            "--abort-on-stdin-close",
+          ],
+          {
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+            env: {
+              ...inspectEnv,
+              ELECTRON_RUN_AS_NODE: "1",
+              LINGER_HOME: home,
+            },
+          },
+        );
+        child.stdin.on("error", () => undefined);
+        let last = "";
+        createInterface({ input: child.stdout }).on("line", (line) => {
+          if (line.trim()) last = line;
+        });
+        let stderr = "";
+        child.stderr.on("data", (chunk: Buffer) => {
+          stderr = (stderr + chunk.toString("utf8")).slice(-1000);
+        });
+        let settled = false;
+        let spawnError: unknown;
+        let escalation: ReturnType<typeof setTimeout> | undefined;
+        const cleanup = () => {
+          signal.removeEventListener("abort", onAbort);
+          if (escalation) {
+            clearTimeout(escalation);
+            escalation = undefined;
+          }
+        };
+        const onAbort = () => {
+          try {
+            child.stdin.end();
+          } catch {
+            // Already closed.
+          }
+          if (sendSigterm) {
+            try {
+              child.kill("SIGTERM");
+            } catch {
+              // Already exited.
+            }
+          }
+          escalation ??= setTimeout(() => {
+            if (settled) return;
+            try {
+              if (process.platform === "win32" && child.pid) {
+                spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+                  stdio: "ignore",
+                  windowsHide: true,
+                }).once("error", () => {
+                  try {
+                    child.kill("SIGKILL");
+                  } catch {
+                    // Already exited.
+                  }
+                });
+              } else {
+                child.kill("SIGKILL");
+              }
+            } catch {
+              // Already exited.
+            }
+          }, 1_500);
+          escalation.unref?.();
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        child.once("error", (error) => {
+          if (settled) return;
+          if (child.pid === undefined) {
+            settled = true;
+            cleanup();
+            reject(error);
+            return;
+          }
+          spawnError ??= error;
+        });
+        child.once("close", (code) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (spawnError !== undefined) reject(spawnError);
+          else resolve({ code, last, stderr });
+        });
+      });
+      if (signal.aborted) {
+        onRetryableExit();
+        this.#ctx?.log.info("local_server.bifrost_prefetch", {
+          status: "aborted",
+          ms: Date.now() - startedAt,
+        });
+        return;
+      }
+      let parsed: Record<string, unknown> | undefined;
+      try {
+        const value: unknown = JSON.parse(output.last);
+        if (value && typeof value === "object" && !Array.isArray(value))
+          parsed = value as Record<string, unknown>;
+      } catch {
+        parsed = undefined;
+      }
+      if (parsed?.ok === true) {
+        this.#ctx?.log.info("local_server.bifrost_prefetch", {
+          status: "completed",
+          ...(typeof parsed.cached === "boolean"
+            ? { cached: parsed.cached }
+            : {}),
+          ...(typeof parsed.version === "string"
+            ? { version: parsed.version }
+            : {}),
+          ms: Date.now() - startedAt,
+        });
+        return;
+      }
+      if (parsed?.unsupported === true) {
+        this.#ctx?.log.info("local_server.bifrost_prefetch", {
+          status: "unsupported",
+          ...(typeof parsed.message === "string"
+            ? { message: parsed.message }
+            : {}),
+          ms: Date.now() - startedAt,
+        });
+        return;
+      }
+      onRetryableExit();
+      this.#ctx?.log.warn("local_server.bifrost_prefetch", {
+        status: "failed",
+        ms: Date.now() - startedAt,
+        ...(typeof parsed?.message === "string"
+          ? { error: parsed.message }
+          : output.stderr.trim()
+            ? { error: output.stderr.trim() }
+            : { code: output.code }),
+      });
+    } catch (error) {
+      onRetryableExit();
+      if (signal.aborted) {
+        this.#ctx?.log.info("local_server.bifrost_prefetch", {
+          status: "aborted",
+          ms: Date.now() - startedAt,
+        });
+        return;
+      }
+      this.#ctx?.log.warn("local_server.bifrost_prefetch", {
+        status: "failed",
+        ms: Date.now() - startedAt,
+        error: error instanceof Error ? error.message : String(error),
       });
     }
   }
@@ -1160,6 +2107,23 @@ export class LocalServerModule implements Module {
       throw new Error("Running Linger on this computer is not supported here");
     const signal = this.#abort.signal;
     const home = this.#location ?? this.#home;
+    const resolvedHome = path.resolve(home);
+    // In-flight inspection downloads the localmodels kit into the default
+    // home; abort it when installing into another folder so it does not
+    // compete for bandwidth, while letting default-home inspection finish so
+    // the installer can reuse its kit.
+    if (resolvedHome !== path.resolve(this.#options.home))
+      this.#inspectAbort?.abort();
+    if (this.#prestage && this.#prestage.home !== resolvedHome)
+      this.#cancelPrestage("location_changed");
+    if (this.#bifrostPrefetch && this.#bifrostPrefetch.home !== resolvedHome)
+      this.#cancelBifrostPrefetch("location_changed");
+    else if (
+      plan.runtime !== "local" &&
+      !plan.byok &&
+      plan.runtime !== "recommended"
+    )
+      this.#cancelBifrostPrefetch("subscription_runtime");
     this.#attempt += 1;
     this.#acquireBusy();
     try {
@@ -1169,24 +2133,66 @@ export class LocalServerModule implements Module {
       this.#endSignIn();
       this.#advance("prepare", 0, "Checking this computer…");
       await this.#adoptSourceKeys(home);
-      // Keep what runs now until this version replaces it.
+      // Keep what runs now until this version replaces it, and keep an
+      // in-flight pre-stage's .partial folder for this same home.
       const record = await this.#readRecord();
+      const sourcePrefix = this.#options.sourceArchive?.sha256.slice(0, 16);
       await this.#timed("prune_sources", () =>
-        this.#pruneSources(home, [
+        this.#schedulePruneSources(home, [
           record?.repo,
-          this.#options.sourceArchive?.sha256.slice(0, 16),
+          sourcePrefix,
+          ...(sourcePrefix &&
+          (this.#prestage?.home === resolvedHome ||
+            this.#prestageSettling.has(resolvedHome))
+            ? [`${sourcePrefix}.partial`]
+            : []),
         ]),
       );
-      // A chosen folder may have filled up or gone since it was picked.
-      if (this.#location) {
-        const model =
-          this.#check.state === "checked" ? this.#check.model : undefined;
-        const error = await checkLocation(
-          home,
-          this.#freeBytes() +
-            (plan.runtime === "local" ? (model?.diskBytes ?? 0) : 0),
-        );
-        if (error) throw new Error(error);
+      signal.throwIfAborted();
+      const platform = this.#options.platform ?? process.platform;
+      // Check the target install location (default or custom) for write access
+      // and free space, including any planned local model's disk budget.
+      const model =
+        this.#check.state === "checked" &&
+        (plan.runtime === "local" ||
+          (plan.runtime === "recommended" &&
+            this.#check.recommendation === "local-models"))
+          ? this.#check.model
+          : undefined;
+      const error = await checkLocation(
+        home,
+        this.#freeBytes() + (model?.diskBytes ?? 0),
+      );
+      if (error) throw new Error(`${home}: ${error}`);
+      // On Windows, pre-check both the install home and the Computer daemon
+      // directory (<userData>/computer) before unpacking so private-path
+      // validation failures (such as symlink/junction ancestors or foreign
+      // target ownership) fail immediately instead of after installation and
+      // enrollment.
+      if (platform === "win32") {
+        const checkPrivate =
+          this.#options.checkPrivateLocation ?? windowsPrivateLocation;
+        await this.#timed("private_paths", async () => {
+          await checkPrivate(home);
+          const daemonDirectory = this.#options.daemonDirectory;
+          if (
+            daemonDirectory &&
+            path.resolve(daemonDirectory) !== path.resolve(home)
+          ) {
+            try {
+              await checkPrivate(daemonDirectory);
+            } catch (error) {
+              // Do not tag a daemon-directory refusal as an install-location
+              // refusal; moving the install folder does not move <userData>.
+              const detail =
+                error instanceof Error ? error.message : String(error);
+              throw new Error(
+                `Desktop Computer directory validation failed: ${detail}`,
+                { cause: error },
+              );
+            }
+          }
+        });
       }
       const node = await this.#timed("node", () => this.#ensureNode(signal));
       const keysChanged = Object.keys(plan.keys ?? {}).length > 0;
@@ -1200,7 +2206,7 @@ export class LocalServerModule implements Module {
         this.#downloadsSource() ? "Downloading Linger…" : "Unpacking Linger…",
       );
       const repo = await this.#timed("source", () =>
-        this.#ensureSource(home, signal),
+        this.#joinOrEnsureSource(home, signal),
       );
       await this.#timed("dependencies", () =>
         this.#ensureDependencies(repo, signal),
@@ -1209,16 +2215,29 @@ export class LocalServerModule implements Module {
       const installer = await this.#timed("installer_launch", () =>
         this.#launchInstaller(node, home, repo, signal),
       );
-      const runInstaller = (next: LocalServerPlan, fresh = false) =>
-        this.#timed("installer_job", () =>
+      let prewarmedOrigin: string | undefined;
+      const prewarm = (origin: string): void => {
+        if (prewarmedOrigin && sameOrigin(prewarmedOrigin, origin)) return;
+        prewarmedOrigin = origin;
+        void this.#ctx
+          ?.get<WindowManagerModule>("WindowManager")
+          .prewarmAssets(origin);
+      };
+      const runInstaller = async (next: LocalServerPlan, fresh = false) => {
+        // Release localmodels' archive lock before running source/stack apply
+        // so the installer job reports progress and resumes any partial bytes.
+        await this.#stopBifrostPrefetch("install_handoff", home, signal);
+        return this.#timed("installer_job", () =>
           installer.run(
             next,
             signal,
             (stage, share, text, transfer) =>
               this.#advance(stage, share, text, transfer),
             fresh,
+            prewarm,
           ),
         );
+      };
       // Reuse a fresh non-local recommendation from the setup window check
       // instead of running a duplicate setup inspection.
       const inspectedRuntime =
@@ -1248,7 +2267,7 @@ export class LocalServerModule implements Module {
       for (;;) {
         const nextChoice = job.signInRequired
           ? await this.#timed("await_signin", () =>
-              this.#awaitSignIn(installer, signal),
+              this.#awaitSignIn(installer, signal, job.setupChoice),
             )
           : undefined;
         if (!nextChoice) break;
@@ -1272,47 +2291,78 @@ export class LocalServerModule implements Module {
                 true,
               );
       }
+      // Clean up any BYOK prefetch started while the user tested endpoints
+      // during sign-in before completing installation.
+      await this.#stopBifrostPrefetch("install_finished", home, signal);
       // Prewarm main-window assets in the background as soon as the server
-      // origin is known.
-      void this.#ctx
-        ?.get<WindowManagerModule>("WindowManager")
-        .prewarmAssets(job.origin);
-      // The desktop's Computer runs the runtime this installer set up, with
-      // its profile, rather than whatever its PATH finds.
-      const runtime = await this.#timed("installer_runtime", () =>
-        installer.runtime(signal),
-      );
-      const preferredRuntime = setupRuntime(runtime.setupChoice);
-      this.#ctx?.config.update({
-        runtimeEnvironment: runtime.environment,
-        ...(preferredRuntime ? { preferredRuntime } : {}),
-      });
-      this.#ctx?.log.info("local_server.runtime", {
-        runtime: runtime.setupChoice,
-        keys: Object.keys(runtime.environment),
-      });
-      // The installer set a database from before Linger aside for a fresh
-      // one; this computer's enrollment belongs to the old one, so it
-      // enrolls again. Noted in the config so that happens once.
-      const legacyBackup = await latestLegacyBackup(
-        path.join(home, "instances", LOCAL_INSTANCE),
-      );
-      if (
-        legacyBackup &&
-        legacyBackup !== this.#ctx?.config.get().legacyBackup
-      ) {
-        this.#ctx?.log.warn("local_server.legacy_data_set_aside", {
-          backup: legacyBackup,
+      // origin is known (deduplicated against early prewarm during polling).
+      prewarm(job.origin);
+      const loadRuntime = async (lookupSignal: AbortSignal): Promise<void> => {
+        // The desktop's Computer runs the runtime this installer set up, with
+        // its profile, rather than whatever its PATH finds.
+        const runtime = await this.#timed("installer_runtime", async () =>
+          job.runtime && !job.signInRequired
+            ? job.runtime
+            : this.#runtimeOf(installer, lookupSignal),
+        );
+        const preferredRuntime = setupRuntime(runtime.setupChoice);
+        this.#ctx?.config.update({
+          runtimeEnvironment: runtime.environment,
+          ...(preferredRuntime ? { preferredRuntime } : {}),
         });
-        await this.#ctx?.get<EnrollmentModule>("Enrollment").unenroll();
-        this.#ctx?.config.update({ legacyBackup, savedEnrollments: undefined });
-        this.#legacyBackup = legacyBackup;
+        this.#ctx?.log.info("local_server.runtime", {
+          runtime: runtime.setupChoice,
+          keys: Object.keys(runtime.environment),
+        });
+      };
+      const handleLegacyBackup = async (): Promise<void> => {
+        // The installer set a database from before Linger aside for a fresh
+        // one; this computer's enrollment belongs to the old one, so it
+        // enrolls again. Noted in the config so that happens once.
+        const legacyBackup = await latestLegacyBackup(
+          path.join(home, "instances", LOCAL_INSTANCE),
+        );
+        if (
+          legacyBackup &&
+          legacyBackup !== this.#ctx?.config.get().legacyBackup
+        ) {
+          this.#ctx?.log.warn("local_server.legacy_data_set_aside", {
+            backup: legacyBackup,
+          });
+          await this.#ctx?.get<EnrollmentModule>("Enrollment").unenroll();
+          this.#ctx?.config.update({
+            legacyBackup,
+            savedEnrollments: undefined,
+          });
+          this.#legacyBackup = legacyBackup;
+        }
+      };
+      const signInOwner = async (): Promise<void> => {
+        const login = await installer.login();
+        await this.#timed("sign_in_as", () =>
+          this.#signInAs(home, job.origin, login.email, login.password),
+        );
+      };
+      if (!job.signInRequired) {
+        this.#advance("connect", 0, "Connecting this computer…");
+        const parallelAbort = new AbortController();
+        const parallelSignal = AbortSignal.any([signal, parallelAbort.signal]);
+        try {
+          await Promise.all([
+            loadRuntime(parallelSignal),
+            handleLegacyBackup(),
+            signInOwner(),
+          ]);
+        } catch (error) {
+          parallelAbort.abort();
+          throw error;
+        }
+      } else {
+        await loadRuntime(signal);
+        await handleLegacyBackup();
+        this.#advance("connect", 0, "Connecting this computer…");
+        await signInOwner();
       }
-      this.#advance("connect", 0, "Connecting this computer…");
-      const login = await installer.login();
-      await this.#timed("sign_in_as", () =>
-        this.#signInAs(home, job.origin, login.email, login.password),
-      );
       // The installation this window used in the same location is the same
       // server, at another origin when the installer moved its web port.
       const previous = await this.#readRecord();
@@ -1322,7 +2372,7 @@ export class LocalServerModule implements Module {
         origin: job.origin,
         version: this.#options.version,
       });
-      await this.#pruneSources(home, [repo]);
+      const prune = this.#schedulePruneSources(home, [repo]);
       this.#home = home;
       this.#location = undefined;
       this.#ready(
@@ -1340,6 +2390,8 @@ export class LocalServerModule implements Module {
       await this.#timed("await_agents", () =>
         this.#awaitAgents(job.origin, signal),
       );
+      await prune;
+      this.#cancelBifrostPrefetch("install_finished");
       this.#set("ready", "Linger is running on this computer.");
     } catch (error) {
       this.#endSignIn();
@@ -1352,7 +2404,10 @@ export class LocalServerModule implements Module {
       this.#set(
         "failed",
         message,
-        windowsPrivateRefusal((error as { refusal?: unknown } | null)?.refusal),
+        windowsPrivateRefusal(
+          (error as { refusal?: unknown } | null)?.refusal ?? error,
+        ),
+        localServerFailure((error as { code?: unknown } | null)?.code),
       );
       throw error;
     } finally {
@@ -1390,9 +2445,12 @@ export class LocalServerModule implements Module {
   async #awaitSignIn(
     installer: InstallerApi,
     signal: AbortSignal,
+    setupChoice?: string,
   ): Promise<LocalRuntime | { readonly byok: SetupByokConfig } | undefined> {
     const runtime =
-      setupRuntime((await installer.runtime(signal)).setupChoice) ?? "pi";
+      setupRuntime(setupChoice) ??
+      setupRuntime((await this.#runtimeOf(installer, signal)).setupChoice) ??
+      "pi";
     this.#signInInstaller = installer;
     this.#switchTo = undefined;
     this.#switchByok = undefined;
@@ -1484,6 +2542,18 @@ export class LocalServerModule implements Module {
     this.#signInWake = undefined;
     this.#opened = undefined;
     this.#signInMethod = undefined;
+  }
+
+  // Whether the window is pointed at this app's own local installation
+  // regardless of startup phase (installing, preparing/resuming, or ready),
+  // unlike servesWindow(), which also requires readiness and TeamHub proof
+  // before posting the owner password.
+  async ownsWindow(): Promise<boolean> {
+    const serverUrl = this.#ctx?.config.get().serverUrl;
+    if (!serverUrl) return false;
+    if (this.#origin && sameOrigin(this.#origin, serverUrl)) return true;
+    const record = await this.#readRecord();
+    return Boolean(record && sameOrigin(record.origin, serverUrl));
   }
 
   // Whether the window shows the Linger this app installed here and its
@@ -1704,11 +2774,31 @@ export class LocalServerModule implements Module {
     );
   }
 
-  // A refusal stays only with the failure it caused.
+  // The runtime the installation set up. On Windows the installer's lookup
+  // can run for minutes with nothing to report, so after a while the page
+  // says what it waits on.
+  async #runtimeOf(
+    installer: InstallerApi,
+    signal: AbortSignal,
+  ): Promise<InstanceRuntime> {
+    const slow = setTimeout(() => {
+      this.#waiting = "runtime";
+      this.#ctx?.bus.emit("local-server.changed");
+    }, RUNTIME_LOOKUP_HINT_MS);
+    try {
+      return await installer.runtime(signal);
+    } finally {
+      clearTimeout(slow);
+      this.#waiting = undefined;
+    }
+  }
+
+  // A refusal or a failure reason stays only with the failure it caused.
   #set(
     phase: LocalServerPhase,
     message: string,
     refusal?: WindowsPrivateRefusal,
+    failure?: LocalServerFailure,
   ): void {
     // A failure stays on the step it happened in.
     if (phase !== "installing" && phase !== "ready" && phase !== "failed") {
@@ -1720,6 +2810,7 @@ export class LocalServerModule implements Module {
     this.#phase = phase;
     this.#message = message;
     this.#refusal = phase === "failed" ? refusal : undefined;
+    this.#failure = phase === "failed" ? failure : undefined;
     if (phase !== "ready") this.#localModelsDegraded = undefined;
     this.#ctx?.bus.emit("local-server.changed");
   }
@@ -1837,19 +2928,51 @@ export class LocalServerModule implements Module {
       "node",
       `v${NODE_RUNTIME_VERSION}`,
     );
+    const isWindows = (this.#options.platform ?? process.platform) === "win32";
     // Windows builds are zips with node.exe at the top.
-    const binary =
-      (this.#options.platform ?? process.platform) === "win32"
-        ? path.join(directory, "node.exe")
-        : path.join(directory, "bin", "node");
+    const binary = isWindows
+      ? path.join(directory, "node.exe")
+      : path.join(directory, "bin", "node");
     if (existsSync(binary)) return binary;
-    // A build that bundles the services also bundles this same Node.js: the
-    // release archive, or on macOS its signed binary.
+    // A build that bundles the services also pins this same Node.js: shared
+    // with the Computer tools under resources/runtime/bin/, or a legacy
+    // archive / folder copy inside runtime-<target>/.
     const bundle = await this.#bundledRuntime();
     const bundled = bundle?.node;
+    const sharedNode = this.#sharedNodeSpec(
+      bundle,
+      isWindows,
+      NODE_RUNTIME_VERSION,
+    );
+    if (sharedNode) {
+      const source = this.#sharedBundledNodePath(isWindows);
+      if (source) {
+        try {
+          await this.#copySharedNode(
+            source,
+            directory,
+            path.relative(directory, binary),
+            sharedNode.sha256,
+            isWindows,
+            signal,
+          );
+          return binary;
+        } catch (error) {
+          if (signal.aborted) throw error;
+          this.#ctx?.log.warn("local_server.shared_node_failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } else {
+        this.#ctx?.log.warn("local_server.shared_node_missing", {
+          target: this.#target(),
+        });
+      }
+    }
     if (
       bundle?.layout === "directory" &&
-      bundled?.version === NODE_RUNTIME_VERSION
+      bundled?.version === NODE_RUNTIME_VERSION &&
+      typeof bundled.file === "string"
     ) {
       await this.#copyBundled(
         this.#bundledRuntimeFile(path.dirname(path.dirname(bundled.file))),
@@ -1860,7 +2983,8 @@ export class LocalServerModule implements Module {
       return binary;
     }
     if (
-      bundled?.file === release.archive &&
+      typeof bundled?.file === "string" &&
+      bundled.file === release.archive &&
       bundled.sha256 === release.sha256
     ) {
       await this.#extract(
@@ -1890,9 +3014,98 @@ export class LocalServerModule implements Module {
     return binary;
   }
 
+  #sharedNodeSpec(
+    bundle: BundledRuntime | undefined,
+    isWindows: boolean,
+    expectedVersion?: string,
+  ): { version: string; sha256: string } | undefined {
+    const bundled = bundle?.node;
+    const expectedSharedBinary = isWindows
+      ? "runtime/bin/node.exe"
+      : "runtime/bin/node";
+    if (
+      bundle?.target !== this.#target() ||
+      bundled?.shared !== true ||
+      typeof bundled.version !== "string" ||
+      !/^[0-9]+(?:\.[0-9]+){1,2}(?:-[0-9A-Za-z.-]+)?$/.test(bundled.version) ||
+      (expectedVersion !== undefined && bundled.version !== expectedVersion) ||
+      (bundled.binary !== undefined &&
+        bundled.binary !== expectedSharedBinary) ||
+      typeof bundled.sha256 !== "string" ||
+      bundled.sha256.length === 0
+    )
+      return undefined;
+    return { version: bundled.version, sha256: bundled.sha256 };
+  }
+
+  #sharedBundledNodePath(
+    isWindows: boolean,
+    installerDirectory?: string,
+  ): string | undefined {
+    const candidate =
+      installerDirectory !== undefined
+        ? path.resolve(
+            installerDirectory,
+            "../../..",
+            "runtime",
+            "bin",
+            isWindows ? "node.exe" : "node",
+          )
+        : (this.#options.bundledNodePath ??
+          path.resolve(
+            this.#options.installerDirectory,
+            "../../..",
+            "runtime",
+            "bin",
+            isWindows ? "node.exe" : "node",
+          ));
+    return existsSync(candidate) ? candidate : undefined;
+  }
+
+  // Copies the single shared Node.js binary from the app bundle into the
+  // user's home so running services never lock the app install directory on
+  // Windows, verifies its digest after copying, and publishes atomically.
+  async #copySharedNode(
+    source: string,
+    directory: string,
+    relativeBinary: string,
+    sha256: string,
+    isWindows: boolean,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (existsSync(path.join(directory, relativeBinary))) return false;
+    let copiedAny = false;
+    await this.#stageDirectory(directory, signal, async () => {
+      if (existsSync(path.join(directory, relativeBinary))) return;
+      const copied = `${directory}.partial`;
+      const target = path.join(copied, relativeBinary);
+      try {
+        await removeRetrying(copied);
+        await mkdir(path.dirname(target), { recursive: true });
+        await copyFile(source, target, fsConstants.COPYFILE_FICLONE);
+        const hash = createHash("sha256");
+        for await (const chunk of createReadStream(target, { signal }))
+          hash.update(chunk as Buffer);
+        if (hash.digest("hex") !== sha256)
+          throw new Error(`The bundled ${relativeBinary} is damaged`);
+        if (!isWindows) await chmod(target, 0o755);
+        await this.#unquarantine(copied, signal, [target, source]);
+        await this.#publish(copied, directory, relativeBinary, signal);
+        copiedAny = true;
+      } finally {
+        await removeRetrying(copied);
+      }
+    });
+    return copiedAny;
+  }
+
   // The source package, unpacked once into the installation folder; or the
   // developer's checkout.
-  async #ensureSource(home: string, signal: AbortSignal): Promise<string> {
+  async #ensureSource(
+    home: string,
+    signal: AbortSignal,
+    options: StageSourceOptions = {},
+  ): Promise<string> {
     if (this.#options.checkout) {
       const repo = await realpath(this.#options.checkout);
       if (!(await isFile(path.join(repo, "scripts/source-native.mjs"))))
@@ -1903,78 +3116,199 @@ export class LocalServerModule implements Module {
     }
     const archive = this.#options.sourceArchive;
     if (!archive) throw new Error("This build has no source package");
-    const directory = path.join(
+    const effectiveOptions: StageSourceOptions = options.silent
+      ? {
+          ...options,
+          timingExtra: options.timingExtra ?? { prestage: true },
+        }
+      : options;
+    if ("file" in archive)
+      return this.#stageSourceFromInstaller(
+        home,
+        archive,
+        signal,
+        effectiveOptions,
+      );
+    const reportProgress =
+      (effectiveOptions.reportProgress ?? true) && !effectiveOptions.silent;
+    return this.#stageSource(
       home,
-      "desktop",
-      "source",
-      archive.sha256.slice(0, 16),
+      archive.sha256,
+      signal,
+      effectiveOptions,
+      (directory) =>
+        this.#unpack(
+          { ...archive, maxBytes: 1024 * MiB },
+          directory,
+          SOURCE_MARKER,
+          path.join(home, "desktop", "downloads"),
+          signal,
+          reportProgress
+            ? (bytes) =>
+                this.#advance(
+                  "download",
+                  (bytes.completed / bytes.total) * 0.05,
+                  "Downloading Linger…",
+                  bytes,
+                )
+            : undefined,
+        ),
     );
-    if (await isFile(path.join(directory, SOURCE_MARKER))) {
-      if (
-        await validateSourceRepository(directory).then(
+  }
+
+  async #stageSourceFromInstaller(
+    home: string,
+    archive: { file: string; sha256: string },
+    signal: AbortSignal,
+    options: StageSourceOptions = {},
+  ): Promise<string> {
+    const installerDirectory =
+      options.installerDirectory ?? this.#options.installerDirectory;
+    return this.#stageSource(
+      home,
+      archive.sha256,
+      signal,
+      options,
+      (directory) =>
+        this.#extract(
+          archive,
+          directory,
+          SOURCE_MARKER,
+          signal,
+          installerDirectory,
+        ),
+    );
+  }
+
+  async #stageSource(
+    home: string,
+    sha256: string,
+    signal: AbortSignal,
+    options: StageSourceOptions,
+    unpack: (directory: string) => Promise<void>,
+  ): Promise<string> {
+    const directory = path.join(home, "desktop", "source", sha256.slice(0, 16));
+    await this.#stageDirectory(directory, signal, async () => {
+      const hasMarker = await isFile(path.join(directory, SOURCE_MARKER));
+      const valid =
+        hasMarker &&
+        (await validateSourceRepository(directory).then(
           () => true,
           () => false,
-        )
-      ) {
-        await this.#timed("teamhub_binaries", () =>
-          this.#ensureTeamhubBinaries(directory, archive.sha256, signal),
-        );
-        await this.#timed("native_runtime", () =>
-          this.#ensureNativeRuntime(directory, archive.sha256, signal),
-        );
-        return directory;
+        ));
+      if (!valid) {
+        if (hasMarker)
+          this.#ctx?.log.warn("local_server.source_damaged", {
+            source: path.basename(directory),
+          });
+        if (hasMarker || existsSync(directory)) await removeRetrying(directory);
+        await unpack(directory);
+        signal.throwIfAborted();
+        if (!(await isFile(path.join(directory, SOURCE_MARKER))))
+          throw new Error("The source package is not a Linger source tree");
       }
-      // This package's own folder, damaged since it was unpacked (files
-      // removed by hand or by a cleanup): the installer would refuse it, so
-      // it is unpacked again in its place.
-      this.#ctx?.log.warn("local_server.source_damaged", {
-        source: path.basename(directory),
-      });
-      await removeRetrying(directory);
-    }
-    if ("file" in archive)
-      await this.#extract(archive, directory, SOURCE_MARKER, signal);
-    else
-      await this.#unpack(
-        { ...archive, maxBytes: 1024 * MiB },
-        directory,
-        SOURCE_MARKER,
-        path.join(home, "desktop", "downloads"),
-        signal,
-        (bytes) =>
-          this.#advance(
-            "download",
-            (bytes.completed / bytes.total) * 0.05,
-            "Downloading Linger…",
-            bytes,
-          ),
-      );
-    if (!(await isFile(path.join(directory, SOURCE_MARKER))))
-      throw new Error("The source package is not a Linger source tree");
-    await this.#timed("teamhub_binaries", () =>
-      this.#ensureTeamhubBinaries(directory, archive.sha256, signal),
-    );
-    await this.#timed("native_runtime", () =>
-      this.#ensureNativeRuntime(directory, archive.sha256, signal),
-    );
+      await this.#ensureSourceAssets(directory, sha256, signal, options);
+    });
     return directory;
+  }
+
+  // Deduplicates concurrent staging into the same versioned source directory
+  // so background pre-staging and launch/resume wait rather than collide on
+  // `<directory>.partial`.
+  async #stageDirectory(
+    directory: string,
+    signal: AbortSignal,
+    work: () => Promise<void>,
+  ): Promise<void> {
+    const key = path.resolve(directory);
+    for (;;) {
+      signal.throwIfAborted();
+      const existing = this.#stagingSources.get(key);
+      if (existing) {
+        try {
+          await raceAbort(existing, signal);
+          return;
+        } catch (error) {
+          if (signal.aborted) throw error;
+          if (this.#abortedStaging.has(existing)) continue;
+          throw error;
+        }
+      }
+      const task: Promise<void> = Promise.resolve()
+        .then(async () => {
+          await raceAbort(
+            this.#pruning.catch(() => undefined),
+            signal,
+          );
+          await work();
+        })
+        .catch((error: unknown) => {
+          if (signal.aborted) this.#abortedStaging.add(task);
+          throw error;
+        })
+        .finally(() => {
+          if (this.#stagingSources.get(key) === task)
+            this.#stagingSources.delete(key);
+        });
+      this.#stagingSources.set(key, task);
+      return await task;
+    }
+  }
+
+  async #ensureSourceAssets(
+    directory: string,
+    sha256: string,
+    signal: AbortSignal,
+    options: StageSourceOptions,
+  ): Promise<void> {
+    const installerDirectory =
+      options.installerDirectory ?? this.#options.installerDirectory;
+    const logTimings = options.reportProgress ?? true;
+    const timingExtra = options.timingExtra;
+    const runBinaries = () =>
+      this.#ensureTeamhubBinaries(
+        directory,
+        sha256,
+        signal,
+        installerDirectory,
+      );
+    const runRuntime = () =>
+      this.#ensureNativeRuntime(directory, sha256, signal, options);
+    const results = await Promise.allSettled([
+      logTimings
+        ? this.#timed("teamhub_binaries", runBinaries, timingExtra)
+        : runBinaries(),
+      logTimings
+        ? this.#timed("native_runtime", runRuntime, timingExtra)
+        : runRuntime(),
+    ]);
+    const rejected = results.find((result) => result.status === "rejected");
+    if (rejected) throw rejected.reason;
   }
 
   // The manifest of the services and Node.js this build bundles for this
   // computer (scripts/build-native-runtime.mjs), or undefined without them.
-  async #bundledRuntime(): Promise<BundledRuntime | undefined> {
+  async #bundledRuntime(
+    installerDirectory = this.#options.installerDirectory,
+  ): Promise<BundledRuntime | undefined> {
     try {
       return JSON.parse(
-        await readFile(this.#bundledRuntimeFile("manifest.json"), "utf8"),
+        await readFile(
+          this.#bundledRuntimeFile("manifest.json", installerDirectory),
+          "utf8",
+        ),
       ) as BundledRuntime;
     } catch {
       return undefined;
     }
   }
 
-  #bundledRuntimeFile(file: string): string {
+  #bundledRuntimeFile(
+    file: string,
+    installerDirectory = this.#options.installerDirectory,
+  ): string {
     return path.join(
-      this.#options.installerDirectory,
+      installerDirectory,
       "native",
       `runtime-${this.#target()}`,
       file,
@@ -1982,27 +3316,43 @@ export class LocalServerModule implements Module {
   }
 
   // Unpacks the services this build compiled from its source package into
-  // the source, so Native installs no packages and needs no network. Without
-  // them Native installs the source's packages and runs it in development.
+  // the source, so Native installs no packages and needs no network. Release
+  // packages ship a minimal source skeleton and fail fast if the host cannot
+  // run these prebuilt binaries (for example Linux glibc < MIN_GLIBC), while
+  // full development checkouts can still fall back to installing from source.
   async #ensureNativeRuntime(
     repo: string,
     sha256: string,
     signal: AbortSignal,
+    options: StageSourceOptions = {},
   ): Promise<void> {
-    const bundle = await this.#bundledRuntime();
+    signal.throwIfAborted();
+    const installerDirectory =
+      options.installerDirectory ?? this.#options.installerDirectory;
+    const reportProgress = (options.reportProgress ?? true) && !options.silent;
+    const logTimings = options.reportProgress ?? true;
+    const timingExtra = options.timingExtra;
+    const bundle = await this.#bundledRuntime(installerDirectory);
     if (!bundle) return;
     const target = this.#target();
     const directory = path.join(repo, NATIVE_RUNTIME_DIRECTORY);
     const glibc = this.#glibcVersion();
     if (glibc && !atLeast(glibc, MIN_GLIBC)) {
-      // Its native packages, like the PostgreSQL build, need a newer glibc;
-      // Native installs the source's packages instead.
+      // Its native packages, like the PostgreSQL build, need glibc >= MIN_GLIBC.
+      // Fail fast on minimal release source skeletons that cannot compile from
+      // source; full development checkouts can still fall back to source install.
       this.#ctx?.log.warn("local_server.native_runtime_skipped", {
         glibc,
         required: MIN_GLIBC,
       });
+      if (!(await canBuildNativeServicesFromSource(repo))) {
+        throw new Error(
+          `Linger requires Linux with glibc ${MIN_GLIBC} or later (detected ${glibc}) because this release uses prebuilt offline services.`,
+        );
+      }
       return;
     }
+    let replacing = false;
     try {
       if (bundle.target !== target || bundle.sourceArchiveSha256 !== sha256)
         throw new Error("The bundled services are for another source package");
@@ -2013,35 +3363,64 @@ export class LocalServerModule implements Module {
         (await nativeRuntimeVerified(directory))
       )
         return;
-      this.#advance("download", 0.05, "Unpacking Linger services…");
+      signal.throwIfAborted();
+      if (reportProgress)
+        this.#advance("download", 0.05, "Unpacking Linger services…");
+      replacing = true;
       await removeRetrying(directory);
       if (bundle.layout === "directory")
         await this.#copyBundled(
-          this.#bundledRuntimeFile(path.dirname(bundle.directory!.file)),
+          this.#bundledRuntimeFile(
+            path.dirname(bundle.directory!.file),
+            installerDirectory,
+          ),
           directory,
           {
             file: path.basename(bundle.directory!.file),
             sha256: bundle.directory!.sha256,
           },
           signal,
+          installerDirectory,
+          logTimings
+            ? { prefix: "native_runtime", extra: timingExtra }
+            : undefined,
         );
       else {
-        const file = this.#bundledRuntimeFile(bundle.archive!.file);
+        const file = this.#bundledRuntimeFile(
+          bundle.archive!.file,
+          installerDirectory,
+        );
         await this.#checkArchive(file, bundle.archive!.sha256, signal);
+        signal.throwIfAborted();
         // Unpacked in place: renaming a folder of fresh files waited up to
         // 30 s for Windows' scanners.
         await this.#unpackInto(file, directory, signal);
       }
+      signal.throwIfAborted();
       // The record written last marks it complete, and the installer then
       // need not hash every file.
-      await markNativeRuntimeVerified(directory);
+      if (logTimings)
+        await this.#timed(
+          "native_runtime_mark_verified",
+          () => markNativeRuntimeVerified(directory),
+          timingExtra,
+        );
+      else await markNativeRuntimeVerified(directory);
       this.#ctx?.log.info("local_server.native_runtime", { target });
     } catch (error) {
+      if (replacing || !signal.aborted)
+        await removeRetrying(directory).catch(() => undefined);
       if (signal.aborted) throw error;
-      await removeRetrying(directory).catch(() => undefined);
+      const detail = error instanceof Error ? error.message : String(error);
       this.#ctx?.log.warn("local_server.native_runtime_failed", {
-        error: error instanceof Error ? error.message : String(error),
+        error: detail,
       });
+      if (!(await canBuildNativeServicesFromSource(repo))) {
+        throw new Error(
+          `The bundled offline Linger services could not be unpacked or verified (${detail}). Reinstall Linger to restore them.`,
+          { cause: error },
+        );
+      }
     }
   }
 
@@ -2064,34 +3443,109 @@ export class LocalServerModule implements Module {
     directory: string,
     check: { file: string; sha256: string },
     signal: AbortSignal,
+    installerDirectory = this.#options.installerDirectory,
+    timing?: { prefix: string; extra?: Record<string, unknown> },
   ): Promise<void> {
     if (existsSync(path.join(directory, check.file))) return;
+    const timed = <T>(name: string, fn: () => Promise<T>): Promise<T> =>
+      timing ? this.#timed(`${timing.prefix}_${name}`, fn, timing.extra) : fn();
     const copied = `${directory}.partial`;
     try {
+      signal.throwIfAborted();
       await removeRetrying(copied);
       await mkdir(path.dirname(copied), { recursive: true });
-      // A clone on APFS: no extra space and no time.
-      await cp(from, copied, {
-        recursive: true,
-        mode: fsConstants.COPYFILE_FICLONE,
+      // A clone on APFS: no extra space and faster with system cp on macOS.
+      await timed("cp", async () => {
+        if (process.platform === "darwin") {
+          try {
+            await run(
+              "/bin/cp",
+              ["-Rpc", from, copied],
+              path.dirname(copied),
+              signal,
+            );
+            return;
+          } catch (error) {
+            if (signal.aborted) throw error;
+            await removeRetrying(copied);
+          }
+        }
+        await cp(from, copied, {
+          recursive: true,
+          mode: fsConstants.COPYFILE_FICLONE,
+        });
       });
-      const hash = createHash("sha256");
-      for await (const chunk of createReadStream(
-        path.join(copied, check.file),
-        { signal },
-      ))
-        hash.update(chunk as Buffer);
-      if (hash.digest("hex") !== check.sha256)
-        throw new Error(`The bundled ${check.file} is damaged`);
-      await this.#unquarantine(copied, signal);
-      await this.#publish(copied, directory, check.file, signal);
+      signal.throwIfAborted();
+      await timed("verify", async () => {
+        const hash = createHash("sha256");
+        for await (const chunk of createReadStream(
+          path.join(copied, check.file),
+          { signal },
+        ))
+          hash.update(chunk as Buffer);
+        if (hash.digest("hex") !== check.sha256)
+          throw new Error(`The bundled ${check.file} is damaged`);
+      });
+      signal.throwIfAborted();
+      await timed("xattr", () =>
+        this.#unquarantine(copied, signal, [
+          path.join(copied, check.file),
+          installerDirectory,
+        ]),
+      );
+      signal.throwIfAborted();
+      await timed("publish", () =>
+        this.#publish(copied, directory, check.file, signal),
+      );
     } finally {
       await removeRetrying(copied);
     }
   }
 
-  async #unquarantine(directory: string, signal: AbortSignal): Promise<void> {
+  async #hasQuarantine(
+    probes: readonly string[],
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const existing = probes.filter((entry) => existsSync(entry));
+    if (!existing.length) return false;
+    return new Promise<boolean>((resolve, reject) => {
+      const child = spawn(
+        "/usr/bin/xattr",
+        ["-p", "com.apple.quarantine", ...existing],
+        {
+          stdio: ["ignore", "pipe", "ignore"],
+          signal,
+          windowsHide: true,
+        },
+      );
+      let stdout = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString("utf8");
+      });
+      child.once("error", () => {
+        if (signal.aborted) reject(signal.reason);
+        else resolve(true);
+      });
+      child.once("close", (code) => {
+        if (signal.aborted) reject(signal.reason);
+        else if (code === 0) resolve(true);
+        else if (code === 1) resolve(stdout.trim().length > 0);
+        else resolve(true);
+      });
+    });
+  }
+
+  async #unquarantine(
+    directory: string,
+    signal: AbortSignal,
+    probes: readonly string[] = [],
+  ): Promise<void> {
     if ((this.#options.platform ?? process.platform) !== "darwin") return;
+    if (
+      process.platform === "darwin" &&
+      !(await this.#hasQuarantine([directory, ...probes], signal))
+    )
+      return;
     await run(
       "/usr/bin/xattr",
       ["-dr", "com.apple.quarantine", directory],
@@ -2113,30 +3567,54 @@ export class LocalServerModule implements Module {
     repo: string,
     sha256: string,
     signal: AbortSignal,
+    installerDirectory = this.#options.installerDirectory,
   ): Promise<void> {
+    signal.throwIfAborted();
     const target = this.#target();
+    const binaryDir = path.join(repo, TEAMHUB_BINARY_DIRECTORY);
+    let needsUnquarantine = false;
     try {
+      signal.throwIfAborted();
       const state = await installTeamhubBinaries(
-        path.join(
-          this.#options.installerDirectory,
-          "native",
-          `teamhub-${target}`,
-        ),
+        path.join(installerDirectory, "native", `teamhub-${target}`),
         repo,
-        { target, sourceArchiveSha256: sha256 },
+        { target, sourceArchiveSha256: sha256, signal },
       );
       if (state === "installed") {
+        needsUnquarantine = true;
+        signal.throwIfAborted();
         await this.#unquarantine(
-          path.join(repo, TEAMHUB_BINARY_DIRECTORY),
+          binaryDir,
           signal,
+          ["teamhub", "migrate", "account"].map((command) =>
+            path.join(binaryDir, command),
+          ),
         );
+        signal.throwIfAborted();
+        needsUnquarantine = false;
         this.#ctx?.log.info("local_server.teamhub_binaries", { target });
       }
     } catch (error) {
+      if (needsUnquarantine) await this.#removeTeamhubBinaries(binaryDir);
+      if (signal.aborted) throw error;
+      const detail = error instanceof Error ? error.message : String(error);
       this.#ctx?.log.warn("local_server.teamhub_binaries_failed", {
-        error: error instanceof Error ? error.message : String(error),
+        error: detail,
       });
+      if (!(await canCompileTeamhubFromSource(repo))) {
+        throw new Error(
+          `The bundled TeamHub binaries could not be verified (${detail}). Reinstall Linger to restore them.`,
+          { cause: error },
+        );
+      }
     }
+  }
+
+  async #removeTeamhubBinaries(binaryDir: string): Promise<void> {
+    await Promise.all([
+      removeRetrying(binaryDir),
+      removeRetrying(teamhubBinaryStampsFile(binaryDir)),
+    ]).catch(() => undefined);
   }
 
   // Unpacks the published dependency store into the checkout, so installing
@@ -2190,6 +3668,25 @@ export class LocalServerModule implements Module {
     }
   }
 
+  #schedulePruneSources(
+    home: string,
+    keep: readonly (string | undefined)[],
+  ): Promise<void> {
+    const task = this.#pruning
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.#abort.signal.aborted) return;
+        const current = await this.#readRecord();
+        await this.#pruneSources(home, [
+          ...keep,
+          current?.repo,
+          ...this.#preStagedSources.keys(),
+        ]);
+      });
+    this.#pruning = task;
+    return task;
+  }
+
   // Each version unpacks beside the last and builds its own dependencies, so
   // once services run from this one the older ones only fill the disk.
   async #pruneSources(
@@ -2198,13 +3695,47 @@ export class LocalServerModule implements Module {
   ): Promise<void> {
     if (this.#options.checkout) return;
     const parent = path.join(home, "desktop", "source");
-    const kept = keep.flatMap((item) => (item ? [path.basename(item)] : []));
-    for (const entry of await readdir(parent).catch(() => [] as string[]))
-      if (!kept.includes(entry))
-        await rm(path.join(parent, entry), {
-          recursive: true,
-          force: true,
-        }).catch(() => undefined);
+    const kept = new Set(
+      keep.flatMap((item) => (item ? [path.basename(item)] : [])),
+    );
+    for (const preStaged of this.#preStagedSources.keys())
+      kept.add(path.basename(preStaged));
+    const isProtected = (entry: string, folder: string) => {
+      if (kept.has(entry)) return true;
+      if (
+        entry.endsWith(".partial") &&
+        this.#stagingSources.has(
+          path.resolve(parent, entry.slice(0, -".partial".length)),
+        )
+      )
+        return true;
+      const resolved = path.resolve(folder);
+      return (
+        this.#stagingSources.has(resolved) ||
+        this.#preStagedSources.has(resolved)
+      );
+    };
+    const prunable = (
+      await readdir(parent).catch(() => [] as string[])
+    ).flatMap((entry) => {
+      const folder = path.join(parent, entry);
+      return isProtected(entry, folder) ? [] : [folder];
+    });
+    if (!prunable.length) return;
+    // A service still running from a folder (its restart onto the kept one
+    // has not happened, or failed) would lose its files under it.
+    const inUse = await foldersInUse(prunable);
+    if (this.#abort.signal.aborted) return;
+    for (const folder of prunable) {
+      if (isProtected(path.basename(folder), folder)) continue;
+      if (inUse.has(folder)) {
+        this.#ctx?.log.info("local_server.source_in_use", {
+          source: path.basename(folder),
+        });
+        continue;
+      }
+      await rm(folder, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   // Downloads a verified archive and unpacks its single top-level folder
@@ -2263,12 +3794,15 @@ export class LocalServerModule implements Module {
     directory: string,
     marker: string,
     signal: AbortSignal,
+    installerDirectory = this.#options.installerDirectory,
   ): Promise<void> {
-    const file = path.resolve(this.#options.installerDirectory, archive.file);
+    const file = path.resolve(installerDirectory, archive.file);
     await this.#checkArchive(file, archive.sha256, signal);
+    signal.throwIfAborted();
     const unpacked = `${directory}.partial`;
     try {
       await this.#unpackInto(file, unpacked, signal);
+      signal.throwIfAborted();
       await this.#publish(unpacked, directory, marker, signal);
     } finally {
       await removeRetrying(unpacked);
@@ -2296,25 +3830,13 @@ export class LocalServerModule implements Module {
     unpacked: string,
     signal: AbortSignal,
   ): Promise<void> {
-    await removeRetrying(unpacked);
-    await mkdir(unpacked, { recursive: true, mode: 0o700 });
-    // Windows' tar may not read zstd; Node's zlib does, and tar reads stdin.
-    if (file.endsWith(".zst")) {
-      await run(
-        tarCommand(),
-        ["-xf", "-", "--strip-components=1"],
-        unpacked,
-        signal,
-        createReadStream(file, { signal }).pipe(createZstdDecompress()),
-      );
-      return;
-    }
-    await run(
-      tarCommand(),
-      ["-xf", path.relative(unpacked, file), "--strip-components=1"],
-      unpacked,
-      signal,
-    );
+    await unpackArchive(file, unpacked, signal, {
+      onFallback: (command) =>
+        this.#ctx?.log.warn("local_server.tar_fallback", {
+          command,
+          archive: path.basename(file),
+        }),
+    });
   }
 
   // Moves a finished `unpacked` folder to `directory`. One that is already
@@ -2437,7 +3959,7 @@ export class LocalServerModule implements Module {
         // A detached Windows process otherwise opens its own console window.
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, ...proxyEnv, LINGER_HOME: home },
+        env: { ...this.#daemonEnv(), ...proxyEnv, LINGER_HOME: home },
       },
     );
     const log = this.#ctx?.log;
@@ -2509,10 +4031,20 @@ export class LocalServerModule implements Module {
     previous?: string,
     reason: WindowLoadReason = "local_ready",
   ): void {
+    this.#locationRejectedPath = undefined;
+    this.#locationFreeBytes = undefined;
     this.#origin = origin;
     this.#ctx
       ?.get<WindowManagerModule>("WindowManager")
       ?.setServer(origin, previous, { reason });
+    const serverUrl = this.#ctx?.config.get().serverUrl;
+    const stillOurs =
+      reason === "local_ready" ||
+      !serverUrl ||
+      sameOrigin(serverUrl, origin) ||
+      (previous !== undefined && sameOrigin(serverUrl, previous));
+    if (stillOurs && this.#ctx?.config.get().localServer !== true)
+      this.#ctx?.config.update({ localServer: true });
   }
 
   // The server sets up the Another Me once this computer offers a signed-in
@@ -2539,7 +4071,9 @@ export class LocalServerModule implements Module {
     if (!tenant) return;
     const base = `/v0/tenants/${encodeURIComponent(tenant)}`;
     const timeout = this.#options.agentsTimeoutMs ?? AGENTS_TIMEOUT_MS;
-    const deadline = Date.now() + timeout;
+    const pollStartedAt = Date.now();
+    const deadline = pollStartedAt + timeout;
+    let lastBlockerKey: string | undefined;
     for (;;) {
       signal.throwIfAborted();
       // A Computer service that cannot start never connects; waiting out the
@@ -2571,7 +4105,10 @@ export class LocalServerModule implements Module {
       // The Another Me has an Agent once the server created it; there is no
       // status to wait for.
       const anotherMe = (await get(`${base}/another-me`)) as
-        | { agent_actor_id?: string }
+        | {
+            agent_actor_id?: string;
+            placement_blocker?: AnotherMePlacementBlocker;
+          }
         | undefined;
       if (!anotherMe) return;
       if (anotherMe.agent_actor_id) {
@@ -2605,8 +4142,47 @@ export class LocalServerModule implements Module {
           this.#advance("agents", 0.6, "Adding your starter agents…");
         }
       } else {
+        const blocker = anotherMe.placement_blocker;
+        if (blocker?.reason) {
+          const blockerRuntimes = blocker.runtimes?.map(
+            (runtime) =>
+              `${runtime.type ?? ""}:${runtime.status ?? ""}:${runtime.model_count ?? 0}`,
+          );
+          const blockerKey = [
+            blocker.reason,
+            blocker.computer_id ?? "",
+            (blockerRuntimes ?? []).join(","),
+          ].join("|");
+          if (blockerKey !== lastBlockerKey) {
+            lastBlockerKey = blockerKey;
+            this.#ctx?.log.warn("local_server.another_me_placement_blocked", {
+              reason: blocker.reason,
+              ...(blocker.computer_id
+                ? { computer_id: blocker.computer_id }
+                : {}),
+              ...(blockerRuntimes?.length ? { runtimes: blockerRuntimes } : {}),
+            });
+          }
+        }
+        const defaultGrantFailure = this.#ctx
+          ?.get<WorkspaceGrantsModule>("WorkspaceGrants")
+          .defaultFailure();
+        const hasWritableGrant =
+          this.#ctx?.config
+            .get()
+            .workspaceGrants.some((grant) => grant.access === "read_write") ??
+          false;
+        if (defaultGrantFailure && !hasWritableGrant) {
+          this.#ctx?.log.warn("local_server.default_workspace_grant_failed", {
+            directory: defaultGrantFailure.directory,
+            error: defaultGrantFailure.error,
+            ...(blocker?.reason ? { blocker_reason: blocker.reason } : {}),
+          });
+          throw new Error(defaultWorkspaceGrantFailed(defaultGrantFailure));
+        }
         if (Date.now() >= deadline) {
-          // Say what the server is missing, as this computer last reported it.
+          // Say what the server is missing, combining the server's placement
+          // blocker with what this computer last reported.
           const computers = (await get(`${base}/local-computers`).catch(
             () => undefined,
           )) as { items?: ReportedComputer[] } | undefined;
@@ -2617,18 +4193,36 @@ export class LocalServerModule implements Module {
           this.#ctx?.log.warn("local_server.another_me_missing", {
             computer_id: computerId,
             computer_status: computer?.status,
-            runtimes: computer?.runtimes?.map(
-              (runtime) =>
-                `${runtime.type}:${runtime.status}:${runtime.models?.length ?? 0}`,
-            ),
+            ...(blocker?.reason ? { blocker_reason: blocker.reason } : {}),
+            ...(blocker?.computer_id
+              ? { blocker_computer_id: blocker.computer_id }
+              : {}),
+            runtimes:
+              blocker?.runtimes?.map(
+                (runtime) =>
+                  `${runtime.type ?? ""}:${runtime.status ?? ""}:${runtime.model_count ?? 0}`,
+              ) ??
+              computer?.runtimes?.map(
+                (runtime) =>
+                  `${runtime.type}:${runtime.status}:${runtime.models?.length ?? 0}`,
+              ),
           });
           throw new Error(
-            anotherMeMissing(computers ? computer : null, timeout),
+            anotherMeMissing(
+              computers ? computer : null,
+              timeout,
+              blocker,
+              hasWritableGrant ? undefined : defaultGrantFailure,
+            ),
           );
         }
-        this.#advance("agents", 0.2, "Preparing your Another Me…");
+        this.#advance("agents", 0.2, anotherMeProgressMessage(blocker));
       }
-      await delay(this.#options.pollMs ?? 1_000, undefined, { signal });
+      await delay(
+        pollDelayMs(pollStartedAt, this.#options.pollMs ?? 1_000),
+        undefined,
+        { signal },
+      );
     }
   }
 
@@ -2648,11 +4242,21 @@ export class LocalServerModule implements Module {
     this.#acquireBusy();
     try {
       const update = this.#sourceUpdate(currentRecord);
+      const versionChanged =
+        !currentRecord.version ||
+        compareVersions(this.#options.version, currentRecord.version) > 0;
       if (update) {
-        // The services restart even if they still answer.
-        this.#preparing = "updating";
-        this.#set("preparing", "Updating Linger on this computer…");
-        windows?.showUpdating();
+        // The services restart even if they still answer. A same-version
+        // bundle refresh shows Starting instead of claiming a new version.
+        if (versionChanged) {
+          this.#preparing = "updating";
+          this.#set("preparing", "Updating Linger on this computer…");
+          windows?.showUpdating();
+        } else {
+          this.#preparing = "starting";
+          this.#set("preparing", "Starting Linger on this computer…");
+          windows?.showStarting();
+        }
       } else {
         this.#preparing = "starting";
         this.#set("preparing", "Starting Linger on this computer…");
@@ -2678,6 +4282,7 @@ export class LocalServerModule implements Module {
               to: moved,
             });
             this.#ready(moved, previous, "port_moved");
+            await this.#syncLocalGateway(currentRecord.home, moved, previous);
             reachable = true;
           }
         }
@@ -2720,8 +4325,13 @@ export class LocalServerModule implements Module {
         // The record moves, and the older folder goes, only once the
         // services run from the new one and answer; until then the older
         // services keep running from their folder, and Retry moves them.
+        const [servingSource, expectedRepo] = await Promise.all([
+          serving.source ? canonicalPath(serving.source) : undefined,
+          canonicalPath(repo),
+        ]);
         if (
-          serving.source !== (await realpath(repo).catch(() => repo)) ||
+          !servingSource ||
+          servingSource !== expectedRepo ||
           !(await this.#reachable(origin))
         )
           throw new Error(
@@ -2741,10 +4351,17 @@ export class LocalServerModule implements Module {
           from: currentRecord.version,
         });
       this.#ready(origin, currentRecord.origin, "resume_ready");
+      await this.#syncLocalGateway(
+        currentRecord.home,
+        origin,
+        currentRecord.origin,
+      );
       this.#set("ready", "Linger is running on this computer.");
       this.#ctx?.log.info("local_server.resume_succeeded", {
         total_ms: Date.now() - startedAt,
       });
+      if (repo !== currentRecord.repo)
+        void this.#schedulePruneSources(currentRecord.home, [repo]);
     } catch (error) {
       if (signal.aborted) return;
       const message = error instanceof Error ? error.message : String(error);
@@ -2761,6 +4378,22 @@ export class LocalServerModule implements Module {
     }
   }
 
+  async #isOrphanedLocalServer(config: DesktopConfig): Promise<boolean> {
+    if (!config.serverUrl || !config.computerId) return false;
+    if (!isManagedLocalServerConfig(config)) return false;
+    try {
+      await stat(this.#recordFile());
+      return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+    }
+    return !(await answers(
+      this.#options.fetch ?? fetch,
+      config.serverUrl,
+      ORPHANED_SERVER_PROBE_MS,
+    ));
+  }
+
   // The person gave up on the installation the window used, whose services
   // do not start (it may have been removed or left broken by an uninstall):
   // forget it and this computer's enrollment with it, and show setup. Its
@@ -2774,17 +4407,69 @@ export class LocalServerModule implements Module {
       this.#set("idle", "");
       ctx.log.info("local_server.reset");
       await ctx.get<EnrollmentModule>("Enrollment").unenroll();
-      ctx.config.update({ serverUrl: undefined });
-      ctx.get<WindowManagerModule>("WindowManager").loadServer();
+      ctx.config.update({ serverUrl: undefined, localServer: undefined });
+      const windows = ctx.get<WindowManagerModule>("WindowManager");
+      windows?.hide?.();
+      windows?.loadServer();
     } catch (error) {
       ctx.log.warn("local_server.reset_failed", { error: String(error) });
     }
     ctx.bus.emit("setup.open");
   }
 
+  // The services can stop while the window shows them. Their supervisors
+  // restart them, so one that does not answer first gets `graceMs` to come
+  // back, checked again during it; one still silent after that (its
+  // supervisor gave up or was ended too) is resumed like a launch: the
+  // installer starts what is not running.
+  async #recoverUnreachable(
+    trigger: "retry" | "load_failed" | "watch",
+    graceMs: number,
+    throttled: boolean,
+  ): Promise<void> {
+    if (this.#recovering || this.#resuming || this.#phase !== "ready") return;
+    if (
+      throttled &&
+      this.#recoveredAt !== undefined &&
+      Date.now() - this.#recoveredAt < RECOVERY_INTERVAL_MS
+    )
+      return;
+    this.#recovering = true;
+    try {
+      let record = await this.#windowRecord();
+      if (!record || (await this.#stillAnswers(record.origin))) return;
+      const checks = graceMs > 0 ? UNREACHABLE_PROBES - 1 : 0;
+      for (let check = 0; check < checks; check++) {
+        await delay(graceMs / checks, undefined, {
+          signal: this.#abort.signal,
+        });
+        if (this.#resuming) return;
+        record = await this.#windowRecord();
+        if (!record || (await this.#stillAnswers(record.origin))) return;
+      }
+      this.#recoveredAt = Date.now();
+      this.#ctx?.log.warn("local_server.unreachable_resume", { trigger });
+      await this.#resume(record, this.#abort.signal);
+    } catch {
+      // Aborted by stop.
+    } finally {
+      this.#recovering = false;
+    }
+  }
+
   // Whether the services already answer, such as after only the app quit.
   #reachable(origin: string): Promise<boolean> {
     return answers(this.#options.fetch ?? fetch, origin);
+  }
+
+  // Whether a ready server still answers, given more time than a launch's
+  // fast check.
+  #stillAnswers(origin: string): Promise<boolean> {
+    return answers(
+      this.#options.fetch ?? fetch,
+      origin,
+      UNREACHABLE_PROBE_TIMEOUT_MS,
+    );
   }
 
   // Whether the services run another source package than this app brings,
@@ -2818,7 +4503,6 @@ export class LocalServerModule implements Module {
       repo,
       version: this.#options.version,
     });
-    await this.#pruneSources(record.home, [repo]);
   }
 
   // Resolves with the source folder the installer reports the services
@@ -2841,7 +4525,7 @@ export class LocalServerModule implements Module {
       ms: Date.now() - nodeStartedAt,
     });
     const env = {
-      ...process.env,
+      ...this.#daemonEnv(),
       ...(await proxyEnv),
       LINGER_HOME: record.home,
     };
@@ -2934,6 +4618,12 @@ export class LocalServerModule implements Module {
         instance: LOCAL_INSTANCE,
         ...lookupTimings,
       });
+    const resumeTimings = resumeTimingFields(outcome.resumeTimings);
+    if (resumeTimings)
+      this.#ctx?.log.info("local_server.installer_resume_timings", {
+        instance: LOCAL_INSTANCE,
+        ...resumeTimings,
+      });
     if (outcome.code !== 0) {
       const { code, causeCode, reasons } = outcome.details ?? {};
       const action =
@@ -2998,7 +4688,26 @@ export class LocalServerModule implements Module {
     } else {
       this.#localModelsDegraded = undefined;
     }
-    this.#adoptRuntime(outcome.runtime);
+    const restoredLocalModels = Array.isArray(
+      outcome.details?.restoredLocalModels,
+    )
+      ? outcome.details.restoredLocalModels.filter(
+          (item): item is string => typeof item === "string" && item.length > 0,
+        )
+      : [];
+    const localModelsRestored =
+      outcome.details?.localModelsRestored === true ||
+      restoredLocalModels.length > 0;
+    const adoptedRuntime = this.#adoptRuntime(outcome.runtime);
+    if (localModelsRestored) {
+      this.#ctx?.log.info("local_server.local_models_restored", {
+        ...(restoredLocalModels.length ? { models: restoredLocalModels } : {}),
+      });
+      // When services were already running, the Computer Daemon may have
+      // probed `library status` while quit-unloaded models were still idle.
+      // Signal a restart/refresh when `#adoptRuntime` did not already do so.
+      if (!adoptedRuntime) this.#ctx?.bus.emit("computer.runtime");
+    }
     const { source, origin } = outcome.details ?? {};
     return {
       ...(typeof source === "string" ? { source } : {}),
@@ -3019,7 +4728,7 @@ export class LocalServerModule implements Module {
   // Every resume reports the runtime and localmodels tool paths, so an
   // install from before the Computer knew one gains it. A change restarts
   // the Computer once its running tasks end.
-  #adoptRuntime(runtime: InstanceRuntime | undefined): void {
+  #adoptRuntime(runtime: InstanceRuntime | undefined): boolean {
     const ctx = this.#ctx;
     if (
       !ctx ||
@@ -3029,20 +4738,21 @@ export class LocalServerModule implements Module {
         (value) => typeof value !== "string",
       )
     )
-      return;
+      return false;
     if (
       isDeepStrictEqual(
         ctx.config.get().runtimeEnvironment ?? {},
         runtime.environment,
       )
     )
-      return;
+      return false;
     ctx.config.update({ runtimeEnvironment: runtime.environment });
     ctx.log.info("local_server.runtime", {
       runtime: runtime.setupChoice,
       keys: Object.keys(runtime.environment),
     });
     ctx.bus.emit("computer.runtime");
+    return true;
   }
 
   // Reads the desktop instance's current origin from instance.json via the
@@ -3055,6 +4765,38 @@ export class LocalServerModule implements Module {
     } catch {
       return undefined;
     }
+  }
+
+  // Reads the desktop instance's current Runner Gateway URL from instance.json.
+  async #readInstanceGatewayUrl(home: string): Promise<string | undefined> {
+    try {
+      const instance = await loadInstance({ name: LOCAL_INSTANCE, home });
+      const port = instance?.source?.ports.nodeServices;
+      return port === undefined ? undefined : localRunnerGatewayUrl(port);
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Keeps the enrolled desktop daemon pointed at this instance's Runner
+  // Gateway when the installer reassigned node-services off a taken port.
+  async #syncLocalGateway(
+    home: string,
+    origin: string,
+    previous?: string,
+  ): Promise<void> {
+    const serverUrl = this.#ctx?.config.get().serverUrl;
+    if (
+      !serverUrl ||
+      (!sameOrigin(serverUrl, origin) &&
+        (!previous || !sameOrigin(serverUrl, previous)))
+    )
+      return;
+    const gatewayUrl = await this.#readInstanceGatewayUrl(home);
+    if (!gatewayUrl) return;
+    this.#ctx
+      ?.get<EnrollmentModule>("Enrollment")
+      .syncLocalGatewayUrl(gatewayUrl);
   }
 
   // Kept in the default home, wherever the installation went.
@@ -3103,9 +4845,22 @@ export class LocalServerModule implements Module {
   }
 }
 
+interface StageSourceOptions {
+  readonly installerDirectory?: string;
+  readonly reportProgress?: boolean;
+  readonly silent?: boolean;
+  readonly timingExtra?: Record<string, unknown>;
+}
+
+interface PreStagedSourceState {
+  active: number;
+  completed: boolean;
+}
+
 // What the desktop installed, so it can start the services again.
 // dist/installer/native/runtime-<target>/manifest.json: an archive of the
-// services beside the Node.js release, or on macOS both as folders.
+// services (or on macOS a folder) plus the pinned Node.js metadata (shared
+// with Computer tools, or legacy archive / folder copy).
 interface BundledRuntime {
   target: string;
   sourceArchiveSha256: string;
@@ -3113,8 +4868,15 @@ interface BundledRuntime {
   archive?: { file: string; sha256: string };
   // runtime/files.json, when the services are a folder.
   directory?: { file: string; sha256: string };
-  // The release archive, or node/bin/node in the folder layout.
-  node?: { version?: string; file: string; sha256: string };
+  // The shared Computer tools binary, or a legacy release archive / folder copy.
+  node?: {
+    version?: string;
+    shared?: boolean;
+    binary?: string;
+    file?: string;
+    sha256: string;
+    bytes?: number;
+  };
 }
 
 // The bundled services' native packages need this glibc or newer, like the
@@ -3147,11 +4909,17 @@ interface ResumeOutcome {
     byokGateway?: unknown;
     // Why local models did not come back on resume: `{ code, message, reasons? }`.
     localModelsDegraded?: unknown;
+    // Set when resume revived the local stack or reloaded library models.
+    localModelsRestored?: unknown;
+    // Library model IDs reloaded during resume.
+    restoredLocalModels?: unknown;
   };
   runtime?: InstanceRuntime;
   // Resume stderr is not piped (detached services could hold it open), so
   // the runtime lookup's stage timings ride in the outcome instead.
   runtimeLookupTimings?: unknown;
+  // Warm/cold resume breakdown from installer.js --resume, when reported.
+  resumeTimings?: unknown;
 }
 
 interface RuntimeLookupTimingFields {
@@ -3160,6 +4928,55 @@ interface RuntimeLookupTimingFields {
   local_models_ms: number;
   tool_ms: number;
   total_ms: number;
+}
+
+interface ResumeTimingFields {
+  path: "warm" | "cold";
+  probe_ms: number;
+  total_ms: number;
+  restore_local_models_ms?: number;
+  restore_byok_gateway_ms?: number;
+  cold_start_ms?: number;
+}
+
+function nonNegativeFinite(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+// The installer's resume stage timings, or undefined unless the required
+// fields have valid shapes; older installers omit this completely.
+function resumeTimingFields(value: unknown): ResumeTimingFields | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return undefined;
+  const {
+    path: resumePath,
+    probeMs,
+    totalMs,
+    restoreLocalModelsMs,
+    restoreByokGatewayMs,
+    coldStartMs,
+  } = value as Record<string, unknown>;
+  if (resumePath !== "warm" && resumePath !== "cold") return undefined;
+  const probe = nonNegativeFinite(probeMs);
+  const total = nonNegativeFinite(totalMs);
+  if (probe === undefined || total === undefined) return undefined;
+  const restoreLocalModels = nonNegativeFinite(restoreLocalModelsMs);
+  const restoreByokGateway = nonNegativeFinite(restoreByokGatewayMs);
+  const coldStart = nonNegativeFinite(coldStartMs);
+  return {
+    path: resumePath,
+    probe_ms: probe,
+    total_ms: total,
+    ...(restoreLocalModels !== undefined
+      ? { restore_local_models_ms: restoreLocalModels }
+      : {}),
+    ...(restoreByokGateway !== undefined
+      ? { restore_byok_gateway_ms: restoreByokGateway }
+      : {}),
+    ...(coldStart !== undefined ? { cold_start_ms: coldStart } : {}),
+  };
 }
 
 // The installer's runtime lookup timings, or undefined unless every stage is
@@ -3275,6 +5092,45 @@ const RUNTIME_STATES: Record<string, string> = {
   unknown: "not checked yet",
 };
 
+// Server-reported diagnostic explaining why TeamHub skipped or failed creating
+// the Human's Another Me on GET /v0/tenants/{tenantId}/another-me.
+export interface AnotherMePlacementRuntimeStatus {
+  readonly type?: string;
+  readonly status?: string;
+  readonly model_count?: number;
+  readonly message?: string;
+}
+
+export interface AnotherMePlacementBlocker {
+  readonly reason?: string;
+  readonly computer_id?: string;
+  readonly runtimes?: readonly AnotherMePlacementRuntimeStatus[];
+}
+
+const anotherMeProgressMessage = (
+  blocker: AnotherMePlacementBlocker | undefined,
+): string => {
+  switch (blocker?.reason) {
+    case "no_online_computer":
+      return "Waiting for this computer to connect…";
+    case "computer_upgrade_required":
+      return "Waiting for an updated Computer service…";
+    case "no_writable_workspace_grant":
+      return "Waiting for a writable workspace folder…";
+    case "no_ready_runtime_with_models":
+      return "Waiting for a signed-in AI runtime…";
+    case "create_failed":
+      return "Retrying Another Me setup…";
+    default:
+      return "Preparing your Another Me…";
+  }
+};
+
+export const defaultWorkspaceGrantFailed = (
+  failure: DefaultWorkspaceGrantFailure,
+): string =>
+  `Linger could not create its default workspace folder (${failure.directory}): ${failure.error.replace(/[.\s]+$/, "")}. Choose a writable folder in Linger Settings, then try again.`;
+
 // Why setup gave up on the Another Me. The server creates it once this
 // computer is online, shares a writable folder and reports a signed-in
 // runtime with a model; `computer` is what the server last heard from this
@@ -3295,13 +5151,63 @@ export function computerNotOnline(
   return "This computer did not come online on Linger.";
 }
 
+const formatMissingRuntimes = (
+  runtimes: readonly {
+    readonly type?: string;
+    readonly status?: string;
+    readonly message?: string;
+  }[],
+): string => {
+  const found = runtimes.map((runtime) => {
+    const name = RUNTIME_NAMES[runtime.type ?? ""] ?? runtime.type;
+    const state =
+      runtime.status === "ready"
+        ? "signed in but reports no models"
+        : (RUNTIME_STATES[runtime.status ?? ""] ?? runtime.status);
+    return `${name}: ${state}${runtime.message ? ` (${runtime.message})` : ""}`;
+  });
+  return [
+    "No signed-in AI runtime is reported by this computer.",
+    ...(found.length ? [`It found ${found.join("; ")}.`] : []),
+    "Install Codex or Claude Code and sign in to it in a terminal (codex login, or claude), then restart Linger and try again.",
+  ].join(" ");
+};
+
 export const anotherMeMissing = (
   computer: ReportedComputer | undefined | null,
   timeoutMs: number,
+  blocker?: AnotherMePlacementBlocker,
+  defaultGrantFailure?: DefaultWorkspaceGrantFailure,
 ): string => {
   const minutes = Math.max(1, Math.round(timeoutMs / 60_000));
   const waited = `Your Another Me was not created after ${minutes} minute${minutes === 1 ? "" : "s"}. The server creates it once this computer is connected with a signed-in AI runtime (Codex, Claude Code or Pi).`;
   const reason = ((): string => {
+    switch (blocker?.reason) {
+      case "no_online_computer":
+        return "The server sees this computer as offline: its Computer service is not connected. computer-daemon.log in the logs says why.";
+      case "computer_upgrade_required":
+        return "This computer's Computer service is too old for the server. Update Linger, then try again.";
+      case "no_writable_workspace_grant":
+        return defaultGrantFailure
+          ? defaultWorkspaceGrantFailed(defaultGrantFailure)
+          : "This computer shares no folder that agents can write to.";
+      case "no_ready_runtime_with_models":
+        return formatMissingRuntimes(
+          blocker.runtimes?.length
+            ? blocker.runtimes
+            : (computer?.runtimes ?? []),
+        );
+      case "create_failed":
+        return "This computer reports a signed-in runtime, but the server did not create the Another Me; the server log says why (another_me.create_failed).";
+    }
+    if (
+      defaultGrantFailure &&
+      (!computer ||
+        !computer.workspace_grants?.some(
+          (grant) => grant.mode === "workspace-write",
+        ))
+    )
+      return defaultWorkspaceGrantFailed(defaultGrantFailure);
     if (computer === null)
       return "Linger could not read this computer's status from the server.";
     if (!computer)
@@ -3323,24 +5229,14 @@ export const anotherMeMissing = (
       )
     )
       return "This computer reports a signed-in runtime, but the server did not create the Another Me; the server log says why (another_me.create_failed).";
-    const found = runtimes.map((runtime) => {
-      const name = RUNTIME_NAMES[runtime.type ?? ""] ?? runtime.type;
-      const state =
-        runtime.status === "ready"
-          ? "signed in but reports no models"
-          : (RUNTIME_STATES[runtime.status ?? ""] ?? runtime.status);
-      return `${name}: ${state}${runtime.message ? ` (${runtime.message})` : ""}`;
-    });
-    return [
-      "No signed-in AI runtime is reported by this computer.",
-      ...(found.length ? [`It found ${found.join("; ")}.`] : []),
-      "Install Codex or Claude Code and sign in to it in a terminal (codex login, or claude), then restart Linger and try again.",
-    ].join(" ");
+    return formatMissingRuntimes(runtimes);
   })();
   return `${waited}\n${reason}`;
 };
 
 interface Job {
+  readonly runtime?: InstanceRuntime;
+  readonly setupChoice?: string;
   readonly id: string;
   readonly instance: string;
   readonly state: string;
@@ -3383,17 +5279,45 @@ const STAGES: Record<string, readonly [LocalServerStep, number, number]> = {
 async function answers(
   fetcher: typeof fetch,
   origin: string,
+  timeoutMs = 1_000,
 ): Promise<boolean> {
   try {
     await fetcher(origin, {
       method: "HEAD",
       redirect: "manual",
-      signal: AbortSignal.timeout(1_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     return true;
   } catch {
     return false;
   }
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+const ORPHANED_SERVER_PROBE_MS = 1_500;
+
+const canonicalPath = (file: string): Promise<string> =>
+  realpath(file).catch(() => path.resolve(file));
+
+// Whether Desktop's saved server config belongs to a Desktop-managed local
+// server rather than a remote team server or an external developer server.
+export function isManagedLocalServerConfig(
+  config: Pick<
+    DesktopConfig,
+    "serverUrl" | "localServer" | "preferredRuntime" | "runtimeEnvironment"
+  >,
+): boolean {
+  if (!config.serverUrl) return false;
+  let hostname: string;
+  try {
+    hostname = new URL(config.serverUrl).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (!LOOPBACK_HOSTS.has(hostname)) return false;
+  if (config.localServer === true) return true;
+  if (config.localServer === false) return false;
+  return Boolean(config.preferredRuntime || config.runtimeEnvironment);
 }
 
 // Done: services run and the owner exists. A runtime sign-in still missing
@@ -3521,9 +5445,25 @@ export interface Reconnect {
 }
 
 const RECONNECT: Reconnect = { windowMs: 60_000, maxBackoffMs: 5_000 };
-// The runtime lookup runs a 120-second harness probe, with private file and
-// pinned tool checks before and after it.
-const INSTALLER_RUNTIME_TIMEOUT_MS = 180_000;
+// The runtime lookup runs a harness status probe (120 s at most) with
+// private folder and pinned tool checks around it; on Windows each of those
+// is a PowerShell ACL request of up to 30 s, so a slow machine takes a few
+// minutes and the worst case of every inner limit stays near seven. The
+// installer runs one lookup per instance and keeps its answer, so waiting
+// costs nothing and asking again joins it. This limit only ends a lookup
+// that has stopped making progress; it is not a performance budget.
+export const RUNTIME_LOOKUP_LIMIT_MS = 10 * 60_000;
+// When the setup page starts saying what the bar is waiting on.
+export const RUNTIME_LOOKUP_HINT_MS = 15_000;
+
+const FAILURES: ReadonlySet<string> = new Set<LocalServerFailure>([
+  "runtime_lookup_timed_out",
+  "runtime_lookup_unreachable",
+]);
+const localServerFailure = (code: unknown): LocalServerFailure | undefined =>
+  typeof code === "string" && FAILURES.has(code)
+    ? (code as LocalServerFailure)
+    : undefined;
 
 const TRANSIENT_CODES = new Set([
   "ECONNRESET",
@@ -3533,6 +5473,9 @@ const TRANSIENT_CODES = new Set([
   "UND_ERR_SOCKET",
   "UND_ERR_CONNECT_TIMEOUT",
   "UND_ERR_CLOSED",
+  // fetch stops waiting for response headers after 300 s; the installer may
+  // still be working on the answer.
+  "UND_ERR_HEADERS_TIMEOUT",
 ]);
 
 // The code of a transport failure worth retrying, found on the error or its
@@ -3616,7 +5559,14 @@ export class InstallerApi {
       transfer?: Transfer,
     ) => void,
     fresh = false,
-  ): Promise<{ readonly origin: string; readonly signInRequired: boolean }> {
+    onOriginReady?: (origin: string) => void,
+  ): Promise<{
+    readonly origin: string;
+    readonly signInRequired: boolean;
+    readonly setupChoice?: string;
+    readonly runtime?: InstanceRuntime;
+  }> {
+    const pollStartedAt = Date.now();
     const { items } = await this.#json<{ items: Job[] }>("/api/jobs");
     const latest = items
       .filter((item) => item.instance === LOCAL_INSTANCE && !item.preparation)
@@ -3625,6 +5575,10 @@ export class InstallerApi {
     if (
       !fresh &&
       latest &&
+      // A job for another choice is the person's earlier answer: after a quit
+      // part way through the local model download, choosing a subscription
+      // must not follow that download. The installer replaces it.
+      runsPlan(latest, plan) &&
       (["queued", "running"].includes(latest.state) ||
         // A finished one only while its instance is still there; its data
         // may have been removed since. Its services must still run too: after
@@ -3669,6 +5623,13 @@ export class InstallerApi {
     let approved: string | undefined;
     let retriedApply = false;
     let replanned = false;
+    let originLookupStarted = false;
+    let notifiedOrigin = false;
+    const notifyOrigin = (origin: string): void => {
+      if (notifiedOrigin) return;
+      notifiedOrigin = true;
+      onOriginReady?.(origin);
+    };
     // Where the bar last stood, kept while the installer cannot be reached.
     let shown: [LocalServerStep, number] | undefined;
     for (;;) {
@@ -3709,8 +5670,40 @@ export class InstallerApi {
           },
         );
       }
-      if (finished(job))
-        return { origin: job.origin!, signInRequired: signInRequired(job) };
+      if (finished(job)) {
+        const live = job === latest ? undefined : job;
+        return {
+          origin: job.origin!,
+          signInRequired: signInRequired(job),
+          setupChoice: live?.runtime?.setupChoice ?? live?.setupChoice,
+          runtime: live?.runtime,
+        };
+      }
+      if (
+        onOriginReady &&
+        !originLookupStarted &&
+        job.stages.some(
+          (stage) =>
+            (stage.id === "services" && stage.state === "succeeded") ||
+            (stage.id === "account" &&
+              (stage.state === "running" || stage.state === "succeeded")),
+        )
+      ) {
+        originLookupStarted = true;
+        const jobOrigin =
+          typeof job.origin === "string"
+            ? parseServerUrl(job.origin)
+            : undefined;
+        if (jobOrigin) {
+          notifyOrigin(jobOrigin);
+        } else {
+          void this.instanceOrigin()
+            .then((origin) => {
+              if (origin && !signal.aborted) notifyOrigin(origin);
+            })
+            .catch(() => undefined);
+        }
+      }
       const planId = job.localModelsPlan?.planId;
       if (
         job.state === "waiting_user" &&
@@ -3756,7 +5749,9 @@ export class InstallerApi {
       }
       if (!["queued", "running"].includes(job.state))
         throw new Error(formatInstallJobFailure(job));
-      await delay(this.#pollMs, undefined, { signal });
+      await delay(pollDelayMs(pollStartedAt, this.#pollMs), undefined, {
+        signal,
+      });
       job = await this.#poll(job.id, signal, () => {
         if (shown) onStep(shown[0], shown[1], "Reconnecting to the installer…");
       });
@@ -3798,31 +5793,71 @@ export class InstallerApi {
     }
   }
 
+  // Best-effort lookup of this instance's origin from GET /api/instances.
+  async instanceOrigin(): Promise<string | undefined> {
+    const { items } = await this.#json<{
+      items?: { name?: unknown; origin?: unknown }[];
+    }>("/api/instances");
+    const entry = items?.find((item) => item?.name === LOCAL_INSTANCE);
+    return typeof entry?.origin === "string"
+      ? parseServerUrl(entry.origin)
+      : undefined;
+  }
+
   // The owner account the installer created for this instance.
   login(): Promise<{ readonly email: string; readonly password: string }> {
     return this.#json(`/api/instances/${LOCAL_INSTANCE}/login`);
   }
 
   // The runtime the installation set up, with the paths of its executable
-  // and profile.
+  // and profile. The installer answers once its lookup ends, and asking
+  // again joins the running one, so a dropped connection is asked again
+  // like a job poll; only RUNTIME_LOOKUP_LIMIT_MS in all ends the wait.
   async runtime(signal: AbortSignal): Promise<InstanceRuntime> {
-    const deadline = AbortSignal.timeout(INSTALLER_RUNTIME_TIMEOUT_MS);
-    try {
-      return await this.#json(
-        `/api/instances/${LOCAL_INSTANCE}/runtime`,
-        undefined,
-        "GET",
-        AbortSignal.any([signal, deadline]),
-      );
-    } catch (error) {
-      if (!signal.aborted && deadline.aborted)
-        throw new Error(
-          "The installer timed out while reading the selected runtime.",
-          {
-            cause: error,
-          },
+    const deadline = AbortSignal.timeout(RUNTIME_LOOKUP_LIMIT_MS);
+    const either = AbortSignal.any([signal, deadline]);
+    let since: number | undefined;
+    let wait = this.#pollMs;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.#json(
+          `/api/instances/${LOCAL_INSTANCE}/runtime`,
+          undefined,
+          "GET",
+          either,
         );
-      throw error;
+      } catch (error) {
+        if (signal.aborted) throw error;
+        if (deadline.aborted)
+          throw Object.assign(
+            new Error(
+              "Checking the AI runtime on this computer did not finish in time.",
+              { cause: error },
+            ),
+            { code: "runtime_lookup_timed_out" },
+          );
+        const code = transientCode(error);
+        if (!code) throw error;
+        this.#log?.warn("local_server.installer_unreachable", {
+          stage: "runtime",
+          code,
+          attempt,
+        });
+        // A lookup that outlasted fetch's wait for an answer is still
+        // running in the installer: ask again at once to join it.
+        if (code === "UND_ERR_HEADERS_TIMEOUT") continue;
+        since ??= Date.now();
+        if (Date.now() - since >= this.#reconnect.windowMs)
+          throw Object.assign(
+            new Error(
+              "Lost the connection to the installer while checking the AI runtime.",
+              { cause: error },
+            ),
+            { code: "runtime_lookup_unreachable" },
+          );
+        await delay(wait, undefined, { signal });
+        wait = Math.min(wait * 2, this.#reconnect.maxBackoffMs);
+      }
     }
   }
 
@@ -3941,6 +5976,16 @@ const recommended = (report: { recommendation?: string }) =>
   report.recommendation === "local-models"
     ? "pi"
     : (report.recommendation ?? "codex");
+
+// Whether the job installs what the plan asks for. The installer picks for
+// "recommended", which never deploys the local model (see `recommended`).
+// A job that names no choice used the saved one and is followed as before.
+const runsPlan = (job: Job, plan: LocalServerPlan): boolean =>
+  !job.setupChoice ||
+  (plan.runtime === "recommended"
+    ? job.setupChoice !== "local-models"
+    : job.setupChoice ===
+      (plan.runtime === "local" ? "local-models" : plan.runtime));
 
 export interface SetCookie {
   readonly name: string;
@@ -4164,6 +6209,36 @@ export const installLocation = async (picked: string): Promise<string> => {
     : path.join(picked, "Linger");
 };
 
+// Walks up from `directory` to the nearest existing directory without creating
+// anything; undefined for non-absolute paths or when the root does not exist.
+const nearestExistingDirectory = async (
+  directory: string,
+): Promise<string | undefined> => {
+  if (!path.isAbsolute(directory)) return undefined;
+  let existing = directory;
+  while (!(await isDirectory(existing))) {
+    if (path.dirname(existing) === existing) return undefined;
+    existing = path.dirname(existing);
+  }
+  return existing;
+};
+
+// Available disk bytes on `directory`'s filesystem without creating folders or
+// writing probe files; undefined when the path or filesystem cannot be read.
+export async function freeDiskBytes(
+  directory: string,
+): Promise<number | undefined> {
+  const existing = await nearestExistingDirectory(directory);
+  if (!existing) return undefined;
+  try {
+    const disk = await statfs(existing);
+    const free = Number(disk.bavail) * Number(disk.bsize);
+    return Number.isFinite(free) && free >= 0 ? free : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // Why Linger cannot install into `directory`, or undefined when it can: the
 // folder (or the one it will be made in) must take files and its disk must
 // have `neededBytes` free.
@@ -4172,12 +6247,8 @@ export const checkLocation = async (
   neededBytes: number,
 ): Promise<string | undefined> => {
   if (!path.isAbsolute(directory)) return "Choose a folder on this computer.";
-  let existing = directory;
-  while (!(await isDirectory(existing))) {
-    if (path.dirname(existing) === existing)
-      return "This folder can't be found.";
-    existing = path.dirname(existing);
-  }
+  const existing = await nearestExistingDirectory(directory);
+  if (!existing) return "This folder can't be found.";
   const probe = path.join(existing, `.linger-${randomUUID()}`);
   try {
     await writeFile(probe, "", { flag: "wx" });
@@ -4211,37 +6282,201 @@ const isFile = async (file: string): Promise<boolean> => {
 
 // Windows' own bsdtar reads both the tar.gz source package and the Node zip;
 // a GNU tar earlier on PATH (Git for Windows) reads neither "C:" paths nor zips.
-const tarCommand = (): string =>
-  process.platform === "win32"
-    ? path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe")
-    : "tar";
+export function tarCommand(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (platform !== "win32") return "tar";
+  const systemRoot =
+    env.SystemRoot?.trim() || env.windir?.trim() || "C:\\Windows";
+  return path.win32.join(systemRoot, "System32", "tar.exe");
+}
+
+export interface UnpackArchiveOptions {
+  readonly command?: string;
+  readonly platform?: NodeJS.Platform;
+  readonly runCommand?: typeof run;
+  readonly fallback?: typeof extractArchiveFallback;
+  readonly onFallback?: (command: string) => void;
+}
+
+// Unpacks `file` (stripping its single top-level directory) into an empty
+// `unpacked` folder. If system tar is missing (for example on stripped Windows
+// images without System32\tar.exe), falls back to the pure-Node extractor and
+// surfaces an actionable error if that also fails.
+export async function unpackArchive(
+  file: string,
+  unpacked: string,
+  signal: AbortSignal,
+  options: UnpackArchiveOptions = {},
+): Promise<void> {
+  const platform = options.platform ?? process.platform;
+  const command = options.command ?? tarCommand(platform);
+  const runCommand = options.runCommand ?? run;
+  const fallback = options.fallback ?? extractArchiveFallback;
+  await removeRetrying(unpacked);
+  await mkdir(unpacked, { recursive: true, mode: 0o700 });
+  try {
+    // Windows' tar may not read zstd; Node's zlib does, and tar reads stdin.
+    if (file.endsWith(".zst")) {
+      await runCommand(
+        command,
+        ["-xf", "-", "--strip-components=1"],
+        unpacked,
+        signal,
+        createReadStream(file, { signal }).pipe(createZstdDecompress()),
+      );
+      return;
+    }
+    // Windows' tar.exe reads argv in the ANSI code page, so pass a relative path
+    // from the resolved destination when both share a drive; POSIX tar is UTF-8
+    // native and takes the archive path directly without symlink depth drift.
+    let archiveArg = file;
+    let cwd = unpacked;
+    if (platform === "win32") {
+      const realUnpacked = await realpath(unpacked).catch(() => unpacked);
+      const realFile = await realpath(file).catch(() => file);
+      archiveArg = path.relative(realUnpacked, realFile);
+      cwd = realUnpacked;
+    }
+    await runCommand(
+      command,
+      ["-xf", archiveArg, "--strip-components=1"],
+      cwd,
+      signal,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+    options.onFallback?.(command);
+    await removeRetrying(unpacked);
+    await mkdir(unpacked, { recursive: true, mode: 0o700 });
+    try {
+      await fallback(file, unpacked, { strip: 1, signal });
+    } catch (fallbackError) {
+      const detail =
+        fallbackError instanceof Error
+          ? fallbackError.message
+          : String(fallbackError);
+      const hint =
+        platform === "win32"
+          ? "Restore Windows tar.exe or reinstall Linger."
+          : "Install tar or reinstall Linger.";
+      throw new Error(
+        `Failed to unpack ${path.basename(file)}: ${command} was not found (ENOENT) and the built-in extractor failed (${detail}). ${hint}`,
+        { cause: fallbackError },
+      );
+    }
+  }
+}
 
 // Resolves once the child exited and closed its stdio, so nothing of it
 // still holds the files it wrote.
 // `input`, when given, is the child's stdin.
-const run = (
+export function runChild(
   command: string,
   args: string[],
   cwd: string,
   signal: AbortSignal,
   input?: Readable,
-): Promise<void> =>
-  new Promise((resolve, reject) => {
+): Promise<void> {
+  if (signal.aborted)
+    return Promise.reject(
+      signal.reason ?? new DOMException("Aborted", "AbortError"),
+    );
+  return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
       stdio: [input ? "pipe" : "ignore", "ignore", "ignore"],
-      signal,
       windowsHide: true,
     });
-    child.once("error", reject);
+    let settled = false;
+    let failure: unknown;
+    let escalated: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      signal.removeEventListener("abort", onAbort);
+      if (escalated) {
+        clearTimeout(escalated);
+        escalated = undefined;
+      }
+    };
+    const terminate = (reason: unknown) => {
+      if (settled) return;
+      failure ??= reason;
+      if (input && !input.destroyed) input.destroy();
+      try {
+        if (process.platform === "win32") child.kill();
+        else child.kill("SIGTERM");
+      } catch {
+        // Already exited.
+      }
+      escalated ??= setTimeout(() => {
+        if (settled) return;
+        try {
+          if (process.platform === "win32" && child.pid) {
+            spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+              stdio: "ignore",
+              windowsHide: true,
+            }).once("error", () => {
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                // Already exited.
+              }
+            });
+          } else {
+            child.kill("SIGKILL");
+          }
+        } catch {
+          // Already exited.
+        }
+      }, 2_000);
+      escalated.unref?.();
+    };
+    const onAbort = () =>
+      terminate(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    child.once("error", (error) => {
+      if (settled) return;
+      if (child.pid === undefined) {
+        settled = true;
+        cleanup();
+        if (input && !input.destroyed) input.destroy();
+        reject(error);
+        return;
+      }
+      failure ??= error;
+    });
     if (input)
       pipeline(input, child.stdin!).catch((error: unknown) => {
-        child.kill();
-        reject(error);
+        terminate(error);
       });
-    child.once("close", (code) =>
-      code === 0
-        ? resolve()
-        : reject(new Error(`${command} exited with code ${code}`)),
+    child.once("close", (code) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (failure !== undefined) reject(failure);
+      else if (code === 0) resolve();
+      else reject(new Error(`${command} exited with code ${code}`));
+    });
+  });
+}
+
+const run = runChild;
+
+const raceAbort = <T>(promise: Promise<T>, signal: AbortSignal): Promise<T> => {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
     );
   });
+};

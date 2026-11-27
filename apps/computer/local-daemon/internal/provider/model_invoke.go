@@ -125,6 +125,7 @@ type ModelInvokeFile struct {
 // ModelInvokeRequest is one decoded execute model_invoke command.
 type ModelInvokeRequest struct {
 	RuntimeType     string
+	Model           string
 	Mode            string
 	ReasoningEffort string
 	Instructions    string
@@ -264,6 +265,9 @@ func (m ModelInvoker) invoke(ctx context.Context, request ModelInvokeRequest, in
 	if request.RuntimeType == "pi" {
 		return invokePiModel(ctx, request, installed, work, scratch)
 	}
+	if request.RuntimeType == "antigravity" {
+		return invokeAntigravityModel(ctx, request, installed, work, scratch)
+	}
 	if request.Mode == ModelInvokeWorkspace {
 		if err := writeModelInvokeFiles(work, request.WorkspaceFiles); err != nil {
 			return ModelInvokeResult{Outcome: ModelInvokeFailed, Reason: err.Error()}
@@ -274,7 +278,7 @@ func (m ModelInvoker) invoke(ctx context.Context, request ModelInvokeRequest, in
 	if request.RuntimeType == "codex" {
 		invocation, err = codexModelInvocation(request, environment, root, work, installed, m.codexModelsCache())
 	} else {
-		invocation, err = claudeModelInvocation(request, environment, m.ClaudeConfigRoot)
+		invocation, err = claudeModelInvocation(request, environment, m.ClaudeConfigRoot, m.TempBase)
 	}
 	if err != nil {
 		var unavailable modelInvokeUnavailableError
@@ -373,7 +377,7 @@ func (m ModelInvoker) sessionInvoke(ctx context.Context, request ModelInvokeRequ
 	}
 	environment["CODEX_HOME"] = home
 	args := []string{"--config", `web_search="disabled"`}
-	named := codexDefaultModel(prepared.Model, installed.DefaultModel)
+	named := codexInvokeModel(request.Model, prepared.Model, installed.DefaultModel)
 	if named != "" {
 		args = append(args, "--config", fmt.Sprintf("model=%q", named))
 	}
@@ -493,7 +497,7 @@ func codexModelInvocation(request ModelInvokeRequest, environment map[string]str
 	if prepared.AuthenticationMissing {
 		return modelInvocation{}, modelInvokeUnavailableError{ModelInvokeAuthRequired, "Codex is not signed in"}
 	}
-	named := codexDefaultModel(prepared.Model, installed.DefaultModel)
+	named := codexInvokeModel(request.Model, prepared.Model, installed.DefaultModel)
 	environment["CODEX_HOME"] = home
 	schemaPath := ""
 	if request.Mode == ModelInvokeStructured {
@@ -505,7 +509,7 @@ func codexModelInvocation(request ModelInvokeRequest, environment map[string]str
 	lastPath := filepath.Join(root, "last.txt")
 	events := &codexInvokeEvents{}
 	return modelInvocation{
-		args:        codexModelInvokeArgs(installed.Version, request.Mode, request.ReasoningEffort, named, work, schemaPath, lastPath),
+		args:        codexModelInvokeArgs(request.Mode, request.ReasoningEffort, named, work, schemaPath, lastPath),
 		environment: environment,
 		stdout:      events,
 		model:       cmp.Or(named, prepared.Model),
@@ -521,12 +525,15 @@ func codexModelInvocation(request ModelInvokeRequest, environment map[string]str
 	}, nil
 }
 
-// codexDefaultModel is the model a call names on the command line: the
-// Runtime catalog's default for the signed-in account, and only when
-// config.toml selects no model. Without one, Codex runs its built-in default,
-// which the account may not offer; the catalog lists only what it can use,
-// and Agent runs choose from the same catalog.
-func codexDefaultModel(configured, catalogDefault string) string {
+// codexInvokeModel is the model a Codex call names explicitly on the command
+// line. An explicit request model always wins so background calls follow the
+// Agent's configured model and override config.toml. When a legacy caller
+// names none, a model configured in config.toml still decides; otherwise the
+// Runtime catalog's default for the signed-in account is used.
+func codexInvokeModel(requested, configured, catalogDefault string) string {
+	if model := strings.TrimSpace(requested); model != "" {
+		return model
+	}
 	if configured != "" {
 		return ""
 	}
@@ -536,7 +543,7 @@ func codexDefaultModel(configured, catalogDefault string) string {
 // codexModelInvokeArgs builds the codex exec argv; an empty model leaves the
 // choice to config.toml. The prompt is read from stdin, so no positional
 // argument follows the options.
-func codexModelInvokeArgs(version, mode, effort, model, work, schemaPath, lastPath string) []string {
+func codexModelInvokeArgs(mode, effort, model, work, schemaPath, lastPath string) []string {
 	sandbox := "read-only"
 	if mode == ModelInvokeWorkspace {
 		sandbox = "workspace-write"
@@ -564,7 +571,7 @@ func codexModelInvokeArgs(version, mode, effort, model, work, schemaPath, lastPa
 		}
 		args = append(args, "-c", "features."+feature+"=false")
 	}
-	args = append(args, native.CodexSubAgentConfig(version)...)
+	args = append(args, native.CodexSubAgentConfig()...)
 	if schemaPath != "" {
 		args = append(args, "--output-schema", schemaPath)
 	}
@@ -670,12 +677,12 @@ func (e *codexInvokeEvents) diagnostics() (string, native.RuntimeFailureDiagnost
 	return "", e.lastDiagnostics
 }
 
-func claudeModelInvocation(request ModelInvokeRequest, environment map[string]string, configRoot string) (modelInvocation, error) {
+func claudeModelInvocation(request ModelInvokeRequest, environment map[string]string, configRoot, tempBase string) (modelInvocation, error) {
 	var prepared map[string]string
 	var release func()
 	var err error
 	if configRoot == "" {
-		prepared, release, err = localworkspace.ClaudeProbeEnvironment(environment)
+		prepared, release, err = localworkspace.ClaudeProbeEnvironment(environment, tempBase)
 	} else {
 		prepared, err = localworkspace.ClaudeModelInvokeEnvironment(configRoot, environment)
 	}
@@ -694,10 +701,12 @@ func claudeModelInvocation(request ModelInvokeRequest, environment map[string]st
 		}
 		return nil
 	}
+	requestedModel := strings.TrimSpace(request.Model)
 	return modelInvocation{
-		args:        claudeModelInvokeArgs(request.Mode, request.ReasoningEffort, request.OutputSchema),
+		args:        claudeModelInvokeArgs(request.Mode, request.ReasoningEffort, requestedModel, request.OutputSchema),
 		environment: prepared,
 		stdout:      stdout,
+		model:       requestedModel,
 		release:     release,
 		reply: func() (ModelInvokeResult, error) {
 			if err := parse(); err != nil {
@@ -744,8 +753,11 @@ func claudeModelInvocation(request ModelInvokeRequest, environment map[string]st
 // claudeModelInvokeArgs builds the claude -p argv. --safe-mode turns off
 // CLAUDE.md, Skills, hooks, MCP servers and plugins while sign-in still works;
 // the prompt is read from stdin.
-func claudeModelInvokeArgs(mode, effort string, schema json.RawMessage) []string {
+func claudeModelInvokeArgs(mode, effort, model string, schema json.RawMessage) []string {
 	args := []string{"-p", "--output-format", "json"}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
 	if mode == ModelInvokeStructured {
 		args = append(args, "--json-schema", string(schema))
 	}
@@ -1076,4 +1088,45 @@ func classifyModelInvokeFailureWithDiagnostics(
 		return ModelInvokeResult{Outcome: ModelInvokeRuntimeUnavailable, Reason: reason}
 	}
 	return ModelInvokeResult{Outcome: ModelInvokeFailed, Reason: reason}
+}
+
+func structuredModelInvokeInstructions(request ModelInvokeRequest) string {
+	instructions := request.Instructions
+	if request.Mode == ModelInvokeStructured {
+		instructions += "\n\nReturn only a JSON object matching this schema:\n" + string(request.OutputSchema)
+	}
+	return instructions
+}
+
+// classifyNativeModelInvokeFailure maps native RPC background model-call
+// failures shared by Pi and Antigravity into structured outcomes. When
+// forwardSanitizedError is false, raw provider error text is never echoed back
+// to the caller.
+func classifyNativeModelInvokeFailure(runtimeName string, err error, answer native.Outcome, forwardSanitizedError bool) ModelInvokeResult {
+	if err != nil {
+		return ModelInvokeResult{Outcome: ModelInvokeRuntimeUnavailable, Reason: runtimeName + " background runtime failed to start"}
+	}
+	if apiErr, ok := parseStructuredAPIError(answer.Error); ok {
+		if isContextTooLongErrorCode(apiErr.Code) || isContextTooLongErrorCode(apiErr.Type) {
+			return ModelInvokeResult{Outcome: ModelInvokeContextTooLong, Reason: "Model invocation prompt exceeds the model context window"}
+		}
+		if apiErr.Code == "model_not_found" {
+			return ModelInvokeResult{Outcome: ModelInvokeRuntimeIncompatible, Reason: runtimeName + " background model is not available"}
+		}
+		if isAuthErrorCode(apiErr.Code) || isAuthErrorCode(apiErr.Type) {
+			return ModelInvokeResult{Outcome: ModelInvokeAuthRequired, Reason: runtimeName + " background authentication is required"}
+		}
+		if isUnavailableErrorCode(apiErr.Code) || isUnavailableErrorCode(apiErr.Type) {
+			return ModelInvokeResult{Outcome: ModelInvokeRuntimeUnavailable, Reason: runtimeName + " background model service is unavailable"}
+		}
+	}
+	if posixNetworkErrnoPattern.MatchString(answer.Error) {
+		return ModelInvokeResult{Outcome: ModelInvokeRuntimeUnavailable, Reason: runtimeName + " background model service is unavailable"}
+	}
+	if forwardSanitizedError {
+		if sanitized := truncateRunes(redact.Text(strings.TrimSpace(answer.Error)), 300); sanitized != "" {
+			return ModelInvokeResult{Outcome: ModelInvokeFailed, Reason: sanitized}
+		}
+	}
+	return ModelInvokeResult{Outcome: ModelInvokeFailed, Reason: runtimeName + " background call did not complete"}
 }

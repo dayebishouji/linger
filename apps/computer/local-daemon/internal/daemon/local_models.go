@@ -33,11 +33,44 @@ const serviceFeatureLocalModelsDiagnostics = "local_models_diagnostics"
 // on unknown LocalModel properties.
 const serviceFeatureLocalModelsEngine = "local_models_engine"
 
+// serviceFeatureLocalModelsConcurrencyProbe in runner.welcome's
+// service_features says the Agent Service accepts per-model
+// concurrency_probing on LocalModel rows. Older services close the connection
+// on unknown LocalModel properties.
+const serviceFeatureLocalModelsConcurrencyProbe = "local_models_concurrency_probe"
+
+// serviceFeatureLocalModelsExternalHolders in runner.welcome's service_features
+// says the Agent Service accepts external_holders on LocalModelPool rows. Older
+// services close the connection on unknown LocalModelPool properties.
+const serviceFeatureLocalModelsExternalHolders = "local_models_external_holders"
+
 // serviceFeatureLocalModelUnavailable in runner.welcome's service_features
 // says the Agent Service accepts the local_model_unavailable Run failure
 // code. An older service rejects the frame, so the Daemon reports
 // model_unavailable to it instead.
 const serviceFeatureLocalModelUnavailable = "local_model_unavailable"
+
+// serviceFeatureModelGatewayUnavailable in runner.welcome's service_features
+// says the Agent Service accepts the model_gateway_unavailable Run failure
+// code. An older service rejects the frame, so the Daemon reports
+// execution_failed to it instead.
+const serviceFeatureModelGatewayUnavailable = "model_gateway_unavailable"
+
+// serviceFeatureRuntimeFailureDetail in runner.welcome's service_features says
+// the Agent Service accepts the optional detail property on
+// RuntimeExecutionFailure. Older services reject unknown properties on that
+// object, so the Daemon omits detail when absent.
+const serviceFeatureRuntimeFailureDetail = "runtime_failure_detail"
+
+// serviceFeatureOperationBackgroundWait in runner.welcome's service_features
+// says the Agent Service accepts run.background_waiting and
+// run.background_resumed Operation events.
+const serviceFeatureOperationBackgroundWait = "operation_background_wait"
+
+// serviceFeatureDynamicReasoningEfforts in runner.welcome's service_features
+// says the Agent Service accepts reasoning effort tokens beyond the legacy
+// seven-value set in runtime diagnostics and model source status.
+const serviceFeatureDynamicReasoningEfforts = "dynamic_reasoning_efforts"
 
 // LocalModelLibrary runs the actions a Computer owner chooses on this
 // Computer's localmodels library. The Daemon never picks a model: on its
@@ -103,6 +136,12 @@ func (d *Daemon) PublishLocalModels(snapshot wire.LocalModelsSnapshot) {
 	}
 	if !d.localModelsEngine.Load() {
 		snapshot = stripLocalModelsEngine(snapshot)
+	}
+	if !d.localModelsConcurrencyProbe.Load() {
+		snapshot = stripLocalModelsConcurrencyProbe(snapshot)
+	}
+	if !d.localModelsExternalHolders.Load() {
+		snapshot = stripLocalModelsExternalHolders(snapshot)
 	}
 	d.localModelsRevision++
 	sentAt := time.Now().UTC()
@@ -274,6 +313,37 @@ func stripLocalModelsEngine(snapshot wire.LocalModelsSnapshot) wire.LocalModelsS
 		models[i] = model
 	}
 	snapshot.Models = models
+	return snapshot
+}
+
+// stripLocalModelsConcurrencyProbe omits per-model concurrency_probing when
+// talking to an Agent Service that did not announce
+// serviceFeatureLocalModelsConcurrencyProbe.
+func stripLocalModelsConcurrencyProbe(snapshot wire.LocalModelsSnapshot) wire.LocalModelsSnapshot {
+	if len(snapshot.Models) == 0 {
+		return snapshot
+	}
+	models := make([]wire.LocalModel, len(snapshot.Models))
+	for i, model := range snapshot.Models {
+		model.ConcurrencyProbing = nil
+		models[i] = model
+	}
+	snapshot.Models = models
+	return snapshot
+}
+
+// stripLocalModelsExternalHolders omits pool external_holders when talking to
+// an Agent Service that did not announce serviceFeatureLocalModelsExternalHolders.
+func stripLocalModelsExternalHolders(snapshot wire.LocalModelsSnapshot) wire.LocalModelsSnapshot {
+	if len(snapshot.Pools) == 0 {
+		return snapshot
+	}
+	pools := make([]wire.LocalModelPool, len(snapshot.Pools))
+	for i, pool := range snapshot.Pools {
+		pool.ExternalHolders = nil
+		pools[i] = pool
+	}
+	snapshot.Pools = pools
 	return snapshot
 }
 

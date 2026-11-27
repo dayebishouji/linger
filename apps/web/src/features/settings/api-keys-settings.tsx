@@ -4,13 +4,11 @@ import { useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
-import { ModalDialog } from "@/components/ui/modal-dialog";
 import { StatusPill } from "@/components/ui/status-pill";
 import { AppLogoTile } from "@/features/apps/app-logo";
 import { externalAppsQueryOptions } from "@/features/apps/connected-apps-queries";
-import { ComposioKeyForm } from "@/features/apps/provider-key-form";
-import { ComposioKeyGuide } from "@/features/apps/provider-key-guide";
-import { roomListMessages } from "@/features/rooms/room-list.messages";
+import { ComposioKeyDialog } from "@/features/apps/provider-key-form";
+import { voiceKeyMessages } from "@/features/rooms/voice-control/voice-key.messages";
 import { LazyVoiceKeyDialog } from "@/features/rooms/voice-control/lazy-voice-key-dialog";
 import { useVoiceMediaPolicy } from "@/features/rooms/voice-control/use-voice-media-policy";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
@@ -56,21 +54,19 @@ export function ApiKeysSettings() {
           {t(accountSettingsMessages.apiKeysDescription)}
         </p>
       </header>
-      <div className="divide-y divide-border rounded-2xl border border-border bg-background">
+      <div className="rounded-2xl border border-border bg-background">
         <ComposioKeyRow onOpen={open} />
         {voicePolicy?.voice_available ? (
           <>
             <VoiceKeyRow
-              detail={t(accountSettingsMessages.sonioxDetail, {
-                pocketNotes: t(roomListMessages.pocketNotes),
-              })}
+              detail={t(voiceKeyMessages.sonioxPurpose)}
               environmentVariable="SONIOX_API_KEY"
               onOpen={() => openVoice("soniox")}
               status={voicePolicy.soniox_key}
               title="Soniox"
             />
             <VoiceKeyRow
-              detail={t(accountSettingsMessages.xaiDetail)}
+              detail={t(voiceKeyMessages.xaiPurpose)}
               environmentVariable="XAI_API_KEY"
               onOpen={() => openVoice("xai")}
               status={voicePolicy.xai_key}
@@ -93,29 +89,19 @@ export function ApiKeysSettings() {
       ) : null}
 
       {dialogOpen ? (
-        <ModalDialog
-          className="app-key-dialog"
-          closeOnBackdrop
-          description={t(accountSettingsMessages.composioDialogDescription)}
+        <ComposioKeyDialog
           onClose={() => setDialogOpen(false)}
-          size="md"
+          onSaved={() => {
+            setSavedProvider("Composio");
+            setDialogOpen(false);
+          }}
           title={
             <span className="flex items-center gap-2.5">
               <AppLogoTile name="Composio" small url={composioLogoUrl} />
               {t(accountSettingsMessages.providerKey, { provider: "Composio" })}
             </span>
           }
-        >
-          <div className="space-y-4 px-5 py-5 text-sm text-app-body">
-            <ComposioKeyGuide />
-            <ComposioKeyForm
-              onSaved={() => {
-                setSavedProvider("Composio");
-                setDialogOpen(false);
-              }}
-            />
-          </div>
-        </ModalDialog>
+        />
       ) : null}
 
       {voiceDialog ? (

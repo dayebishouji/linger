@@ -18,10 +18,13 @@ import { RunnerModelInvokeUnavailableError } from "../../../src/agent/runner-gat
 import { RunnerModelInvokeYieldedError } from "../../../src/agent/runner-gateway/runner-model-invocation.js";
 import {
   modelCallPolicies,
+  RunPriority,
+  runPriorities,
   type ModelCallKind,
 } from "../../../src/model-tasks.js";
 import { CURRENT_RUNNER_CAPABILITIES } from "../test-support/runner-capabilities.js";
 import { createTestRunnerGateway } from "../test-support/runner-gateway.js";
+import { readyContextScope } from "../test-support/ready-context-view.js";
 import {
   acceptReadyConnection,
   defaultAgentPlacement,
@@ -232,6 +235,77 @@ describe("RunnerGateway model invocation", () => {
     },
   );
 
+  it("runs Memory on Antigravity on 0.67.0+ and gates older Computers to fallback or upgrade guidance", async () => {
+    const current = await connect(
+      {
+        ...invokingHello(),
+        daemon_version: "0.67.0",
+        runtimes: ["antigravity"],
+        runtime_diagnostics: runtimeDiagnostics({
+          ready: ["antigravity"],
+          link: "api",
+        }),
+      },
+      defaultAgentPlacement({
+        agentId: "agent-another-me",
+        runtime: { type: "antigravity" },
+      }),
+    );
+    try {
+      expect(
+        current.gateway.supportsModelInvoke("runner-local", "antigravity"),
+      ).toBe(true);
+      const pending = current.gateway.invokeModel(
+        "runner-local",
+        request({ runtimeType: "antigravity" }),
+      );
+      await vi.waitFor(() =>
+        expect(sentInvocations(current.peer)).toHaveLength(1),
+      );
+      expect(sentInvocations(current.peer)[0]).toMatchObject({
+        runtime_type: "antigravity",
+        mode: "structured",
+      });
+      await invoked(current.connection, sentInvocations(current.peer)[0]!);
+      await expect(pending).resolves.toMatchObject({
+        outcome: "completed",
+        text: '{"summary":"ok"}',
+      });
+    } finally {
+      current.connection.disconnect();
+    }
+
+    const legacy = await connect(
+      {
+        ...invokingHello(),
+        daemon_version: "0.66.0",
+        runtimes: ["antigravity"],
+        runtime_diagnostics: runtimeDiagnostics({
+          ready: ["antigravity"],
+          link: "api",
+        }),
+      },
+      defaultAgentPlacement({
+        agentId: "agent-another-me",
+        runtime: { type: "antigravity" },
+      }),
+    );
+    try {
+      expect(
+        legacy.gateway.supportsModelInvoke("runner-local", "antigravity"),
+      ).toBe(false);
+      await expect(
+        legacy.gateway.invokeModel(
+          "runner-local",
+          request({ runtimeType: "antigravity" }),
+        ),
+      ).rejects.toThrow(/Antigravity/);
+      expect(sentInvocations(legacy.peer)).toEqual([]);
+    } finally {
+      legacy.connection.disconnect();
+    }
+  });
+
   it("sends model.invoke and resolves with the Daemon's outcome", async () => {
     const { gateway, peer, connection } = await connect();
     try {
@@ -308,36 +382,96 @@ describe("RunnerGateway model invocation", () => {
     }
   });
 
-  it("starts a second call at once after calls kept answering as fast while others waited", async () => {
+  it("promotes concurrency after a silent background probe stays as fast, and aborts a probe when interactive work arrives", async () => {
     const { gateway, peer, connection } = await connect();
     try {
-      const results = Array.from({ length: 6 }, (_, i) =>
-        gateway.invokeModel(
-          "runner-local",
-          request({ input: `ask ${i}`, queue: queued("approval") }),
-        ),
-      );
       const usage = {
         input_tokens: 4_000,
         cached_input_tokens: 0,
         output_tokens: 100,
       };
-      for (let answered = 0; answered < 4; answered++) {
+      // Build the single-unit baseline with three background calls.
+      for (let i = 0; i < 3; i++) {
+        const pending = gateway.invokeModel(
+          "runner-local",
+          request({ input: `base ${i}`, queue: queued("memory") }),
+        );
         await vi.waitFor(() =>
-          expect(sentInvocations(peer)).toHaveLength(answered + 1),
+          expect(sentInvocations(peer)).toHaveLength(i + 1),
         );
         await invoked(
           connection,
-          sentInvocations(peer)[answered]!,
+          sentInvocations(peer)[i]!,
           "completed",
           usage,
         );
+        await pending;
       }
-      // Four answers at one place, as fast each time: the endpoint gets two.
+
+      // Two waiting background calls trigger a silent probe for two.
+      const probeA = gateway.invokeModel(
+        "runner-local",
+        request({ input: "probe A", queue: queued("memory") }),
+      );
+      const probeB = gateway.invokeModel(
+        "runner-local",
+        request({ input: "probe B", queue: queued("memory") }),
+      );
+      await vi.waitFor(() => expect(sentInvocations(peer)).toHaveLength(5));
+      const [cmdA, cmdB] = sentInvocations(peer).slice(3);
+
+      // Interactive work arriving mid-probe aborts it and yields both probing calls.
+      probeA.catch(() => undefined);
+      probeB.catch(() => undefined);
+      const ask = gateway.invokeModel(
+        "runner-local",
+        request({ input: "urgent ask", queue: queued("voice_ask") }),
+      );
+      await vi.waitFor(() => expect(sentCancels(peer)).toHaveLength(2));
+      expect(sentCancels(peer).map((cancel) => cancel.invoke_id)).toEqual(
+        expect.arrayContaining([cmdA!.invoke_id, cmdB!.invoke_id]),
+      );
+      await invoked(connection, cmdA!, "canceled");
+      await invoked(connection, cmdB!, "canceled");
+      await expect(probeA).rejects.toBeInstanceOf(
+        RunnerModelInvokeYieldedError,
+      );
+      await expect(probeB).rejects.toBeInstanceOf(
+        RunnerModelInvokeYieldedError,
+      );
       await vi.waitFor(() => expect(sentInvocations(peer)).toHaveLength(6));
-      for (const command of sentInvocations(peer).slice(4))
+      expect(sentInvocations(peer)[5]!.input).toBe("urgent ask");
+      await invoked(connection, sentInvocations(peer)[5]!, "completed", usage);
+      await ask;
+
+      // Once foreground work finishes, a clean background probe promotes to two.
+      const p1 = gateway.invokeModel(
+        "runner-local",
+        request({ input: "probe 1", queue: queued("memory") }),
+      );
+      const p2 = gateway.invokeModel(
+        "runner-local",
+        request({ input: "probe 2", queue: queued("memory") }),
+      );
+      await vi.waitFor(() => expect(sentInvocations(peer)).toHaveLength(8));
+      const [run1, run2] = sentInvocations(peer).slice(6);
+      await invoked(connection, run1!, "completed", usage);
+      await invoked(connection, run2!, "completed", usage);
+      await Promise.all([p1, p2]);
+
+      // Confirmed limit is now two: two interactive calls run at once.
+      const a1 = gateway.invokeModel(
+        "runner-local",
+        request({ input: "ask 1", queue: queued("approval") }),
+      );
+      const a2 = gateway.invokeModel(
+        "runner-local",
+        request({ input: "ask 2", queue: queued("approval") }),
+      );
+      await vi.waitFor(() => expect(sentInvocations(peer)).toHaveLength(10));
+      for (const command of sentInvocations(peer).slice(8))
         await invoked(connection, command, "completed", usage);
-      await expect(Promise.all(results)).resolves.toHaveLength(6);
+      await Promise.all([a1, a2]);
     } finally {
       connection.disconnect();
     }
@@ -389,6 +523,136 @@ describe("RunnerGateway model invocation", () => {
       connection.disconnect();
     }
   });
+
+  it.each([
+    { pending: [], claimPending: false, order: ["chat-run"] },
+    {
+      pending: ["task", "document"],
+      claimPending: false,
+      order: ["chat-run", "task", "document"],
+    },
+    {
+      pending: ["task", "routine"],
+      claimPending: false,
+      order: ["chat-run", "routine", "task"],
+    },
+    {
+      pending: ["task", "routine"],
+      claimPending: true,
+      order: ["routine", "chat-run", "task"],
+    },
+  ] as const)(
+    "dispatches $order with a pending chat claim of $claimPending",
+    async ({ pending, claimPending, order }) => {
+      const { gateway, peer, connection } = await connect();
+      const requests = new AbortController();
+      const starts = () =>
+        peer.sent.filter(
+          (command): command is OperationStart =>
+            command.type === "operation.start",
+        );
+      const finish = async (start: OperationStart) => {
+        await connection.receive(
+          event(start, 1, {
+            type: "operation.accepted",
+            command_id: start.command_id,
+            runner_pid: 100,
+          }),
+        );
+        await connection.receive(
+          event(start, 2, {
+            type: "operation.completed",
+            result: { type: "run", final_response: "done", session: {} },
+          }),
+        );
+      };
+      try {
+        const background = gateway.invokeModel(
+          "runner-local",
+          request({ signal: requests.signal }),
+        );
+        void background.catch(() => undefined);
+        await vi.waitFor(() => expect(sentInvocations(peer)).toHaveLength(1));
+
+        const target = sessionTarget();
+        const queuedRuns = new Map<
+          string,
+          ReturnType<typeof gateway.startOperation>
+        >();
+        for (const kind of pending) {
+          const runTarget = {
+            ...target,
+            ...readyContextScope(kind),
+            priority: new RunPriority(runPriorities[kind]),
+          };
+          const run = gateway.startOperation({
+            ...runTarget,
+            signal: requests.signal,
+            runKind: kind,
+            request: {
+              ...target.request,
+              run_context: { execution_run_ref: kind, source_inbox_ids: [] },
+            },
+          });
+          void run.catch(() => undefined);
+          queuedRuns.set(kind, run);
+        }
+        expect(starts()).toHaveLength(0);
+
+        const chatTarget = { ...target, ...readyContextScope("another-room") };
+        const capacityPermit = await gateway.acquireOperationCapacity(
+          chatTarget,
+          requests.signal,
+        );
+        const startChat = () => {
+          const chat = gateway.startOperation({
+            ...chatTarget,
+            capacityPermit,
+            runKind: "chat",
+            signal: requests.signal,
+            request: {
+              ...target.request,
+              run_context: {
+                execution_run_ref: "chat-run",
+                source_inbox_ids: [],
+              },
+            },
+          });
+          void chat.catch(() => undefined);
+          queuedRuns.set("chat-run", chat);
+        };
+        if (!claimPending) startChat();
+        const active = sentInvocations(peer)[0]!;
+        await vi.waitFor(() =>
+          expect(sentCancels(peer)).toEqual([
+            expect.objectContaining({
+              invoke_id: active.invoke_id,
+              reason: "scheduler_yield",
+            }),
+          ]),
+        );
+        expect(starts()).toHaveLength(0);
+
+        await invoked(connection, active, "canceled");
+        await expect(background).rejects.toBeInstanceOf(
+          RunnerModelInvokeYieldedError,
+        );
+        if (claimPending) startChat();
+        for (const [index, kind] of order.entries()) {
+          await vi.waitFor(() => expect(starts()).toHaveLength(index + 1));
+          expect(starts()[index]!.request.run_context.execution_run_ref).toBe(
+            kind,
+          );
+          const operation = await queuedRuns.get(kind)!;
+          await finish(starts()[index]!);
+          await operation.result;
+        }
+      } finally {
+        requests.abort();
+        connection.disconnect();
+      }
+    },
+  );
 
   it("keeps the answer of a background call that finished before its cancel", async () => {
     const { gateway, peer, connection } = await connect();
@@ -833,6 +1097,48 @@ describe("RunnerGateway model invocation", () => {
       await expect(pending).resolves.toMatchObject({ outcome: "completed" });
     } finally {
       connection.disconnect();
+    }
+  });
+
+  it("sends explicit model only to Computers at or above 0.62.0", async () => {
+    const current = await connect({
+      ...invokingHello(),
+      daemon_version: "0.62.0",
+    });
+    try {
+      const pending = current.gateway.invokeModel(
+        "runner-local",
+        request({ model: "gpt-5.4" }),
+      );
+      await vi.waitFor(() =>
+        expect(sentInvocations(current.peer)).toHaveLength(1),
+      );
+      const [command] = sentInvocations(current.peer);
+      expect(command!.model).toBe("gpt-5.4");
+      await invoked(current.connection, command!);
+      await expect(pending).resolves.toMatchObject({ outcome: "completed" });
+    } finally {
+      current.connection.disconnect();
+    }
+
+    const older = await connect({
+      ...invokingHello(),
+      daemon_version: "0.61.0",
+    });
+    try {
+      const pending = older.gateway.invokeModel(
+        "runner-local",
+        request({ model: "gpt-5.4" }),
+      );
+      await vi.waitFor(() =>
+        expect(sentInvocations(older.peer)).toHaveLength(1),
+      );
+      const [command] = sentInvocations(older.peer);
+      expect(command!.model).toBeUndefined();
+      await invoked(older.connection, command!);
+      await expect(pending).resolves.toMatchObject({ outcome: "completed" });
+    } finally {
+      older.connection.disconnect();
     }
   });
 

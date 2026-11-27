@@ -61,13 +61,9 @@ func (d *Daemon) handleOperationStart(ctx context.Context, stream transport.Stre
 	if d.runtimeCleanupUnconfirmed(command.RuntimeType) {
 		return d.finishFailure(ctx, stream, command, cleanupUnconfirmedCode, cleanupUnconfirmedMessage)
 	}
-	admittedCount, contextBusy := d.operationOccupancy(identity)
-	capacityExhausted := d.capacity != nil && admittedCount >= *d.capacity
+	_, contextBusy := d.operationOccupancy(identity)
 	if stopped {
 		return d.finishFailure(ctx, stream, command, operationCodeRunnerStopped, "Agent Runner is locally stopped")
-	}
-	if capacityExhausted {
-		return d.finishAdmissionBusy(ctx, stream, command, "Local Computer capacity is exhausted")
 	}
 	if contextBusy {
 		return d.finishAdmissionBusy(ctx, stream, command, "Context already has an active Operation")
@@ -94,7 +90,6 @@ func (d *Daemon) handleOperationStart(ctx context.Context, stream transport.Stre
 		}
 	}
 	active := &activeOperation{identity: identity, ctx: operationCtx, cancel: cancel}
-	spec.SessionMoved = func() { active.sessionMoved.Store(true) }
 	emitEvent := d.operationEventEmitter(command, identity, active)
 	if spec.OperationKind == "run.start" {
 		// Only run.start rewrites the per-run CLI files, after the Context
@@ -118,6 +113,15 @@ func (d *Daemon) handleOperationStart(ctx context.Context, stream transport.Stre
 		d.discardPreparedOperationAsync(prepared, "admission_failure")
 		return err
 	}
+	if prepared != nil {
+		prepared.suppressReceipt()
+	}
+	// Register before sending operation.accepted and releasing admissionMu so an
+	// immediate operation.cancel, drain, stop, or occupancy check triggered by
+	// the acceptance frame never misses the Operation.
+	d.activeMu.Lock()
+	d.activeOperations[command.OperationID] = active
+	d.activeMu.Unlock()
 	slog.Info("runner.operation.accepted", "operation_id", command.OperationID, "command_id", command.CommandID,
 		"runner_id", command.RunnerID, "agent_id", command.AgentID, "kind", command.OperationKind,
 		"accepted_at_unix_ms", time.Now().UnixMilli())
@@ -135,19 +139,16 @@ func (d *Daemon) handleOperationStart(ctx context.Context, stream transport.Stre
 	// any later event whose delivery fails. The Operation stays admitted and
 	// starts; the returned error reconnects, the next hello reports it active,
 	// and the Gateway's re-sent start replays the accepted event.
-	if prepared != nil {
-		prepared.suppressReceipt()
-	}
-	// Register before releasing admissionMu: drain, stop, capacity and Context
-	// occupancy must see this Operation from the moment it is accepted.
-	d.activeMu.Lock()
-	d.activeOperations[command.OperationID] = active
-	d.activeMu.Unlock()
 	acceptedRevision := d.authorityRevision
+	// Capture the welcomed feature flags before returning to the connection loop
+	// so a transient stream drop during gateway remount cannot downgrade an
+	// already-accepted Operation.
+	modelGatewayUnavailable := d.modelGatewayUnavailable.Load()
+	operationBackgroundWait := d.operationBackgroundWait.Load()
 	d.operationWG.Add(1)
 	go func() {
 		defer d.operationWG.Done()
-		d.startAcceptedOperation(operationCtx, command, spec, prepared, acceptedRevision, emitEvent, cancel)
+		d.startAcceptedOperation(operationCtx, command, spec, prepared, acceptedRevision, modelGatewayUnavailable, operationBackgroundWait, emitEvent, cancel)
 	}()
 	return acceptanceSendErr
 }

@@ -8,11 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/linger/control"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/linger/transport"
+	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/platform/privatefs"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider"
 )
 
@@ -32,10 +34,22 @@ func decodeJSON(t *testing.T, text string) map[string]any {
 	return value
 }
 
+func TestLoginAcceptsRetiredConcurrencyFlags(t *testing.T) {
+	for _, args := range [][]string{{"login", "--max-concurrent-runs", "2"}, {"login", "--no-max-concurrent-runs"}} {
+		t.Run(args[1], func(t *testing.T) {
+			f := newFixture(t)
+			if code := f.run(args...); code != 0 || len(f.setupOptions) != 1 {
+				t.Fatalf("login exit=%d stderr=%s", code, f.stderr.String())
+			}
+			contains(t, f.stderr.String(), "deprecated and ignored")
+		})
+	}
+}
+
 func TestLoginLimitsDiagnosticsAndSetupToTheEnabledRuntime(t *testing.T) {
 	f := newFixture(t)
 	var requested []string
-	f.deps.diagnoseRuntimes = func(_ context.Context, _, _ map[string]string, enabled []string) ([]runtimeDiagnostic, error) {
+	f.deps.diagnoseRuntimes = func(_ context.Context, _ runtimeRequest, enabled []string) ([]runtimeDiagnostic, error) {
 		requested = enabled
 		return onlyRuntime("codex"), nil
 	}
@@ -49,7 +63,7 @@ func TestLoginLimitsDiagnosticsAndSetupToTheEnabledRuntime(t *testing.T) {
 
 func TestLoginConnectsWithOnlySelectedPiAbsent(t *testing.T) {
 	f := newFixture(t)
-	f.deps.diagnoseRuntimes = func(context.Context, map[string]string, map[string]string, []string) ([]runtimeDiagnostic, error) {
+	f.deps.diagnoseRuntimes = func(context.Context, runtimeRequest, []string) ([]runtimeDiagnostic, error) {
 		return onlyRuntime("pi"), nil
 	}
 	if code := f.run("login", "--enabled-runtime", "pi"); code != 0 {
@@ -62,7 +76,7 @@ func TestLoginConnectsWithOnlySelectedPiAbsent(t *testing.T) {
 
 func TestLoginPreservesAnUnselectedExecutableOverride(t *testing.T) {
 	f := newFixture(t)
-	f.deps.diagnoseRuntimes = func(context.Context, map[string]string, map[string]string, []string) ([]runtimeDiagnostic, error) {
+	f.deps.diagnoseRuntimes = func(context.Context, runtimeRequest, []string) ([]runtimeDiagnostic, error) {
 		return onlyRuntime("codex"), nil
 	}
 	selected, other := filepath.Join(f.root, "selected-codex"), filepath.Join(f.root, "unselected-claude")
@@ -76,13 +90,13 @@ func TestLoginPreservesAnUnselectedExecutableOverride(t *testing.T) {
 
 func TestLoginRejectsMissingSelectedExecutableAndEmptyDiscovery(t *testing.T) {
 	f := newFixture(t)
-	f.deps.diagnoseRuntimes = func(context.Context, map[string]string, map[string]string, []string) ([]runtimeDiagnostic, error) {
+	f.deps.diagnoseRuntimes = func(context.Context, runtimeRequest, []string) ([]runtimeDiagnostic, error) {
 		return onlyRuntime("pi"), nil
 	}
 	if code := f.run("login", "--enabled-runtime", "pi", "--pi-path", filepath.Join(f.root, "missing-pi")); code != 14 {
 		t.Fatalf("explicit missing executable exit=%d", code)
 	}
-	f.deps.diagnoseRuntimes = func(context.Context, map[string]string, map[string]string, []string) ([]runtimeDiagnostic, error) {
+	f.deps.diagnoseRuntimes = func(context.Context, runtimeRequest, []string) ([]runtimeDiagnostic, error) {
 		return nil, nil
 	}
 	if code := f.run("login", "--enabled-runtime", "pi"); code != 13 {
@@ -95,7 +109,7 @@ func TestLoginRejectsMissingSelectedExecutableAndEmptyDiscovery(t *testing.T) {
 
 func TestLoginConnectsBeforeRuntimeInstallation(t *testing.T) {
 	f := newFixture(t)
-	f.deps.diagnoseRuntimes = func(context.Context, map[string]string, map[string]string, []string) ([]runtimeDiagnostic, error) {
+	f.deps.diagnoseRuntimes = func(context.Context, runtimeRequest, []string) ([]runtimeDiagnostic, error) {
 		var absent []runtimeDiagnostic
 		for _, runtimeType := range runtimeTypes {
 			absent = append(absent, runtimeDiagnostic{Type: runtimeType, Status: "not_installed", ErrorMessage: "Runtime executable not found"})
@@ -123,7 +137,7 @@ func TestLoginMapsTokenInputAndRuntimeOverrides(t *testing.T) {
 	claudePath := filepath.Join(f.root, "bin", "claude")
 	f.stdin = "  linger-connect-v1.payload\n"
 	code := f.run("login", "--config", f.configPath, "--gateway-url", "wss://gateway.example.test/v1/runner-gateway",
-		"--max-concurrent-runs", "4", "--token-stdin", "--codex-path", codexPath, "--claude-path", claudePath)
+		"--token-stdin", "--codex-path", codexPath, "--claude-path", claudePath)
 	if code != 0 {
 		t.Fatalf("exit=%d stderr=%s", code, f.stderr.String())
 	}
@@ -133,7 +147,7 @@ func TestLoginMapsTokenInputAndRuntimeOverrides(t *testing.T) {
 	}
 	options := f.setupOptions[0]
 	if options.configPath != f.configPath || options.stateDirectory != filepath.Join(f.root, "state") ||
-		options.gatewayURL != "wss://gateway.example.test/v1/runner-gateway" || options.maxRuns == nil || *options.maxRuns != 4 ||
+		options.gatewayURL != "wss://gateway.example.test/v1/runner-gateway" ||
 		options.serverToken != "linger-connect-v1.payload" || !reflect.DeepEqual(options.runtimePaths, want) {
 		t.Fatalf("setup=%+v", options)
 	}
@@ -170,31 +184,6 @@ func TestLoginRejectsTokensInArgumentsAndRemovedTokenInputs(t *testing.T) {
 	}
 	if len(f.setupOptions) != 0 {
 		t.Fatal("setup ran")
-	}
-}
-
-func TestLoginRunLimitOptions(t *testing.T) {
-	f := newFixture(t)
-	if code := f.run("login", "--no-max-concurrent-runs", "--config", f.configPath); code != 0 {
-		t.Fatalf("exit=%d", code)
-	}
-	if options := f.setupOptions[0]; !options.maxRunsSet || options.maxRuns != nil {
-		t.Fatalf("clear limit=%+v", options)
-	}
-	for _, limit := range []string{"0", "101", "1.5"} {
-		f.clear()
-		if code := f.run("login", "--max-concurrent-runs", limit); code != 2 {
-			t.Fatalf("limit %s exit=%d", limit, code)
-		}
-		contains(t, f.stderr.String(), "--max-concurrent-runs must be an integer between 1 and 100")
-	}
-	f.clear()
-	if code := f.run("login", "--max-concurrent-runs", "3", "--no-max-concurrent-runs"); code != 2 {
-		t.Fatalf("conflict exit=%d", code)
-	}
-	contains(t, f.stderr.String(), "Use only one of --max-concurrent-runs or --no-max-concurrent-runs")
-	if len(f.setupOptions) != 1 {
-		t.Fatalf("setup runs=%d", len(f.setupOptions))
 	}
 }
 
@@ -385,7 +374,7 @@ func TestDaemonStatusJSONKeepsItsShape(t *testing.T) {
 	}
 	got := decodeJSON(t, f.stdout.String())
 	want := decodeJSON(t, `{"version":1,"config":{"configured":true,"path":`+quote(f.configPath)+`},
-		"daemon":{"state":"running","pid":42,"computer_id":"computer-local","gateway_state":"connecting","reconciled":false,"active_operations":0,"active_runners":1,"capacity":2},
+		"daemon":{"state":"running","pid":42,"computer_id":"computer-local","gateway_state":"connecting","reconciled":false,"active_operations":0,"active_runners":1},
 		"runtimes":[{"type":"codex","status":"ready","version":"1.2.3"}],
 		"runners":[{"agent_id":"agent-a","state":"running","pid":84}]}`)
 	if !reflect.DeepEqual(got, want) {
@@ -579,6 +568,108 @@ func TestRuntimeCheckUsesConfiguredPathsAndCodexHome(t *testing.T) {
 	}
 }
 
+func TestDoctorAndRuntimeCheckForwardValidatedStateTempBase(t *testing.T) {
+	t.Run("valid_private_state_directory", func(t *testing.T) {
+		f := newFixture(t)
+		stateDir := filepath.Join(f.root, "state")
+		if err := privatefs.EnsureDir(stateDir); err != nil {
+			t.Fatal(err)
+		}
+		wantTempBase := filepath.Join(stateDir, "operation-tmp")
+
+		var doctorReq runtimeRequest
+		f.deps.diagnoseRuntimes = func(_ context.Context, request runtimeRequest, _ []string) ([]runtimeDiagnostic, error) {
+			doctorReq = request
+			return runtimeFixtures(request.configuredPaths), nil
+		}
+		if code := f.run("doctor", "--json", "--config", f.configPath); code != 0 {
+			t.Fatalf("doctor exit=%d stdout=%s stderr=%s", code, f.stdout.String(), f.stderr.String())
+		}
+		if doctorReq.tempBase != wantTempBase {
+			t.Fatalf("doctor tempBase = %q, want %q", doctorReq.tempBase, wantTempBase)
+		}
+
+		var checkReq runtimeRequest
+		f.deps.checkRuntime = func(_ context.Context, runtimeType string, request runtimeRequest) (runtimeCheck, error) {
+			checkReq = request
+			return runtimeCheck{diagnostic: onlyRuntime(runtimeType)[0]}, nil
+		}
+		f.clear()
+		if code := f.run("runtime", "check", "codex", "--config", f.configPath); code != 0 {
+			t.Fatalf("runtime check exit=%d stdout=%s stderr=%s", code, f.stdout.String(), f.stderr.String())
+		}
+		if checkReq.tempBase != wantTempBase {
+			t.Fatalf("runtime check tempBase = %q, want %q", checkReq.tempBase, wantTempBase)
+		}
+	})
+
+	t.Run("missing_state_directory_omits_temp_base", func(t *testing.T) {
+		f := newFixture(t)
+		if err := os.RemoveAll(filepath.Join(f.root, "state")); err != nil {
+			t.Fatal(err)
+		}
+		doctorReq := runtimeRequest{tempBase: "sentinel"}
+		f.deps.diagnoseRuntimes = func(_ context.Context, request runtimeRequest, _ []string) ([]runtimeDiagnostic, error) {
+			doctorReq = request
+			return runtimeFixtures(request.configuredPaths), nil
+		}
+		_ = f.run("doctor", "--json", "--config", f.configPath)
+		if doctorReq.tempBase != "" {
+			t.Fatalf("doctor tempBase = %q, want empty when state directory is missing", doctorReq.tempBase)
+		}
+
+		checkReq := runtimeRequest{tempBase: "sentinel"}
+		f.deps.checkRuntime = func(_ context.Context, runtimeType string, request runtimeRequest) (runtimeCheck, error) {
+			checkReq = request
+			return runtimeCheck{diagnostic: onlyRuntime(runtimeType)[0]}, nil
+		}
+		f.clear()
+		_ = f.run("runtime", "check", "codex", "--config", f.configPath)
+		if checkReq.tempBase != "" {
+			t.Fatalf("runtime check tempBase = %q, want empty when state directory is missing", checkReq.tempBase)
+		}
+	})
+
+	t.Run("unsafe_state_directory_omits_temp_base", func(t *testing.T) {
+		f := newFixture(t)
+		stateDir := filepath.Join(f.root, "state")
+		if runtime.GOOS == "windows" {
+			// Replace the directory with a regular file so privatefs.CheckPath
+			// rejects it deterministically on Windows without touching ACLs.
+			if err := os.RemoveAll(stateDir); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(stateDir, []byte("not-a-dir"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			if err := os.Chmod(stateDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		doctorReq := runtimeRequest{tempBase: "sentinel"}
+		f.deps.diagnoseRuntimes = func(_ context.Context, request runtimeRequest, _ []string) ([]runtimeDiagnostic, error) {
+			doctorReq = request
+			return runtimeFixtures(request.configuredPaths), nil
+		}
+		_ = f.run("doctor", "--json", "--config", f.configPath)
+		if doctorReq.tempBase != "" {
+			t.Fatalf("doctor tempBase = %q, want empty when state directory fails privatefs check", doctorReq.tempBase)
+		}
+
+		checkReq := runtimeRequest{tempBase: "sentinel"}
+		f.deps.checkRuntime = func(_ context.Context, runtimeType string, request runtimeRequest) (runtimeCheck, error) {
+			checkReq = request
+			return runtimeCheck{diagnostic: onlyRuntime(runtimeType)[0]}, nil
+		}
+		f.clear()
+		_ = f.run("runtime", "check", "codex", "--config", f.configPath)
+		if checkReq.tempBase != "" {
+			t.Fatalf("runtime check tempBase = %q, want empty when state directory fails privatefs check", checkReq.tempBase)
+		}
+	})
+}
+
 func TestAuthStatusShowsTheSavedAuthorization(t *testing.T) {
 	f := newFixture(t)
 	f.deps.environment["LINGER_WEB_URL"] = "https://app.example.test"
@@ -657,7 +748,7 @@ func TestDoctorFailures(t *testing.T) {
 	f = newFixture(t)
 	f.writeConfig(map[string]any{"enabled_runtimes": []any{}})
 	probed := false
-	f.deps.diagnoseRuntimes = func(context.Context, map[string]string, map[string]string, []string) ([]runtimeDiagnostic, error) {
+	f.deps.diagnoseRuntimes = func(context.Context, runtimeRequest, []string) ([]runtimeDiagnostic, error) {
 		probed = true
 		return nil, nil
 	}
@@ -669,8 +760,8 @@ func TestDoctorFailures(t *testing.T) {
 	codexHome := filepath.Join(f.root, "custom-codex")
 	f.writeConfig(map[string]any{"codex": map[string]any{"auth_file": filepath.Join(codexHome, "auth.json")}, "credential_expires_at": "2026-01-01T00:00:00.000Z"})
 	var environment map[string]string
-	f.deps.diagnoseRuntimes = func(_ context.Context, _ map[string]string, probeEnvironment map[string]string, _ []string) ([]runtimeDiagnostic, error) {
-		environment = probeEnvironment
+	f.deps.diagnoseRuntimes = func(_ context.Context, request runtimeRequest, _ []string) ([]runtimeDiagnostic, error) {
+		environment = request.environment
 		diagnostics := runtimeFixtures(nil)
 		diagnostics[0].Status, diagnostics[0].ErrorMessage = "authentication_required", "Codex authentication is required"
 		return diagnostics, nil

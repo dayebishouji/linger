@@ -16,6 +16,9 @@ import path from "node:path";
 import iconPng from "../../resources/icon.png";
 // The Linger logo with its wordmark, for the page header.
 import logoPng from "../../resources/logo-horizontal.png";
+import claudeSvg from "../../resources/harnesses/claude.svg";
+import codexSvg from "../../resources/harnesses/codex.svg";
+import piSvg from "../../resources/harnesses/pi.svg";
 // The installer's welcome scene, so setup looks like the installer.
 import scenePng from "../../../linger-installer/public/onboarding/welcome-scene.png";
 // The SPA's typeface, so the setup page reads like the app it opens.
@@ -26,6 +29,8 @@ import { offlineMessages } from "../shell/offline.messages.js";
 import setupHtml from "../shell/setup.html";
 import { setupMessages } from "../shell/setup.messages.js";
 import {
+  NVIDIA_DRIVER_DOWNLOAD_URL,
+  NVIDIA_DRIVER_GUIDE_URL,
   SETUP_IPC,
   type SetupCommand,
   type SetupLocalAccount,
@@ -34,6 +39,7 @@ import {
 import { appWindow } from "./app-window.js";
 import { dialogMessages } from "./dialogs.messages.js";
 import type { DiagnosticsModule } from "./diagnostics.js";
+import type { DriverUpdaterHost } from "./driver-updater.js";
 import type { EnrollmentModule } from "./enrollment.js";
 import type { LanguageModule } from "./language.js";
 import type { LocalServerModule } from "./local-server.js";
@@ -53,17 +59,24 @@ export interface SetupWindowOptions {
   readonly preload: string;
   readonly version: string;
   readonly defaultDisplayName: string;
-  // Open on start; set when this computer is not connected yet.
-  readonly show: boolean;
+  // Open on start; set when this computer is not connected yet. Accepts a
+  // predicate so recovery during LocalServer.start() is observed before show.
+  readonly show: boolean | (() => boolean);
   readonly loginItem: {
     get(): boolean;
     set(on: boolean): void;
   };
   // macOS only.
   readonly permissions?: MacPermissions;
+  readonly driverUpdater?: DriverUpdaterHost;
 }
 
 const SETUP_URL = "app://setup/";
+const HARNESS_ICONS: Readonly<Record<string, Uint8Array>> = {
+  "/harness-claude.svg": claudeSvg,
+  "/harness-codex.svg": codexSvg,
+  "/harness-pi.svg": piSvg,
+};
 // Its own session: the setup page never sees the server's cookies.
 const PARTITION = "linger-setup";
 
@@ -86,6 +99,10 @@ export class SetupWindowModule implements Module {
   #signedIn = false;
   // The runtime's sign-in was waiting on the browser.
   #runtimeSigningIn = false;
+  // Re-check local models when returning from NVIDIA App or a driver download.
+  #driverUpdatePendingRecheck = false;
+  #lastDriverAutoRecheckAt = 0;
+  #lastLocationSpaceRefreshAt = 0;
   #permissions: PermissionStatuses | undefined;
   #diagnostics: SetupState["diagnostics"];
   #account: SetupAccount | undefined;
@@ -114,10 +131,12 @@ export class SetupWindowModule implements Module {
     };
     ipcMain.handle(SETUP_IPC.state, async (event) => {
       fromSetup(event);
+      this.#lastLocationSpaceRefreshAt = Date.now();
       await Promise.all([
         this.#refreshSignedIn(),
         this.#refreshPermissions(),
         this.#refreshAccount(),
+        local.refreshLocationSpace(),
       ]);
       return this.#state();
     });
@@ -150,6 +169,12 @@ export class SetupWindowModule implements Module {
       () => pages.protocol.unhandle("app"),
       ctx.bus.on("computer.changed", push),
       ctx.bus.on("diagnostics.changed", push),
+      ctx.bus.on("driver-update.changed", () => {
+        push();
+        if (this.#options.driverUpdater?.installState().phase === "completed") {
+          ctx.get<LocalServerModule>("LocalServer").recheck();
+        }
+      }),
       ctx.bus.on("power.changed", push),
       ctx.bus.on("grants.changed", push),
       ctx.bus.on("local-server.changed", onLocal),
@@ -157,7 +182,11 @@ export class SetupWindowModule implements Module {
       ctx.bus.on("server.moved", onCookie),
       ctx.bus.on("setup.open", () => this.show()),
     );
-    if (this.#options.show) this.show();
+    const show =
+      typeof this.#options.show === "function"
+        ? this.#options.show()
+        : this.#options.show;
+    if (show) this.show();
   }
 
   async stop(): Promise<void> {
@@ -215,14 +244,19 @@ export class SetupWindowModule implements Module {
     contents.setWindowOpenHandler(() => ({ action: "deny" }));
     contents.on("will-attach-webview", (event) => event.preventDefault());
     window.once("ready-to-show", () => window.show());
-    // Back from System Settings: show what changed there.
-    window.on(
-      "focus",
-      () => void this.#refreshPermissions().then(() => this.#push()),
-    );
+    // Back from System Settings, a driver updater, or freeing disk space:
+    // show what changed there.
+    window.on("focus", () => {
+      void this.#refreshPermissions().then(() => this.#push());
+      this.#maybeRecheckDriverOnFocus();
+      this.#maybeRefreshLocationSpaceOnFocus();
+    });
     window.on("closed", () => {
       if (this.#window === window) this.#window = undefined;
       this.#account?.hide();
+      // Idle background pre-staging and Bifrost pre-fetch stop when setup
+      // closes before Install is started.
+      this.#ctx?.get<LocalServerModule>("LocalServer").cancelPrestage();
       // A report waiting on this page's consent would block other sends.
       const sender = this.#ctx?.get<DiagnosticsModule>("Diagnostics").sender;
       if (sender?.state().phase === "confirm") void sender.cancel();
@@ -248,7 +282,37 @@ export class SetupWindowModule implements Module {
         await this.#refreshSignedIn();
         return;
       case "external.open":
+        if (
+          command.url === NVIDIA_DRIVER_DOWNLOAD_URL ||
+          command.url === NVIDIA_DRIVER_GUIDE_URL
+        ) {
+          this.#driverUpdatePendingRecheck = true;
+        }
         await shell.openExternal(command.url);
+        return;
+      case "driver.open-nvidia-app": {
+        this.#driverUpdatePendingRecheck = true;
+        const result = await this.#options.driverUpdater?.openNvidiaApp();
+        if (!result?.ok) {
+          await shell.openExternal(NVIDIA_DRIVER_DOWNLOAD_URL);
+        }
+        return;
+      }
+      case "driver.start-install": {
+        this.#driverUpdatePendingRecheck = true;
+        const local = ctx.get<LocalServerModule>("LocalServer");
+        const models = local.status().localModels;
+        const gpuName = models.state === "checked" ? models.gpu : undefined;
+        await this.#options.driverUpdater?.startInstall({
+          ...(gpuName ? { gpuName } : {}),
+          ...(command.requiredCuda
+            ? { requiredCuda: command.requiredCuda }
+            : {}),
+        });
+        return;
+      }
+      case "driver.clear-state":
+        this.#options.driverUpdater?.clearInstallState();
         return;
       case "local.start": {
         const local = ctx.get<LocalServerModule>("LocalServer");
@@ -416,6 +480,17 @@ export class SetupWindowModule implements Module {
         this.#account?.view(),
       ),
       ...(this.#diagnostics ? { diagnostics: this.#diagnostics } : {}),
+      ...(this.#options.driverUpdater
+        ? {
+            driverUpdate: {
+              nvidiaApp: this.#options.driverUpdater.capabilities().nvidiaApp,
+              directInstallSupported:
+                this.#options.driverUpdater.capabilities()
+                  .directInstallSupported,
+              installState: this.#options.driverUpdater.installState(),
+            },
+          }
+        : {}),
       ...(diagnostics.uploadUrl()
         ? { diagnosticsSend: diagnostics.sender.state() }
         : {}),
@@ -446,6 +521,46 @@ export class SetupWindowModule implements Module {
     }
   }
 
+  #maybeRecheckDriverOnFocus(): void {
+    if (!this.#driverUpdatePendingRecheck) return;
+    const local = this.#ctx?.get<LocalServerModule>("LocalServer");
+    if (!local) return;
+    const models = local.status().localModels;
+    const driverBlocked =
+      models.state === "checked" &&
+      Boolean(models.blockedNow) &&
+      Boolean(
+        models.reasons?.some(
+          (reason) =>
+            reason.code === "cuda-driver-update-required" ||
+            reason.code === "cuda-driver-version-unknown",
+        ),
+      );
+    if (!driverBlocked) {
+      this.#driverUpdatePendingRecheck = false;
+      return;
+    }
+    const now = Date.now();
+    if (now - this.#lastDriverAutoRecheckAt < 3000) return;
+    this.#lastDriverAutoRecheckAt = now;
+    local.recheck();
+  }
+
+  #maybeRefreshLocationSpaceOnFocus(): void {
+    const local = this.#ctx?.get<LocalServerModule>("LocalServer");
+    if (!local) return;
+    const status = local.status();
+    if (
+      !status.available ||
+      (status.phase !== "idle" && status.phase !== "failed")
+    )
+      return;
+    const now = Date.now();
+    if (now - this.#lastLocationSpaceRefreshAt < 2000) return;
+    this.#lastLocationSpaceRefreshAt = now;
+    void local.refreshLocationSpace();
+  }
+
   #push(): void {
     const contents = this.#window?.webContents;
     if (contents && !contents.isDestroyed())
@@ -470,6 +585,11 @@ export class SetupWindowModule implements Module {
     if (url.pathname === "/geist.woff2")
       return new Response(Buffer.from(geistWoff2), {
         headers: { "content-type": "font/woff2" },
+      });
+    const harnessSvg = HARNESS_ICONS[url.pathname];
+    if (harnessSvg)
+      return new Response(Buffer.from(harnessSvg), {
+        headers: { "content-type": "image/svg+xml" },
       });
     // In the language of the moment it opens; the Web client, where the
     // language is chosen, is not on screen while setup is.
@@ -498,6 +618,7 @@ const localServerState = (
     step,
     progress,
     transfer,
+    waiting,
     attempt,
     localModels,
     location,
@@ -507,6 +628,7 @@ const localServerState = (
     byokModels,
     legacyBackup,
     refusal,
+    failure,
   } = local.status();
   const home = os.homedir();
   const shown = (folder: string) =>
@@ -522,11 +644,15 @@ const localServerState = (
     step,
     progress,
     ...(transfer ? { transfer } : {}),
+    ...(waiting ? { waiting } : {}),
     attempt,
     localModels,
     location: {
       ...location,
       path: shown(location.path),
+      ...(location.rejectedPath
+        ? { rejectedPath: shown(location.rejectedPath) }
+        : {}),
     },
     keys,
     ...(signIn ? { signIn } : {}),
@@ -534,6 +660,7 @@ const localServerState = (
     ...(byokModels ? { byokModels } : {}),
     ...(legacyBackup ? { legacyBackup: shown(legacyBackup) } : {}),
     ...(refusal ? { refusal } : {}),
+    ...(failure ? { failure } : {}),
     ...(account ? { account } : {}),
   };
 };

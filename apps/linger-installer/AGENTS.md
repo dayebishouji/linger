@@ -22,7 +22,15 @@ A closed native sign-in input reports failure without stopping the installer;
 retry starts a new owned login process.
 A start returns the instance's running or queued job; a job that finished its
 run and waits for the person (`waiting_user`, e.g. `LOCAL_MODELS_UNAVAILABLE`)
-is canceled and replaced, so Try Again checks the computer again.
+is canceled and replaced, so Try Again checks the computer again. A start that
+names another choice (`setupChoice`, or BYOK for another runtime) than the
+active job's is the person's latest choice: it cancels that job (stopping a
+local model download chosen before, which the manager keeps running after the
+desktop quits) and runs once it has ended. The start answers at once with the
+new `queued` job: the earlier job may be in a step that only stops at its end
+(services, account, computer), which can take minutes, so the new job waits for
+it in the background and shutdown or a cancel stops it before it runs. A start
+without a choice follows the active job.
 An idle desktop-owned manager steps aside when the desktop relaunches the same
 instance with another checkout. Every installation runs natively from the
 source checkout `--source-repo` names. Start failures print their real cause
@@ -50,9 +58,11 @@ services when the instance's `user.env` no longer
 matches the configuration they started with, or when `--source-repo` names
 another checkout than the instance's. An instance follows a new checkout only
 once its services are ready on it: until then `instance.json` keeps naming the
-checkout they run from, the new checkout's migrations run only after the
-runtime (the local model, for one) is ready, and a run that stops earlier
-leaves the running services and their schema as they were. A successful
+checkout they run from, the new checkout's migrations run only after blocking
+runtime checks are ready (while degraded-tolerant local-model and BYOK recovery
+starts eagerly in the background alongside `release`, `migrate`, and service
+startup and is awaited before local-stack preparation), and a run that
+stops earlier leaves the running services and their schema as they were. A successful
 outcome's `details.source` names the checkout the services serve from, and
 `details.origin` the origin they serve at, which the run moves when another
 program took the web port. A local model stack whose saved binding is no longer ready and whose saved plan
@@ -67,24 +77,21 @@ person approved is ever applied, and a stack still not ready ends
 `LOCAL_MODELS_RECOVERY_REQUIRED` with the binding's reason codes in
 `details.reasons` (exposed on jobs as `errorReasons`) and any upstream stack
 guard or plan error code in `details.causeCode` (exposed on jobs as
-`errorCauseCode`). When the services already run, a setup whose
-Computer uses the local model source (`model-source.json` says `local`, or does
-not exist yet on a `local-models` setup) has its stack and saved library model
-checked (`restoreLocalModels`), since a quit stops the models but not the
-services: a stack that is not ready gets the same restore, an unloaded saved
-local model (`localmodels/` or `localmodels-library/`) is reloaded, and the local source is applied again;
-if that restore fails or throws (or a same-checkout cold resume cannot prepare
-the local model stack or reload its saved library model), the failure is logged
-and reported in the ready outcome's `details.localModelsDegraded` without
-failing the resume, so the person can still reach the workspace and the Models
-page. Resource-choice mismatches omit stale binding reason codes so Quick
-Install still triggers a replan. Both same-version resume (`restoreLocalModels`)
-and version upgrades from the saved setup choice leave the stack stopped when
-`model-source.json` was switched to `subscription` or `byok`; a saved BYOK
-source gets its Bifrost gateway mounted again from the saved configuration
-unless it already answers (`restoreByokSource`), and a failure is logged and
-reported in the ready outcome's `details.byokGateway` without failing the
-resume; the Computer mounts it again before the next Run on it.
+`errorCauseCode`). When the services already run, resume mounts a saved BYOK
+gateway first (`restoreByokSource`, since `source apply --mode byok` unloads
+local models before mounting BYOK) and then restores any local stack and
+previously loaded library models (`restoreLocalModels`), reporting any BYOK
+failure in `details.byokGateway`, any local-model failure in
+`details.localModelsDegraded`, and any reloaded models or revived stack in
+`details.localModelsRestored` / `details.restoredLocalModels` without failing
+the resume or letting a failure in one block restoring the other, so the person
+can still reach the workspace and the Models page. Resource-choice mismatches
+omit stale binding reason codes so Quick Install still triggers a replan. Both
+same-version resume and version upgrades from the saved setup choice leave the
+Quick Install stack stopped when `model-source.json` was switched to
+`subscription` or `byok` while still restoring any library models that were
+loaded before quit, crash, reboot, or upgrade stop (without switching
+`model-source.json`).
 A failed installation records the stage that caused it, even when native
 checkout preparation and runtime setup ran in parallel. A BYOK mount failure
 belongs to runtime and keeps the redacted provider error in the job.
@@ -99,10 +106,29 @@ the desktop's Computer follows them. The HTTP lookup writes one JSON line to
 stderr, `{"event":"installer.runtime_lookup_timings","instance",...,"timings"}`,
 whose `timings` holds `config`, `runtime`, `localModels`, `tool` and `total`
 in ms; the `--resume` outcome carries the same object as
-`runtimeLookupTimings` whenever the lookup ran. The desktop logs both at info
-as `local_server.installer_runtime_timings`, keyed on that event name and
-field shape, which are its contract. The route's response body does not carry
-these timings.
+`runtimeLookupTimings` whenever the lookup ran, plus `resumeTimings`
+(`path`, `probeMs`, optional `restoreLocalModelsMs` / `restoreByokGatewayMs` /
+`coldStartMs`, and `totalMs`), and logs `Resume timings (<path>, ms): ...`
+on stderr. The desktop logs `runtimeLookupTimings` (from both the HTTP lookup
+stderr event and `--resume`) at info as `local_server.installer_runtime_timings`,
+keyed on that event name and field shape, and logs `resumeTimings` at info as
+`local_server.installer_resume_timings`. The route's response body does not
+carry these timings.
+
+A desktop-owned install uses the selected runtime descriptor to return the
+paths on its live completed job and emits the same timings event. Listing jobs
+and reloading saved jobs omit the runtime so a later setup reads current paths.
+When the handoff fails, the job still succeeds without `runtime`, stderr gets
+one `{"event":"installer.runtime_handoff_failed","instance","message"}` line,
+and the desktop falls back to `GET /api/instances/{name}/runtime`.
+
+`GET /api/instances/{name}/runtime` runs one lookup per instance at a time
+(`runtime-lookup.ts`): a second request joins the running one, and a finished
+answer is kept for 10 minutes, so a desktop that stopped waiting picks up the
+late result on Try Again or its next launch instead of starting the lookup
+over. Starting or finishing an install, or saving a runtime key, forgets it.
+The runtime descriptors an install inspected answer the lookup in place of a
+second status probe, as on the resume path.
 
 `--stop` (with `--instance`) is the desktop uninstall's and Windows setup's: it stops the
 manager the desktop started for that instance (its `/api/stop` cancels a
@@ -111,7 +137,8 @@ JSON line with what failed. It needs nothing beside `installer.js`, so
 setup can run it from a copy on an earlier release's `Linger.exe`. It also
 stops what the pinned localmodels kit runs for each home: the model
 library's running loads (cancelled) and loaded models, the model controller, and the stack with its
-gateway (`stopLocalmodels`).
+gateway (`stopLocalmodels`), forwards `options.log` into `stopNativeSource`,
+and logs durations for the `manager`, `services`, and `localmodels` stop stages.
 
 `--stop-local-models` is the desktop's quit: in the default home and the
 location `desktop/local-server.json` names, it cancels the model library's
@@ -130,7 +157,19 @@ A missing pinned kit has nothing to stop.
 
 `--inspect` checks without migrating installations. Its optional
 `--inspect-target` selects the home whose disk and runtimes are checked;
-`--home` still owns the inspection tool cache and state.
+`--home` still owns the inspection tool cache and state. When `--home` fails
+Windows private-path validation, `--inspect` reports the `WINDOWS_PRIVATE_PATH_UNSAFE`
+code on stderr and writes `{ error, refusal }` on stdout before exiting nonzero.
+
+`--prepare-voice-tools --home <dir> --instance <name>` is the detached
+background worker spawned on cold first installs without voice provider keys
+(skipping legacy migration), wired explicitly by `serve` through
+`createVoiceToolsBackgroundLauncher(fileURLToPath(import.meta.url))`. It
+listens on stdin for `"go\n"` vs `"abort\n"`/EOF while extracting and verifying
+the bundled voice tools, cancels in-flight extraction on abort/EOF, and on
+`"go\n"` acquires `withInstanceLock(instance)` (waiting boundedly on
+`INSTANCE_BUSY`), checks that both `postgres` and `teamhub` are running and
+`livekit` is not yet running, and starts LiveKit.
 
 Every other mode first converts an install from before the rename to Linger
 (`migrateLegacyInstallation`); `--migrate` does only that and exits, for the
@@ -139,10 +178,14 @@ installer, and the next start tries again. Only `--migrate` reports them: a
 warning naming each and why on stderr, and one JSON line
 `{"skipped":[{instance,reason}]}` on stdout. Other modes stay silent, so a
 warning is never taken for the reason a start failed, and refuse a skipped
-instance when they open it. Fresh native installs overlap `migrate`,
-`services`, and `account` with `runtime` while holding `services`/`account`
-completion until both branches succeed; upgrades and live re-runs keep `migrate`
-sequential after `runtime`.
+instance when they open it. Fresh native installs and same-checkout cold resumes
+overlap `migrate`, `services`, and `account` with `runtime` while holding
+`services`/`account` completion until both branches succeed; upgrades and live
+re-runs keep blocking `runtime` checks and `migrate` sequential first, then
+overlap foundation and gateway preparation with service startup after
+`bindLiveKit()`, while degraded-tolerant local-model/BYOK recovery starts
+eagerly in the background alongside `release`, `migrate`, and `services` on both
+paths and is awaited before local-stack preparation (and drained on abort).
 
 Run `make check-installer`; verify UI process behavior with an isolated
 browser context and retain masked evidence. Never stop a user's existing stack

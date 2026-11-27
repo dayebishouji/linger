@@ -49,7 +49,7 @@ export function RemoveComputerDialog({
   error?: Error | null;
   onClose: () => void;
   onConfirm: () => void;
-  onConnect: () => void;
+  onConnect?: () => void;
   pending: boolean;
   tenantId: string;
 }) {
@@ -164,9 +164,11 @@ export function RemoveComputerDialog({
             role="status"
           >
             <p>{t(computersMessages.noOtherComputer)}</p>
-            <Button onClick={onConnect} size="compact">
-              {t(computerSetupMessages.title)}
-            </Button>
+            {onConnect ? (
+              <Button onClick={onConnect} size="compact">
+                {t(computerSetupMessages.title)}
+              </Button>
+            ) : null}
           </div>
         ) : null}
         {rows.length ? (
@@ -174,7 +176,7 @@ export function RemoveComputerDialog({
             <h3 className="text-xs font-medium text-muted-foreground">
               {t(computersMessages.assignedAgentsMoveFirst)}
             </h3>
-            <ul className="mt-1 divide-y divide-border">
+            <ul className="mt-1">
               {plans.map(({ hint, options, row }) => (
                 <RemoveComputerAgentRow
                   agent={row}

@@ -69,15 +69,6 @@ func pinParents(path string) (func(), error) {
 		parent = next
 	}
 	handles := []windows.Handle{}
-	// One walk reads the Codex sandbox principals at most once, and only when
-	// an ancestor grants replace rights to an otherwise untrusted SID.
-	var sandbox map[string]bool
-	sandboxSIDs := func() map[string]bool {
-		if sandbox == nil {
-			sandbox = codexSandboxSIDs()
-		}
-		return sandbox
-	}
 	closeAll := func() {
 		for i := len(handles) - 1; i >= 0; i-- {
 			_ = windows.CloseHandle(handles[i])
@@ -89,7 +80,7 @@ func pinParents(path string) (func(), error) {
 			closeAll()
 			return nil, err
 		}
-		handle, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+		handle, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 		if err != nil {
 			closeAll()
 			return nil, &os.PathError{Op: "open private ancestor", Path: paths[i], Err: err}
@@ -102,15 +93,7 @@ func pinParents(path string) (func(), error) {
 		}
 		if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
 			closeAll()
-			return nil, errors.New("private path has an unsafe ancestor")
-		}
-		sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
-		if err == nil {
-			err = validateAncestorDescriptor(sd, filepath.Dir(paths[i]) == paths[i], sandboxSIDs)
-		}
-		if err != nil {
-			closeAll()
-			return nil, fmt.Errorf("unsafe private path ancestor: %w", err)
+			return nil, fmt.Errorf("private path has an unsafe ancestor (%s)", paths[i])
 		}
 	}
 	return closeAll, nil
@@ -156,10 +139,9 @@ func validateHandle(file *os.File, kind string, ownerOnly bool) error {
 // privateOwner reports whether owner may own the current user's private path:
 // the user, or BUILTIN\Administrators when the user is an administrator. That
 // group owns what an elevated process creates (Run as administrator, the
-// built-in Administrator). It is already trusted on every ancestor and in
-// private ACLs, and an administrator can take ownership of any file, so
-// accepting it trusts no other account. Git for Windows decides ownership the
-// same way.
+// built-in Administrator), and an administrator can take ownership of any
+// file, so accepting it trusts no other account. Git for Windows decides
+// ownership the same way.
 func privateOwner(owner, user *windows.SID) bool {
 	return owner != nil && (windows.EqualSid(owner, user) ||
 		owner.IsWellKnown(windows.WinBuiltinAdministratorsSid) && currentUserIsAdministrator())
@@ -228,75 +210,6 @@ func validateDescriptor(sd *windows.SECURITY_DESCRIPTOR, ownerOnly bool) error {
 		}
 	}
 	return nil
-}
-
-// Ancestors need not be private, but another account must not be able to
-// replace an existing component. The default C:\ ACL allows creating new
-// directories; that does not grant removal or replacement of an owned child.
-func validateAncestorDescriptor(sd *windows.SECURITY_DESCRIPTOR, volumeRoot bool, sandboxSIDs func() map[string]bool) error {
-	user, err := CurrentSID()
-	if err != nil {
-		return err
-	}
-	trusted := func(sid *windows.SID) bool {
-		return sid != nil && (windows.EqualSid(sid, user) || sid.IsWellKnown(windows.WinLocalSystemSid) || sid.IsWellKnown(windows.WinBuiltinAdministratorsSid) ||
-			sid.String() == "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464") // Windows TrustedInstaller
-	}
-	owner, _, err := sd.Owner()
-	if err != nil || !trusted(owner) {
-		return errors.New("ancestor is owned by another user")
-	}
-	dacl, _, err := sd.DACL()
-	if err != nil || dacl == nil {
-		return errors.New("ancestor has no access restriction")
-	}
-	for index := uint32(0); index < uint32(dacl.AceCount); index++ {
-		var ace *windows.ACCESS_ALLOWED_ACE
-		if err := windows.GetAce(dacl, index, &ace); err != nil {
-			return err
-		}
-		if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 || ace.Header.AceType == windows.ACCESS_DENIED_ACE_TYPE {
-			continue
-		}
-		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
-			return errors.New("ancestor has an unsupported permission entry")
-		}
-		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
-		const fileDeleteChild = 0x0040
-		replaceMask := windows.ACCESS_MASK(windows.GENERIC_ALL | windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER | fileDeleteChild)
-		// The volume root cannot itself be removed or renamed. Its default ACL
-		// grants DELETE to authenticated users, but not FILE_DELETE_CHILD.
-		// Keep rejecting permission changes and child replacement at the root.
-		if volumeRoot {
-			replaceMask &^= windows.DELETE
-		}
-		if trusted(sid) || ace.Mask&replaceMask == 0 {
-			continue
-		}
-		if !sandboxSIDs()[sid.String()] {
-			return fmt.Errorf("ancestor permits another user (%s) to replace private paths", sid.String())
-		}
-	}
-	return nil
-}
-
-// codexSandboxSIDs returns the principals the Codex Windows sandbox grants on
-// its writable roots: the sandbox users group and the capability SIDs Codex
-// records in its default home. Linger accepts that a sandboxed Codex command
-// may replace an ancestor such as AppData; private paths themselves stay
-// owner-only.
-func codexSandboxSIDs() map[string]bool {
-	sids := map[string]bool{}
-	profile, err := windows.GetCurrentProcessToken().GetUserProfileDirectory()
-	if err == nil {
-		if data, err := os.ReadFile(filepath.Join(profile, ".codex", "cap_sid")); err == nil {
-			sids = parseCodexCapSIDs(data)
-		}
-	}
-	if sid, _, _, err := windows.LookupSID("", "CodexSandboxUsers"); err == nil {
-		sids[sid.String()] = true
-	}
-	return sids
 }
 
 func CheckPath(path, kind string, ownerOnly bool) error {
@@ -368,6 +281,9 @@ func EnsureDir(path string) error {
 		return err
 	}
 	defer file.Close()
+	if validateHandle(file, "directory", true) == nil {
+		return nil
+	}
 	var info windows.ByHandleFileInformation
 	if err := windows.GetFileInformationByHandle(windows.Handle(file.Fd()), &info); err != nil {
 		return err
@@ -416,18 +332,18 @@ func ProtectDirectory(path string) error {
 			continue
 		}
 		file := filepath.Join(path, entry.Name())
-		if err := protectFile(file); err != nil {
+		if err := ProtectFile(file); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("%s: %w", file, err)
 		}
 	}
 	return nil
 }
 
-func protectFile(path string) error {
+// ProtectFile tightens an existing regular file owned by the current user to a
+// protected owner-only DACL. Reparse points, directories, hard-linked files,
+// and files owned by another user are refused without modification.
+func ProtectFile(path string) error {
 	file, err := openHandle(path, windows.FILE_READ_ATTRIBUTES|windows.WRITE_DAC, windows.OPEN_EXISTING, nil)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
 	if err != nil {
 		return err
 	}
@@ -435,7 +351,18 @@ func protectFile(path string) error {
 	if validateHandle(file, "file", true) == nil {
 		return nil
 	}
-	sd, err := windows.GetSecurityInfo(windows.Handle(file.Fd()), windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	handle := windows.Handle(file.Fd())
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
+		return err
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return errors.New("private path is a reparse point")
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 || info.NumberOfLinks != 1 {
+		return errors.New("private path type or link count is unsafe")
+	}
+	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
 	if err != nil {
 		return err
 	}
@@ -452,7 +379,7 @@ func protectFile(path string) error {
 	if err != nil {
 		return err
 	}
-	if err := windows.SetSecurityInfo(windows.Handle(file.Fd()), windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
 		return fmt.Errorf("protect private file: %w", err)
 	}
 	return validateHandle(file, "file", true)

@@ -92,39 +92,6 @@ func (e AgentNoticeFieldChangeField) Valid() bool {
 	}
 }
 
-// Defines values for AgentReasoningEffort.
-const (
-	AgentReasoningEffortHigh   AgentReasoningEffort = "high"
-	AgentReasoningEffortLow    AgentReasoningEffort = "low"
-	AgentReasoningEffortMax    AgentReasoningEffort = "max"
-	AgentReasoningEffortMedium AgentReasoningEffort = "medium"
-	AgentReasoningEffortNone   AgentReasoningEffort = "none"
-	AgentReasoningEffortUltra  AgentReasoningEffort = "ultra"
-	AgentReasoningEffortXhigh  AgentReasoningEffort = "xhigh"
-)
-
-// Valid indicates whether the value is a known member of the AgentReasoningEffort enum.
-func (e AgentReasoningEffort) Valid() bool {
-	switch e {
-	case AgentReasoningEffortHigh:
-		return true
-	case AgentReasoningEffortLow:
-		return true
-	case AgentReasoningEffortMax:
-		return true
-	case AgentReasoningEffortMedium:
-		return true
-	case AgentReasoningEffortNone:
-		return true
-	case AgentReasoningEffortUltra:
-		return true
-	case AgentReasoningEffortXhigh:
-		return true
-	default:
-		return false
-	}
-}
-
 // Defines values for AgentRuntimeActivityContentBlockFormat.
 const (
 	AgentRuntimeActivityContentBlockFormatCode AgentRuntimeActivityContentBlockFormat = "code"
@@ -234,6 +201,7 @@ const (
 	AgentRuntimeExecutionFailureCodeExecutionOutcomeUnknown AgentRuntimeExecutionFailureCode = "execution_outcome_unknown"
 	AgentRuntimeExecutionFailureCodeInterrupted             AgentRuntimeExecutionFailureCode = "interrupted"
 	AgentRuntimeExecutionFailureCodeLocalModelUnavailable   AgentRuntimeExecutionFailureCode = "local_model_unavailable"
+	AgentRuntimeExecutionFailureCodeModelGatewayUnavailable AgentRuntimeExecutionFailureCode = "model_gateway_unavailable"
 	AgentRuntimeExecutionFailureCodeModelNotOffered         AgentRuntimeExecutionFailureCode = "model_not_offered"
 	AgentRuntimeExecutionFailureCodeModelServiceError       AgentRuntimeExecutionFailureCode = "model_service_error"
 	AgentRuntimeExecutionFailureCodeModelUnavailable        AgentRuntimeExecutionFailureCode = "model_unavailable"
@@ -266,6 +234,8 @@ func (e AgentRuntimeExecutionFailureCode) Valid() bool {
 	case AgentRuntimeExecutionFailureCodeInterrupted:
 		return true
 	case AgentRuntimeExecutionFailureCodeLocalModelUnavailable:
+		return true
+	case AgentRuntimeExecutionFailureCodeModelGatewayUnavailable:
 		return true
 	case AgentRuntimeExecutionFailureCodeModelNotOffered:
 		return true
@@ -394,9 +364,10 @@ func (e AgentRuntimeStoppedStatusChangedEventOutcome) Valid() bool {
 
 // Defines values for AgentRuntimeWorkingStatusChangedEventStatus.
 const (
-	AgentRuntimeWorkingStatusChangedEventStatusQueued   AgentRuntimeWorkingStatusChangedEventStatus = "queued"
-	AgentRuntimeWorkingStatusChangedEventStatusThinking AgentRuntimeWorkingStatusChangedEventStatus = "thinking"
-	AgentRuntimeWorkingStatusChangedEventStatusWorking  AgentRuntimeWorkingStatusChangedEventStatus = "working"
+	AgentRuntimeWorkingStatusChangedEventStatusQueued            AgentRuntimeWorkingStatusChangedEventStatus = "queued"
+	AgentRuntimeWorkingStatusChangedEventStatusThinking          AgentRuntimeWorkingStatusChangedEventStatus = "thinking"
+	AgentRuntimeWorkingStatusChangedEventStatusWaitingBackground AgentRuntimeWorkingStatusChangedEventStatus = "waiting_background"
+	AgentRuntimeWorkingStatusChangedEventStatusWorking           AgentRuntimeWorkingStatusChangedEventStatus = "working"
 )
 
 // Valid indicates whether the value is a known member of the AgentRuntimeWorkingStatusChangedEventStatus enum.
@@ -406,79 +377,9 @@ func (e AgentRuntimeWorkingStatusChangedEventStatus) Valid() bool {
 		return true
 	case AgentRuntimeWorkingStatusChangedEventStatusThinking:
 		return true
+	case AgentRuntimeWorkingStatusChangedEventStatusWaitingBackground:
+		return true
 	case AgentRuntimeWorkingStatusChangedEventStatusWorking:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for AgentTemplateOrigin.
-const (
-	Builtin   AgentTemplateOrigin = "builtin"
-	Published AgentTemplateOrigin = "published"
-)
-
-// Valid indicates whether the value is a known member of the AgentTemplateOrigin enum.
-func (e AgentTemplateOrigin) Valid() bool {
-	switch e {
-	case Builtin:
-		return true
-	case Published:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for AgentTemplateRoutineCreatedByRole.
-const (
-	AgentTemplateRoutineCreatedByRoleAgent AgentTemplateRoutineCreatedByRole = "agent"
-	AgentTemplateRoutineCreatedByRoleHuman AgentTemplateRoutineCreatedByRole = "human"
-)
-
-// Valid indicates whether the value is a known member of the AgentTemplateRoutineCreatedByRole enum.
-func (e AgentTemplateRoutineCreatedByRole) Valid() bool {
-	switch e {
-	case AgentTemplateRoutineCreatedByRoleAgent:
-		return true
-	case AgentTemplateRoutineCreatedByRoleHuman:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for AgentTemplateRoutineMentionRole.
-const (
-	AgentTemplateRoutineMentionRoleAgent AgentTemplateRoutineMentionRole = "agent"
-)
-
-// Valid indicates whether the value is a known member of the AgentTemplateRoutineMentionRole enum.
-func (e AgentTemplateRoutineMentionRole) Valid() bool {
-	switch e {
-	case AgentTemplateRoutineMentionRoleAgent:
-		return true
-	default:
-		return false
-	}
-}
-
-// Defines values for AgentTemplateSkillImportStatus.
-const (
-	AgentTemplateSkillImportStatusImportable  AgentTemplateSkillImportStatus = "importable"
-	AgentTemplateSkillImportStatusImported    AgentTemplateSkillImportStatus = "imported"
-	AgentTemplateSkillImportStatusUnavailable AgentTemplateSkillImportStatus = "unavailable"
-)
-
-// Valid indicates whether the value is a known member of the AgentTemplateSkillImportStatus enum.
-func (e AgentTemplateSkillImportStatus) Valid() bool {
-	switch e {
-	case AgentTemplateSkillImportStatusImportable:
-		return true
-	case AgentTemplateSkillImportStatusImported:
-		return true
-	case AgentTemplateSkillImportStatusUnavailable:
 		return true
 	default:
 		return false
@@ -539,6 +440,33 @@ func (e AnotherMeBackgroundFailureReason) Valid() bool {
 	case AnotherMeBackgroundFailureReasonRuntimeUnavailable:
 		return true
 	case AnotherMeBackgroundFailureReasonUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for AnotherMePlacementBlockerReason.
+const (
+	ComputerUpgradeRequired  AnotherMePlacementBlockerReason = "computer_upgrade_required"
+	CreateFailed             AnotherMePlacementBlockerReason = "create_failed"
+	NoOnlineComputer         AnotherMePlacementBlockerReason = "no_online_computer"
+	NoReadyRuntimeWithModels AnotherMePlacementBlockerReason = "no_ready_runtime_with_models"
+	NoWritableWorkspaceGrant AnotherMePlacementBlockerReason = "no_writable_workspace_grant"
+)
+
+// Valid indicates whether the value is a known member of the AnotherMePlacementBlockerReason enum.
+func (e AnotherMePlacementBlockerReason) Valid() bool {
+	switch e {
+	case ComputerUpgradeRequired:
+		return true
+	case CreateFailed:
+		return true
+	case NoOnlineComputer:
+		return true
+	case NoReadyRuntimeWithModels:
+		return true
+	case NoWritableWorkspaceGrant:
 		return true
 	default:
 		return false
@@ -1830,6 +1758,7 @@ const (
 	ExternalConnectionReauthorizationErrorCodeDuplicateRemotePrincipal ExternalConnectionReauthorizationErrorCode = "duplicate_remote_principal"
 	ExternalConnectionReauthorizationErrorCodeIdentityMismatch         ExternalConnectionReauthorizationErrorCode = "identity_mismatch"
 	ExternalConnectionReauthorizationErrorCodeInternalError            ExternalConnectionReauthorizationErrorCode = "internal_error"
+	ExternalConnectionReauthorizationErrorCodeProviderAuthFailed       ExternalConnectionReauthorizationErrorCode = "provider_auth_failed"
 	ExternalConnectionReauthorizationErrorCodeStaleRevision            ExternalConnectionReauthorizationErrorCode = "stale_revision"
 )
 
@@ -1845,6 +1774,8 @@ func (e ExternalConnectionReauthorizationErrorCode) Valid() bool {
 	case ExternalConnectionReauthorizationErrorCodeIdentityMismatch:
 		return true
 	case ExternalConnectionReauthorizationErrorCodeInternalError:
+		return true
+	case ExternalConnectionReauthorizationErrorCodeProviderAuthFailed:
 		return true
 	case ExternalConnectionReauthorizationErrorCodeStaleRevision:
 		return true
@@ -2684,6 +2615,7 @@ func (e LocalModelsViewUnavailableReasonCode) Valid() bool {
 // Defines values for LocalRuntimeDiagnosticErrorCode.
 const (
 	LocalRuntimeDiagnosticErrorCodeLOCALCOMPUTEROFFLINE          LocalRuntimeDiagnosticErrorCode = "LOCAL_COMPUTER_OFFLINE"
+	LocalRuntimeDiagnosticErrorCodeLOCALCOMPUTERUPGRADEREQUIRED  LocalRuntimeDiagnosticErrorCode = "LOCAL_COMPUTER_UPGRADE_REQUIRED"
 	LocalRuntimeDiagnosticErrorCodeRUNTIMEAUTHENTICATIONREQUIRED LocalRuntimeDiagnosticErrorCode = "RUNTIME_AUTHENTICATION_REQUIRED"
 	LocalRuntimeDiagnosticErrorCodeRUNTIMEDIAGNOSTICFAILED       LocalRuntimeDiagnosticErrorCode = "RUNTIME_DIAGNOSTIC_FAILED"
 	LocalRuntimeDiagnosticErrorCodeRUNTIMEINCOMPATIBLE           LocalRuntimeDiagnosticErrorCode = "RUNTIME_INCOMPATIBLE"
@@ -2694,6 +2626,8 @@ const (
 func (e LocalRuntimeDiagnosticErrorCode) Valid() bool {
 	switch e {
 	case LocalRuntimeDiagnosticErrorCodeLOCALCOMPUTEROFFLINE:
+		return true
+	case LocalRuntimeDiagnosticErrorCodeLOCALCOMPUTERUPGRADEREQUIRED:
 		return true
 	case LocalRuntimeDiagnosticErrorCodeRUNTIMEAUTHENTICATIONREQUIRED:
 		return true
@@ -4046,6 +3980,27 @@ func (e UnifiedDocumentStatus) Valid() bool {
 	}
 }
 
+// Defines values for UrlPreviewFramingFraming.
+const (
+	UrlPreviewFramingFramingAllowed UrlPreviewFramingFraming = "allowed"
+	UrlPreviewFramingFramingRefused UrlPreviewFramingFraming = "refused"
+	UrlPreviewFramingFramingUnknown UrlPreviewFramingFraming = "unknown"
+)
+
+// Valid indicates whether the value is a known member of the UrlPreviewFramingFraming enum.
+func (e UrlPreviewFramingFraming) Valid() bool {
+	switch e {
+	case UrlPreviewFramingFramingAllowed:
+		return true
+	case UrlPreviewFramingFramingRefused:
+		return true
+	case UrlPreviewFramingFramingUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for VoiceCaptureTranscriptRecoveryStatus.
 const (
 	VoiceCaptureTranscriptRecoveryStatusFailed    VoiceCaptureTranscriptRecoveryStatus = "failed"
@@ -4823,6 +4778,24 @@ func (e ListWorkItemsParamsScope) Valid() bool {
 	}
 }
 
+// Defines values for GetUrlPreviewFramingParamsPageScheme.
+const (
+	Http  GetUrlPreviewFramingParamsPageScheme = "http"
+	Https GetUrlPreviewFramingParamsPageScheme = "https"
+)
+
+// Valid indicates whether the value is a known member of the GetUrlPreviewFramingParamsPageScheme enum.
+func (e GetUrlPreviewFramingParamsPageScheme) Valid() bool {
+	switch e {
+	case Http:
+		return true
+	case Https:
+		return true
+	default:
+		return false
+	}
+}
+
 // Account defines model for Account.
 type Account struct {
 	// CreatedAt UTC timestamp in RFC 3339 format with an explicit offset.
@@ -4973,7 +4946,7 @@ type AgentProfileChangedNotice struct {
 }
 
 // AgentReasoningEffort defines model for AgentReasoningEffort.
-type AgentReasoningEffort string
+type AgentReasoningEffort = string
 
 // AgentRunStatusChangedPayload An Agent Run shown in this Room changed status or committed Runtime presentation events. Clients fetch events after their last ordinal up to run.event_ordinal.
 type AgentRunStatusChangedPayload struct {
@@ -5038,11 +5011,14 @@ type AgentRuntimeConfig struct {
 	ReasoningEffort *AgentReasoningEffort  `json:"reasoning_effort,omitempty"`
 }
 
-// AgentRuntimeExecutionFailure Public classified failure; contains no native error text, paths, credentials, or task input. Each code is set where the failure is observed, from structured signals only. model_unavailable means the model service refused the selected model for the Runtime's account, so the Agent needs another model or another sign-in. model_not_offered means the Agent's Computer does not offer the selected model for its Runtime, or the model does not support the selected reasoning effort, so the Runtime could not start; the Agent needs a model and reasoning effort that Computer offers. local_model_unavailable means the Agent's Computer could not load the Agent's local model (not enough free memory, not fully downloaded, or loading took too long), so the Runtime did not start; the person can manage it on the Computer's Models page or choose another model. context_too_long means the conversation no longer fits the model's context window. model_service_error means the model service reported a server-side error. timeout means the Runtime hit its local execution deadline. execution_outcome_unknown means a command was dispatched but no validated exit was observed before unexpected transport or Runtime failure. Intentional cancellation, authorization loss or unavailability, and normal retirement do not create this classification. Authorization loss or unavailability includes explicit revocation, authorization checks that fail or time out, and authorization expiry. This code does not currently cover unknown effects caused by control-plane disconnection. It remains a failed Run and must not be automatically replayed; verify its effects before starting another Run. reply_undelivered means a Room Run finished, but every message the Agent tried to post failed, so the Room received no reply from it. reply_not_sent means a Room Run finished without trying to post anything while a Human who mentioned the Agent waited for its reply; the Runtime ended the turn in text nobody sees, which is not posted for it. interrupted means the Run stopped before it finished for a reason other than a user cancellation, such as a restart or a Runner stopped on its Computer; part of its work may have taken effect and it is not replayed. computer_unavailable means the Agent's Computer could not run it: the Computer is unreachable, the Agent's Runner is stopped there, or the Runtime is not enabled. cleanup_unconfirmed means the Runtime process could not be confirmed stopped. response_too_large means the reply exceeded the Room's size limit. unclassified means no structured signal identified the cause. runtime_type is present when the failure belongs to a selected Runtime; it is absent for failures the Agent Service or TeamHub observes without one.
+// AgentRuntimeExecutionFailure Public classified failure; contains no credentials, raw secrets, or task input. Each code is set where the failure is observed, from structured signals only. detail is an optional redacted, single-line diagnostic summary for Activity display. model_unavailable means the model service refused the selected model for the Runtime's account, so the Agent needs another model or another sign-in. model_not_offered means the Agent's Computer does not offer the selected model for its Runtime, or the model does not support the selected reasoning effort, so the Runtime could not start; the Agent needs a model and reasoning effort that Computer offers. local_model_unavailable means the Agent's Computer could not load the Agent's local model (not enough free memory, not fully downloaded, or loading took too long), so the Runtime did not start; the person can manage it on the Computer's Models page or choose another model. model_gateway_unavailable means the Agent's Computer could not start or reach its local model gateway (such as Bifrost for BYOK), so the Runtime did not start; the person can check the Computer's Models page or Local Computer diagnostics before retrying. context_too_long means the conversation no longer fits the model's context window. model_service_error means the model service reported a server-side error. timeout means the Runtime hit its local execution deadline. execution_outcome_unknown means a command was dispatched but no validated exit was observed before unexpected transport or Runtime failure. Intentional cancellation, authorization loss or unavailability, and normal retirement do not create this classification. Authorization loss or unavailability includes explicit revocation, authorization checks that fail or time out, and authorization expiry. This code does not currently cover unknown effects caused by control-plane disconnection. It remains a failed Run and must not be automatically replayed; verify its effects before starting another Run. reply_undelivered means a Room Run finished while a Human who mentioned the Agent waited for its reply, every message write the Agent tried to post failed, and no reply reached the Room. reply_not_sent means a Room Run finished while a Human who mentioned the Agent waited for its reply and no reply reached the Room without any failed message write attempt (for instance, the Runtime ended the turn in text nobody sees, which is not posted for it). interrupted means the Run stopped before it finished for a reason other than a user cancellation, such as a restart or a Runner stopped on its Computer; part of its work may have taken effect and it is not replayed. computer_unavailable means the Agent's Computer could not run it: the Computer is unreachable, the Agent's Runner is stopped there, or the Runtime is not enabled. cleanup_unconfirmed means the Runtime process could not be confirmed stopped. response_too_large means the reply exceeded the Room's size limit. unclassified means no structured signal identified the cause. runtime_type is present when the failure belongs to a selected Runtime; it is absent for failures the Agent Service or TeamHub observes without one.
 type AgentRuntimeExecutionFailure struct {
-	Code           AgentRuntimeExecutionFailureCode `json:"code"`
-	RuntimeType    *LocalRuntimeType                `json:"runtime_type,omitempty"`
-	RuntimeVersion *string                          `json:"runtime_version,omitempty"`
+	Code AgentRuntimeExecutionFailureCode `json:"code"`
+
+	// Detail Optional redacted, single-line diagnostic detail explaining why the Run failed, for display in the Activity log. Must contain no credentials or control characters.
+	Detail         *string           `json:"detail,omitempty"`
+	RuntimeType    *LocalRuntimeType `json:"runtime_type,omitempty"`
+	RuntimeVersion *string           `json:"runtime_version,omitempty"`
 }
 
 // AgentRuntimeExecutionFailureCode defines model for AgentRuntimeExecutionFailure.Code.
@@ -5107,7 +5083,7 @@ type AgentRuntimePresentationOutputCreatedEventSurface string
 
 // AgentRuntimeStoppedStatusChangedEvent defines model for AgentRuntimeStoppedStatusChangedEvent.
 type AgentRuntimeStoppedStatusChangedEvent struct {
-	// Failure Public classified failure; contains no native error text, paths, credentials, or task input. Each code is set where the failure is observed, from structured signals only. model_unavailable means the model service refused the selected model for the Runtime's account, so the Agent needs another model or another sign-in. model_not_offered means the Agent's Computer does not offer the selected model for its Runtime, or the model does not support the selected reasoning effort, so the Runtime could not start; the Agent needs a model and reasoning effort that Computer offers. local_model_unavailable means the Agent's Computer could not load the Agent's local model (not enough free memory, not fully downloaded, or loading took too long), so the Runtime did not start; the person can manage it on the Computer's Models page or choose another model. context_too_long means the conversation no longer fits the model's context window. model_service_error means the model service reported a server-side error. timeout means the Runtime hit its local execution deadline. execution_outcome_unknown means a command was dispatched but no validated exit was observed before unexpected transport or Runtime failure. Intentional cancellation, authorization loss or unavailability, and normal retirement do not create this classification. Authorization loss or unavailability includes explicit revocation, authorization checks that fail or time out, and authorization expiry. This code does not currently cover unknown effects caused by control-plane disconnection. It remains a failed Run and must not be automatically replayed; verify its effects before starting another Run. reply_undelivered means a Room Run finished, but every message the Agent tried to post failed, so the Room received no reply from it. reply_not_sent means a Room Run finished without trying to post anything while a Human who mentioned the Agent waited for its reply; the Runtime ended the turn in text nobody sees, which is not posted for it. interrupted means the Run stopped before it finished for a reason other than a user cancellation, such as a restart or a Runner stopped on its Computer; part of its work may have taken effect and it is not replayed. computer_unavailable means the Agent's Computer could not run it: the Computer is unreachable, the Agent's Runner is stopped there, or the Runtime is not enabled. cleanup_unconfirmed means the Runtime process could not be confirmed stopped. response_too_large means the reply exceeded the Room's size limit. unclassified means no structured signal identified the cause. runtime_type is present when the failure belongs to a selected Runtime; it is absent for failures the Agent Service or TeamHub observes without one.
+	// Failure Public classified failure; contains no credentials, raw secrets, or task input. Each code is set where the failure is observed, from structured signals only. detail is an optional redacted, single-line diagnostic summary for Activity display. model_unavailable means the model service refused the selected model for the Runtime's account, so the Agent needs another model or another sign-in. model_not_offered means the Agent's Computer does not offer the selected model for its Runtime, or the model does not support the selected reasoning effort, so the Runtime could not start; the Agent needs a model and reasoning effort that Computer offers. local_model_unavailable means the Agent's Computer could not load the Agent's local model (not enough free memory, not fully downloaded, or loading took too long), so the Runtime did not start; the person can manage it on the Computer's Models page or choose another model. model_gateway_unavailable means the Agent's Computer could not start or reach its local model gateway (such as Bifrost for BYOK), so the Runtime did not start; the person can check the Computer's Models page or Local Computer diagnostics before retrying. context_too_long means the conversation no longer fits the model's context window. model_service_error means the model service reported a server-side error. timeout means the Runtime hit its local execution deadline. execution_outcome_unknown means a command was dispatched but no validated exit was observed before unexpected transport or Runtime failure. Intentional cancellation, authorization loss or unavailability, and normal retirement do not create this classification. Authorization loss or unavailability includes explicit revocation, authorization checks that fail or time out, and authorization expiry. This code does not currently cover unknown effects caused by control-plane disconnection. It remains a failed Run and must not be automatically replayed; verify its effects before starting another Run. reply_undelivered means a Room Run finished while a Human who mentioned the Agent waited for its reply, every message write the Agent tried to post failed, and no reply reached the Room. reply_not_sent means a Room Run finished while a Human who mentioned the Agent waited for its reply and no reply reached the Room without any failed message write attempt (for instance, the Runtime ended the turn in text nobody sees, which is not posted for it). interrupted means the Run stopped before it finished for a reason other than a user cancellation, such as a restart or a Runner stopped on its Computer; part of its work may have taken effect and it is not replayed. computer_unavailable means the Agent's Computer could not run it: the Computer is unreachable, the Agent's Runner is stopped there, or the Runtime is not enabled. cleanup_unconfirmed means the Runtime process could not be confirmed stopped. response_too_large means the reply exceeded the Room's size limit. unclassified means no structured signal identified the cause. runtime_type is present when the failure belongs to a selected Runtime; it is absent for failures the Agent Service or TeamHub observes without one.
 	Failure *AgentRuntimeExecutionFailure                `json:"failure,omitempty"`
 	Outcome AgentRuntimeStoppedStatusChangedEventOutcome `json:"outcome"`
 	Status  string                                       `json:"status"`
@@ -5124,7 +5100,7 @@ type AgentRuntimeStoppedStatusChangedEventOutcome string
 type AgentRuntimeWorkingStatusChangedEvent struct {
 	Status AgentRuntimeWorkingStatusChangedEventStatus `json:"status"`
 
-	// Title Optional public queue label for queued, or the full provider-visible reasoning summary title for thinking. Omit for working; raw reasoning is never allowed.
+	// Title Optional public queue label for queued, or the full provider-visible reasoning summary title for thinking. Omit for working and waiting_background; raw reasoning is never allowed.
 	Title *string `json:"title,omitempty"`
 	Type  string  `json:"type"`
 }
@@ -5202,112 +5178,22 @@ type AgentSkillRegistration struct {
 	SkillId SkillIdentifier `json:"skill_id"`
 }
 
-// AgentTemplate A reusable Agent definition. It carries identity text, instructions, Routines, and the exact Skill and Connector selections. Runtime provider, model, reasoning effort, and placement are Agent deployment facts and never belong to a template.
-type AgentTemplate struct {
-	// AvatarKey Product avatar selection carried with the template. Clients that do not know the key fall back to their own default.
-	AvatarKey *string `json:"avatar_key,omitempty"`
-
-	// ConnectorBindings Connected App keys this Agent used, carried so a consumer knows what to authorize. A template never carries a connection, account, credential, or token: the consumer grants access from their own connected accounts after the Agent exists.
-	ConnectorBindings []ExternalAppKey `json:"connector_bindings"`
-
-	// CreatedAt UTC timestamp in RFC 3339 format with an explicit offset.
-	CreatedAt    Timestamp `json:"created_at"`
-	Description  string    `json:"description"`
-	Instructions string    `json:"instructions"`
-	Name         string    `json:"name"`
-
-	// Origin builtin templates ship with the deployment and belong to no Tenant. published templates are Human-published and are visible to every Tenant in the deployment.
-	Origin      AgentTemplateOrigin `json:"origin"`
-	PublishedBy *ActorRef           `json:"published_by,omitempty"`
-
-	// Routines Fixed snapshots of all Routines in the publisher's direct Room with the source Agent. Copied automatically into the new Agent's direct Room with its Sponsor.
-	Routines      []AgentTemplateRoutine   `json:"routines"`
-	SkillBindings []AgentSkillRegistration `json:"skill_bindings"`
-
-	// TemplateId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
-	TemplateId Id `json:"template_id"`
-
-	// UpdatedAt UTC timestamp in RFC 3339 format with an explicit offset.
-	UpdatedAt Timestamp `json:"updated_at"`
-}
-
-// AgentTemplateOrigin builtin templates ship with the deployment and belong to no Tenant. published templates are Human-published and are visible to every Tenant in the deployment.
-type AgentTemplateOrigin string
-
-// AgentTemplatePage defines model for AgentTemplatePage.
-type AgentTemplatePage struct {
-	Items []AgentTemplate `json:"items"`
-}
-
-// AgentTemplatePublishRequest Publishes one reusable definition to the deployment-wide template market. Skill references are stored exactly as given and are resolved against the consuming Tenant catalog when an Agent is created. Publishing shares the referenced Skill versions: a consumer may copy a version private to the publisher into their own Tenant through importAgentTemplateSkills. A reference that can be neither bound nor copied is skipped rather than rejected here. Connector references name Apps only; no connection, credential, or account of the publisher is ever carried.
-type AgentTemplatePublishRequest struct {
-	AvatarKey *string `json:"avatar_key,omitempty"`
-
-	// ConnectorBindings Connected App keys this Agent used, carried so a consumer knows what to authorize. A template never carries a connection, account, credential, or token: the consumer grants access from their own connected accounts after the Agent exists.
-	ConnectorBindings *[]ExternalAppKey         `json:"connector_bindings,omitempty"`
-	Description       *string                   `json:"description,omitempty"`
-	Instructions      string                    `json:"instructions"`
-	Name              string                    `json:"name"`
-	SkillBindings     *[]AgentSkillRegistration `json:"skill_bindings,omitempty"`
-
-	// SourceAgentActorId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
-	SourceAgentActorId *Id `json:"source_agent_actor_id,omitempty"`
-}
-
-// AgentTemplateRoutine defines model for AgentTemplateRoutine.
-type AgentTemplateRoutine struct {
-	Cadence       RoutineCadence                    `json:"cadence"`
-	CreatedByRole AgentTemplateRoutineCreatedByRole `json:"created_by_role"`
-	Enabled       bool                              `json:"enabled"`
-	Instruction   string                            `json:"instruction"`
-
-	// Key Opaque, case-sensitive identifier. Clients must not infer type or time from it.
-	Key Id `json:"key"`
-
-	// MentionRole Absent when the source Routine has no valid mention of the source Agent. Raw instruction text is never rewritten.
-	MentionRole *AgentTemplateRoutineMentionRole `json:"mention_role,omitempty"`
-	Name        string                           `json:"name"`
-}
-
-// AgentTemplateRoutineCreatedByRole defines model for AgentTemplateRoutine.CreatedByRole.
-type AgentTemplateRoutineCreatedByRole string
-
-// AgentTemplateRoutineMentionRole Absent when the source Routine has no valid mention of the source Agent. Raw instruction text is never rewritten.
-type AgentTemplateRoutineMentionRole string
-
-// AgentTemplateSkillImport defines model for AgentTemplateSkillImport.
-type AgentTemplateSkillImport struct {
-	// Skill Initial enabled Agent binding to one existing sealed Skill Manifest version. Configuration defaults to an empty object. Agent registration does not upload or create a Skill Package.
-	Skill *AgentSkillRegistration `json:"skill,omitempty"`
-
-	// Source Initial enabled Agent binding to one existing sealed Skill Manifest version. Configuration defaults to an empty object. Agent registration does not upload or create a Skill Package.
-	Source AgentSkillRegistration `json:"source"`
-
-	// Status importable means the published template's Skill version can be copied from the publisher's Tenant into this Tenant as a private Skill of the caller. imported means the copy exists (created now or reused from an earlier import with identical content). unavailable means the source version is missing, disabled, deleted, or not owned by the template's publishing Tenant.
-	Status AgentTemplateSkillImportStatus `json:"status"`
-}
-
-// AgentTemplateSkillImportPage Template Skill references the caller cannot bind from this Tenant catalog. References the catalog already resolves, including platform Skills, are not listed.
-type AgentTemplateSkillImportPage struct {
-	Items []AgentTemplateSkillImport `json:"items"`
-}
-
-// AgentTemplateSkillImportStatus importable means the published template's Skill version can be copied from the publisher's Tenant into this Tenant as a private Skill of the caller. imported means the copy exists (created now or reused from an earlier import with identical content). unavailable means the source version is missing, disabled, deleted, or not owned by the template's publishing Tenant.
-type AgentTemplateSkillImportStatus string
-
 // AgentType Persisted Agent runtime type.
 type AgentType string
 
 // AgentVisibilityScope Tenant directory visibility only. Sponsor visibility does not hide the Agent from members of a Room where the Sponsor explicitly admitted it, and workspace visibility does not grant Agent management or ordinary Room admission rights.
 type AgentVisibilityScope string
 
-// AnotherMe The Human's Another Me and its live direct Chat. Empty until the Another Me exists; room_id is also absent while the Chat is being deleted.
+// AnotherMe The Human's Another Me and its live direct Chat. Empty until the Another Me exists or a registered Local Computer reports a placement blocker; room_id is also absent while the Chat is being deleted.
 type AnotherMe struct {
 	// AgentActorId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
 	AgentActorId *Id `json:"agent_actor_id,omitempty"`
 
 	// BackgroundFailure Present while the Another Me's background model calls (Wiki, Memory, daily reports) have failed at least three times in a row; absent again after the next one completes.
 	BackgroundFailure *AnotherMeBackgroundFailure `json:"background_failure,omitempty"`
+
+	// PlacementBlocker Present while the Human has no Another Me yet and TeamHub has a known reason it cannot place or create one on the Human's Local Computers. Absent once the Another Me exists or before any Local Computer is registered for the Human.
+	PlacementBlocker *AnotherMePlacementBlocker `json:"placement_blocker,omitempty"`
 
 	// RoomId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
 	RoomId *Id `json:"room_id,omitempty"`
@@ -5323,6 +5209,29 @@ type AnotherMeBackgroundFailure struct {
 
 // AnotherMeBackgroundFailureReason Why the latest background model call failed: the Runtime is incompatible or its model is not available to the account, the Runtime needs sign-in, the Runtime is unavailable, or a cause the Human cannot act on. Clients show an unknown value as unknown.
 type AnotherMeBackgroundFailureReason string
+
+// AnotherMePlacementBlocker Present while the Human has no Another Me yet and TeamHub has a known reason it cannot place or create one on the Human's Local Computers. Absent once the Another Me exists or before any Local Computer is registered for the Human.
+type AnotherMePlacementBlocker struct {
+	// ComputerId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
+	ComputerId *Id `json:"computer_id,omitempty"`
+
+	// Reason Why TeamHub skipped or failed creating the Human's Another Me on their Local Computers. Clients treat an unknown value as unknown.
+	Reason AnotherMePlacementBlockerReason `json:"reason"`
+
+	// Runtimes Runtime diagnostics last reported by the candidate Computer when placement is blocked because no Runtime is ready with models.
+	Runtimes *[]AnotherMePlacementRuntimeStatus `json:"runtimes,omitempty"`
+}
+
+// AnotherMePlacementBlockerReason Why TeamHub skipped or failed creating the Human's Another Me on their Local Computers. Clients treat an unknown value as unknown.
+type AnotherMePlacementBlockerReason string
+
+// AnotherMePlacementRuntimeStatus defines model for AnotherMePlacementRuntimeStatus.
+type AnotherMePlacementRuntimeStatus struct {
+	Message    *string                      `json:"message,omitempty"`
+	ModelCount int                          `json:"model_count"`
+	Status     LocalRuntimeDiagnosticStatus `json:"status"`
+	Type       LocalRuntimeType             `json:"type"`
+}
 
 // ArtifactTreeSegment defines model for ArtifactTreeSegment.
 type ArtifactTreeSegment struct {
@@ -6994,12 +6903,6 @@ type LocalComputer struct {
 	// ActiveOperations Active Operations the Computer reported at its last heartbeat; 0 while it is offline.
 	ActiveOperations int `json:"active_operations"`
 
-	// AvailableCapacity Currently available active Operation slots. Present only when capacity is configured.
-	AvailableCapacity *int `json:"available_capacity,omitempty"`
-
-	// Capacity Optional maximum simultaneous active Operations on this Computer. Omission means unlimited; it does not limit bound Agents.
-	Capacity *int `json:"capacity,omitempty"`
-
 	// ComputerId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
 	ComputerId Id `json:"computer_id"`
 
@@ -7131,13 +7034,16 @@ type LocalModel struct {
 	// Capabilities Capabilities verified by localmodels on this platform.
 	Capabilities *[]LocalModelCapability `json:"capabilities,omitempty"`
 
-	// Concurrency Maximum concurrent request slots configured for this model when loaded.
-	Concurrency   *int                        `json:"concurrency,omitempty"`
-	ContextTokens int64                       `json:"context_tokens"`
-	Description   string                      `json:"description"`
-	Download      *LocalModelDownloadProgress `json:"download,omitempty"`
-	DownloadBytes int64                       `json:"download_bytes"`
-	Endpoint      *LocalModelEndpoint         `json:"endpoint,omitempty"`
+	// Concurrency Maximum concurrent request slots configured or probed for this model when loaded.
+	Concurrency *int `json:"concurrency,omitempty"`
+
+	// ConcurrencyProbing True while a loaded or loading local model is running its post-load max-concurrency probe before reporting loaded.
+	ConcurrencyProbing *bool                       `json:"concurrency_probing,omitempty"`
+	ContextTokens      int64                       `json:"context_tokens"`
+	Description        string                      `json:"description"`
+	Download           *LocalModelDownloadProgress `json:"download,omitempty"`
+	DownloadBytes      int64                       `json:"download_bytes"`
+	Endpoint           *LocalModelEndpoint         `json:"endpoint,omitempty"`
 
 	// Engine Inference engine family that runs this model entry. Never inferred from name or description.
 	Engine *LocalModelEngine `json:"engine,omitempty"`
@@ -7362,6 +7268,9 @@ type LocalModelNoteCode string
 
 // LocalModelPool One place models load into. The system and unified budgets are 80% of RAM, as localmodels computes them.
 type LocalModelPool struct {
+	// ExternalHolders Closeable desktop applications holding this pool's memory, as localmodels reports them. An empty list means localmodels looked and found no closeable app; absent means not reported, and the rest of used_bytes is then not known to be other apps.
+	ExternalHolders *[]LocalModelPoolExternalHolder `json:"external_holders,omitempty"`
+
 	// GpuIndex Present only for kind gpu; matches LocalModelGpu.index.
 	GpuIndex *int                   `json:"gpu_index,omitempty"`
 	Holders  []LocalModelPoolHolder `json:"holders"`
@@ -7375,6 +7284,12 @@ type LocalModelPool struct {
 
 // LocalModelPoolKind defines model for LocalModelPool.Kind.
 type LocalModelPoolKind string
+
+// LocalModelPoolExternalHolder A desktop application outside localmodels holding pool memory, such as a browser, video player, or game, that the user could close.
+type LocalModelPoolExternalHolder struct {
+	Bytes int64  `json:"bytes"`
+	Name  string `json:"name"`
+}
 
 // LocalModelPoolHolder Something holding pool memory. A component is a foundation service such as an embedding, reranker, or speech model; it is never a model row.
 type LocalModelPoolHolder struct {
@@ -9547,9 +9462,6 @@ type TenantAgentCreateRequest struct {
 	// SkillBindings Initial enabled Agent Skill bindings; skill_id values must be unique. Configuration defaults to an empty object and must satisfy each selected Manifest.
 	SkillBindings *[]AgentSkillRegistration `json:"skill_bindings,omitempty"`
 
-	// TemplateId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
-	TemplateId *Id `json:"template_id,omitempty"`
-
 	// VisibilityScope Tenant directory visibility only. Sponsor visibility does not hide the Agent from members of a Room where the Sponsor explicitly admitted it, and workspace visibility does not grant Agent management or ordinary Room admission rights.
 	VisibilityScope *AgentVisibilityScope `json:"visibility_scope,omitempty"`
 }
@@ -9655,6 +9567,15 @@ type UnifiedDocumentVersionRef struct {
 	Sha256        string `json:"sha256"`
 	VersionNumber int    `json:"version_number"`
 }
+
+// UrlPreviewFraming defines model for UrlPreviewFraming.
+type UrlPreviewFraming struct {
+	// Framing refused: the final response forbids framing by another site (X-Frame-Options DENY or SAMEORIGIN, or a CSP frame-ancestors that allows no page of the Linger page's scheme), so the panel offers a new tab instead of a frame. allowed: it does not. unknown: TeamHub did not read the page, because it was unreachable, slow or redirected too often, TeamHub was busy with other probes, or it is on a non-public address or a port other than 80 and 443, which TeamHub never requests; the panel frames it and lets the browser decide.
+	Framing UrlPreviewFramingFraming `json:"framing"`
+}
+
+// UrlPreviewFramingFraming refused: the final response forbids framing by another site (X-Frame-Options DENY or SAMEORIGIN, or a CSP frame-ancestors that allows no page of the Linger page's scheme), so the panel offers a new tab instead of a frame. allowed: it does not. unknown: TeamHub did not read the page, because it was unreachable, slow or redirected too often, TeamHub was busy with other probes, or it is on a non-public address or a port other than 80 and 443, which TeamHub never requests; the panel frames it and lets the browser decide.
+type UrlPreviewFramingFraming string
 
 // VoiceCapture defines model for VoiceCapture.
 type VoiceCapture struct {
@@ -10389,9 +10310,6 @@ type AfterRoomSeq = int64
 // AgentId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
 type AgentId = Id
 
-// AgentTemplateId Opaque, case-sensitive identifier. Clients must not infer type or time from it.
-type AgentTemplateId = Id
-
 // AttachmentUploadId Service-signed upload credential. It names the uploading Human, the Room, and the stored file, and it expires at the upload's expires_at; clients must not construct or parse it.
 type AttachmentUploadId = AttachmentUploadToken
 
@@ -10809,6 +10727,18 @@ type CreateWorkItemParams struct {
 	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
 }
 
+// GetUrlPreviewFramingParams defines parameters for GetUrlPreviewFraming.
+type GetUrlPreviewFramingParams struct {
+	// Url The http or https page to preview.
+	Url string `form:"url" json:"url"`
+
+	// PageScheme The scheme of the Linger page that frames the site; frame-ancestors scheme sources are matched against it. Without it, http and https sources both allow the frame.
+	PageScheme *GetUrlPreviewFramingParamsPageScheme `form:"page_scheme,omitempty" json:"page_scheme,omitempty"`
+}
+
+// GetUrlPreviewFramingParamsPageScheme defines parameters for GetUrlPreviewFraming.
+type GetUrlPreviewFramingParamsPageScheme string
+
 // ListVoiceEventsParams defines parameters for ListVoiceEvents.
 type ListVoiceEventsParams struct {
 	After *string `form:"after,omitempty" json:"after,omitempty"`
@@ -11077,9 +11007,6 @@ type ReadRoomHistoryShareJSONRequestBody = ReadRoomHistoryShare
 
 // PatchAccountProfileJSONRequestBody defines body for PatchAccountProfile for application/json ContentType.
 type PatchAccountProfileJSONRequestBody = AccountProfileUpdateRequest
-
-// PublishAgentTemplateJSONRequestBody defines body for PublishAgentTemplate for application/json ContentType.
-type PublishAgentTemplateJSONRequestBody = AgentTemplatePublishRequest
 
 // CreateTenantAgentJSONRequestBody defines body for CreateTenantAgent for application/json ContentType.
 type CreateTenantAgentJSONRequestBody = TenantAgentCreateRequest

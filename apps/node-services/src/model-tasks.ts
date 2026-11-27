@@ -85,19 +85,13 @@ export interface ModelLeaseResult {
 export interface ModelLease {
   /** A sent approval or chain step keeps the place until its Runtime reply. */
   borrow(): Pick<ModelLease, "release">;
+  /** Temporarily yields the model slot while waiting on background tool completion. */
+  suspend(): void;
+  /** Reclaims the model slot upon resuming active execution. */
+  resume(): void;
   /** Frees the place once all borrowers finish. Later calls do nothing. */
   release(result: ModelLeaseResult): void;
 }
-
-/** A bounded Computer resolves an unknown Meta priority only when work contends. */
-export type CapacityPriority =
-  | number
-  | RunPriority
-  | {
-      /** Monotonic arrival time retained across priority refreshes for this wait. */
-      readonly queuedAt: number;
-      resolve(): Promise<number>;
-    };
 
 /** A question or the notes of a recording go before chat. */
 export const RECORDING_PRIORITY = 5;
@@ -145,7 +139,7 @@ export const modelCallPolicies: Readonly<
     priority: RECORDING_PRIORITY,
     interactive: true,
     attempts: 1,
-    timeoutMs: 20_000,
+    timeoutMs: 60_000,
   },
   agent_memory: {
     priority: 30,
@@ -184,4 +178,9 @@ export function isModelCallKind(value: unknown): value is ModelCallKind {
     typeof value === "string" &&
     (modelCallKinds as readonly string[]).includes(value)
   );
+}
+
+/** Whether kind is a yieldable background model call. */
+export function isBackgroundModelCall(kind: string): boolean {
+  return isModelCallKind(kind) && !modelCallPolicies[kind].interactive;
 }

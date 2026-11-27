@@ -6,6 +6,8 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import * as fs from "node:fs";
+import * as childProcess from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 
@@ -29,6 +31,9 @@ import type {
   SystemPermission,
   SystemPermissionId,
 } from "./system-permissions.js";
+
+vi.mock("node:fs", { spy: true });
+vi.mock("node:child_process", { spy: true });
 
 const TOKEN = "sr1.test-credential-0123456789abcdefghij";
 
@@ -64,11 +69,14 @@ class FakeChild implements DaemonChild {
   kill(): void {
     this.killed = true;
   }
-  status(gateway: string, active = 0): void {
+  status(gateway: string, active = 0, modelInvokes?: number): void {
     const line = JSON.stringify({
       type: "status",
       gateway_state: gateway,
       active_operations: active,
+      ...(modelInvokes !== undefined
+        ? { active_model_invokes: modelInvokes }
+        : {}),
     });
     for (const listener of this.lines) listener(line);
   }
@@ -79,12 +87,14 @@ class FakeChild implements DaemonChild {
 
 const setup = (
   options: {
+    createEmbeddedDriver?: ComputerDaemonOptions["createEmbeddedDriver"];
     enrolled?: boolean;
     credential?: boolean;
     env?: Promise<Record<string, string>>;
     permissions?: ComputerDaemonOptions["permissions"];
     relaunch?: () => void;
     protect?: ComputerDaemonOptions["protect"];
+    devLocalmodels?: ComputerDaemonOptions["devLocalmodels"];
   } = {},
 ) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "computer-daemon-"));
@@ -130,6 +140,7 @@ const setup = (
   });
   const daemon = new ComputerDaemonModule({
     spawn,
+    createEmbeddedDriver: options.createEmbeddedDriver,
     credentials,
     directory: path.join(directory, "computer"),
     teamhubCliDirectory: "/Applications/Linger.app/teamhub-cli",
@@ -137,6 +148,9 @@ const setup = (
     ...(options.permissions ? { permissions: options.permissions } : {}),
     ...(options.relaunch ? { relaunch: options.relaunch } : {}),
     ...(options.protect ? { protect: options.protect } : {}),
+    ...(options.devLocalmodels
+      ? { devLocalmodels: options.devLocalmodels }
+      : {}),
   });
   return { daemon, ctx, bus, config, children, credentials, directory, spawn };
 };
@@ -146,6 +160,78 @@ afterEach(() => {
 });
 
 describe("ComputerDaemonModule", () => {
+  const hostDriver = (socket = "/tmp/host/driver.sock") => ({
+    socket,
+    start: vi.fn(async () => {}),
+    stop: vi.fn(async () => {}),
+  });
+
+  it.each([
+    { enrolled: false, credential: true },
+    { enrolled: true, credential: false },
+  ])("does not create an idle driver for %o", async (options) => {
+    const create = vi.fn(() => hostDriver());
+    const { daemon, ctx, children } = setup({
+      ...options,
+      createEmbeddedDriver: create,
+    });
+    await daemon.start(ctx);
+    expect(create).not.toHaveBeenCalled();
+    expect(children).toHaveLength(0);
+    await daemon.stop();
+  });
+
+  it("selects embedded from the first daemon and retires its driver on exit and unenrollment", async () => {
+    const first = hostDriver(),
+      second = hostDriver("/tmp/new/driver.sock");
+    const create = vi
+      .fn()
+      .mockReturnValueOnce(first)
+      .mockReturnValueOnce(second);
+    const { daemon, ctx, bus, config, children } = setup({
+      createEmbeddedDriver: create,
+    });
+    await daemon.start(ctx);
+    await vi.waitFor(() => expect(children).toHaveLength(1));
+    const desktop = () =>
+      JSON.parse(readFileSync(children.at(-1)!.configFile, "utf8")).desktop;
+    expect(desktop()).toMatchObject({ cua_socket: first.socket });
+    children[0]!.exit(1);
+    expect(first.stop).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(children).toHaveLength(2), { timeout: 3000 });
+    expect(desktop()).toMatchObject({ cua_socket: second.socket });
+    children[1]!.status("connected", 1);
+    bus.emit("grants.changed");
+    config.update({ computerId: undefined });
+    bus.emit("computer.changed", undefined);
+    await vi.waitFor(() => expect(second.stop).toHaveBeenCalledOnce());
+    expect(create).toHaveBeenCalledTimes(2);
+    await daemon.stop();
+  });
+
+  it("drops an in-flight driver startup when enrollment is cleared", async () => {
+    let ready!: () => void;
+    const driver = hostDriver();
+    driver.start.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          ready = resolve;
+        }),
+    );
+    const { daemon, ctx, children, bus, config } = setup({
+      createEmbeddedDriver: () => driver,
+    });
+    await daemon.start(ctx);
+    expect(driver.start).toHaveBeenCalledOnce();
+    config.update({ computerId: undefined });
+    bus.emit("computer.changed", undefined);
+    await vi.waitFor(() => expect(driver.stop).toHaveBeenCalledOnce());
+    ready();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(children).toHaveLength(0);
+    await daemon.stop();
+  });
+
   it("starts the daemon with its config and the credential in the environment", async () => {
     const { daemon, ctx, children } = setup();
     await daemon.start(ctx);
@@ -186,6 +272,84 @@ describe("ComputerDaemonModule", () => {
     });
     expect(daemon.state()).toBe("starting");
     expect(daemon.connection()).toBe("connecting");
+  });
+
+  it("writes local_models from devLocalmodels even without Quick Install runtimeEnvironment", async () => {
+    const devHome = mkdtempSync(path.join(os.tmpdir(), "desktop-dev-home-"));
+    const devPython = path.join(devHome, "lab", ".venv", "bin", "python");
+    const devModule = path.join(devHome, "lab");
+    const stateDirectory = path.join(
+      devHome,
+      "runtime",
+      "localmodels",
+      "state",
+    );
+    const baseDirectory = path.join(
+      devHome,
+      "runtime",
+      "localmodels",
+      "models",
+    );
+    const { daemon, ctx, children } = setup({
+      devLocalmodels: {
+        python: devPython,
+        moduleDirectory: devModule,
+        stateDirectory,
+        baseDirectory,
+      },
+    });
+    try {
+      await daemon.start(ctx);
+      await vi.waitFor(() => expect(children).toHaveLength(1));
+      const written = JSON.parse(readFileSync(children[0]!.configFile, "utf8"));
+      expect(written.local_models).toEqual({
+        python: devPython,
+        module_directory: devModule,
+        state_directory: stateDirectory,
+        base_directory: baseDirectory,
+      });
+    } finally {
+      await daemon.stop();
+      rmSync(devHome, { recursive: true, force: true });
+    }
+  });
+
+  it("overrides python and module_directory when devLocalmodels is active over an installed runtimeEnvironment", async () => {
+    const devHome = mkdtempSync(path.join(os.tmpdir(), "desktop-dev-home-"));
+    const customState = path.join(devHome, "custom-state");
+    const customModels = path.join(devHome, "custom-models");
+    const devPython = path.join(devHome, "lab", ".venv", "bin", "python");
+    const devModule = path.join(devHome, "lab");
+    const { daemon, ctx, config, children } = setup({
+      devLocalmodels: {
+        python: devPython,
+        moduleDirectory: devModule,
+        stateDirectory: path.join(devHome, "runtime", "localmodels", "state"),
+        baseDirectory: path.join(devHome, "runtime", "localmodels", "models"),
+      },
+    });
+    config.update({
+      runtimeEnvironment: {
+        LINGER_LOCALMODELS_PYTHON: path.join(devHome, "kit", "python"),
+        LINGER_LOCALMODELS_MODULE_DIR: path.join(devHome, "kit", "mod"),
+        LINGER_LOCALMODELS_STATE: customState,
+        LINGER_LOCALMODELS_BASE_DIR: customModels,
+      },
+    });
+    try {
+      await daemon.start(ctx);
+      await vi.waitFor(() => expect(children).toHaveLength(1));
+      const written = JSON.parse(readFileSync(children[0]!.configFile, "utf8"));
+      expect(written.local_models).toEqual({
+        python: devPython,
+        module_directory: devModule,
+        state_directory: customState,
+        base_directory: customModels,
+      });
+    } finally {
+      await daemon.stop();
+      rmSync(devHome, { recursive: true, force: true });
+    }
   });
 
   it("runs the runtime the local server's installer set up", async () => {
@@ -308,17 +472,48 @@ describe("ComputerDaemonModule", () => {
   it("follows the status the daemon reports", async () => {
     const { daemon, ctx, bus, children } = setup();
     const activity: number[] = [];
+    const modelActivity: number[] = [];
     bus.on("runtime.activity", (running) => activity.push(running));
+    bus.on("runtime.model_activity", (running) => modelActivity.push(running));
     await daemon.start(ctx);
     children[0]!.status("connected", 2);
     expect(daemon.state()).toBe("ready");
     expect(daemon.connection()).toBe("online");
     expect(daemon.running()).toBe(2);
-    children[0]!.status("upgrade-required");
+    // An older daemon that omits active_model_invokes defaults to 0.
+    expect(daemon.modelInvokes()).toBe(0);
+    children[0]!.status("connected", 2, 3);
+    expect(daemon.running()).toBe(2);
+    expect(daemon.modelInvokes()).toBe(3);
+    children[0]!.status("upgrade-required", 0, 0);
     expect(daemon.connection()).toBe("upgrade_required");
     children[0]!.status("identity-conflict");
     expect(daemon.connection()).toBe("identity_conflict");
     expect(activity).toEqual([2, 0]);
+    expect(modelActivity).toEqual([3, 0]);
+  });
+
+  it("resets background model activity when the daemon exits or stops", async () => {
+    const { daemon, ctx, bus, children } = setup();
+    const modelActivity: number[] = [];
+    bus.on("runtime.model_activity", (running) => modelActivity.push(running));
+    await daemon.start(ctx);
+    children[0]!.status("connected", 0, 2);
+    expect(daemon.modelInvokes()).toBe(2);
+    children[0]!.exit(1);
+    expect(daemon.modelInvokes()).toBe(0);
+    expect(modelActivity).toEqual([2, 0]);
+    await daemon.stop();
+  });
+
+  it("restarts on grant changes without waiting on background model invokes", async () => {
+    const { daemon, ctx, bus, children } = setup();
+    await daemon.start(ctx);
+    children[0]!.status("connected", 0, 2);
+    bus.emit("grants.changed");
+    await vi.waitFor(() => expect(children).toHaveLength(2));
+    expect(children[0]!.stopped).toBe(true);
+    expect(daemon.modelInvokes()).toBe(0);
   });
 
   it("stays stopped until this computer is connected", async () => {
@@ -751,6 +946,49 @@ describe("restartDelay", () => {
       1_000, 2_000, 4_000, 60_000,
     ]);
   });
+});
+
+it("keeps handling daemon status after the log disk fills up", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "spawn-daemon-"));
+  const log = path.join(directory, "computer-daemon.log");
+  const { createWriteStream } = fs;
+  const { spawn } = childProcess;
+  const openLog = vi.spyOn(fs, "createWriteStream").mockImplementationOnce(() =>
+    createWriteStream(log, {
+      fs: {
+        open: fs.open,
+        close: fs.close,
+        write: (_fd, _buffer, _offset, _length, _position, callback) => {
+          callback(
+            Object.assign(new Error("no space left"), { code: "ENOSPC" }),
+            0,
+          );
+        },
+      },
+    }),
+  );
+  const launch = vi.spyOn(childProcess, "spawn").mockImplementationOnce(() =>
+    spawn(process.execPath, [
+      "-e",
+      `process.stderr.write("daemon started\\n");
+       process.stdin.once("data", () => console.log('{"type":"status"}'));`,
+    ]),
+  );
+  try {
+    const child = spawnDaemon(process.execPath, log)("config.json", {});
+    const stream = openLog.mock.results[0]!.value;
+    await new Promise<void>((resolve) => stream.once("close", resolve));
+    const status = new Promise<string>((resolve) => child.onLine(resolve));
+    const exit = new Promise<number | null>((resolve) => child.onExit(resolve));
+    child.write("status");
+    await expect(status).resolves.toBe('{"type":"status"}');
+    child.stop();
+    await expect(exit).resolves.toBe(0);
+  } finally {
+    launch.mockRestore();
+    openLog.mockRestore();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 describe.skipIf(process.platform === "win32")("spawnDaemon", () => {

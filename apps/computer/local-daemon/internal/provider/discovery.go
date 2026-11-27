@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +36,11 @@ type RuntimeDiagnostic struct {
 	// Internal provenance: only an authentication probe failure may be
 	// retried without rerunning version and protocol discovery.
 	authProbeFailed bool
+	// searchPath is the PATH this observation searched and executable the
+	// file it probed, so the monitor can notice an install or upgrade
+	// without a full discovery (changedInstallations).
+	searchPath string
+	executable os.FileInfo
 }
 
 type RuntimeModel struct {
@@ -68,13 +75,23 @@ type DiscoveryResult struct {
 
 type DiscoveryOptions struct {
 	RuntimeHomeRoot string
+	// TempBase holds per-probe temporary directories inside the Daemon's
+	// private state directory; empty falls back to the OS temporary directory.
+	TempBase        string
 	ConfiguredPaths map[string]string
-	Environment     map[string]string
-	Timeout         time.Duration
+	// ManagedPaths holds installer- or harness-managed Runtime executables
+	// checked after user PATH and macOS app bundles, and before BundledPaths.
+	ManagedPaths map[string]string
+	BundledPaths map[string]string
+	Environment  map[string]string
+	Timeout      time.Duration
 	// Runtimes limits discovery to these types; empty diagnoses every Runtime.
 	Runtimes []string
 	// PreferredRuntime is the type whose diagnostic is marked Preferred.
 	PreferredRuntime string
+	// SkipModelCatalog skips model catalog listing after protocol and
+	// authentication verification (used by stateless setup/auth probes).
+	SkipModelCatalog bool
 }
 
 type runtimeDefinition struct {
@@ -86,6 +103,48 @@ var runtimeDefinitions = []runtimeDefinition{
 	{"claude", "claude", "stream-json"},
 	{"pi", "pi", "rpc"},
 	{"antigravity", "agy", "acp"},
+}
+
+// AllRuntimeTypes returns every supported Runtime type in canonical discovery order.
+func AllRuntimeTypes() []string {
+	types := make([]string, len(runtimeDefinitions))
+	for i, definition := range runtimeDefinitions {
+		types[i] = definition.Type
+	}
+	return types
+}
+
+// MergeRuntimeDiagnostics combines base diagnostics with additions, replacing
+// matching types and ordering known Runtimes in canonical discovery order.
+func MergeRuntimeDiagnostics(base, additions []RuntimeDiagnostic) DiscoveryResult {
+	byType := make(map[string]RuntimeDiagnostic, len(base)+len(additions))
+	for _, diagnostic := range base {
+		byType[diagnostic.Type] = diagnostic
+	}
+	for _, diagnostic := range additions {
+		byType[diagnostic.Type] = diagnostic
+	}
+	merged := make([]RuntimeDiagnostic, 0, len(byType))
+	for _, definition := range runtimeDefinitions {
+		if diagnostic, ok := byType[definition.Type]; ok {
+			merged = append(merged, diagnostic)
+			delete(byType, definition.Type)
+		}
+	}
+	if len(byType) > 0 {
+		for _, source := range [][]RuntimeDiagnostic{base, additions} {
+			for _, diagnostic := range source {
+				if value, ok := byType[diagnostic.Type]; ok {
+					merged = append(merged, value)
+					delete(byType, diagnostic.Type)
+				}
+			}
+		}
+	}
+	return DiscoveryResult{
+		Diagnostics:   merged,
+		Installations: InstallationsFromDiagnostics(merged),
+	}
 }
 
 // ValidateRuntimeSelection accepts an omitted scope or a nonempty unique supported subset.
@@ -156,6 +215,7 @@ func diagnose(ctx context.Context, kind, executable, protocol string, options Di
 		observation.Error = &DiagnosticError{Code: code, Message: message}
 		return observation
 	}
+	observation.searchPath = options.Environment["PATH"]
 	entry, err := resolveExecutableEntry(ctx, kind, executable, options)
 	if err != nil {
 		return reject("not_installed", "RUNTIME_NOT_INSTALLED", "Runtime executable not found")
@@ -165,6 +225,7 @@ func diagnose(ctx context.Context, kind, executable, protocol string, options Di
 		return reject("not_installed", "RUNTIME_NOT_INSTALLED", "Runtime executable not found")
 	}
 	observation.EntryPath, observation.ExecutablePath = entry, canonical
+	observation.executable, _ = os.Stat(canonical)
 	observation.ExecutionPath = options.Environment["PATH"]
 	versionEnv := options.Environment
 	if kind == "claude" {
@@ -191,14 +252,17 @@ func diagnose(ctx context.Context, kind, executable, protocol string, options Di
 	if kind == "codex" {
 		// Discovery lists models, so its home reuses a Context's catalog
 		// instead of fetching it on every refresh.
-		prepared, release, err := localworkspace.CodexProbeEnvironment(probe, environment, version, codexProbeModelsCache(options.RuntimeHomeRoot))
+		prepared, release, err := localworkspace.CodexProbeEnvironment(probe, environment, version, codexProbeModelsCache(options.RuntimeHomeRoot), options.TempBase)
 		if err != nil {
 			return reject("error", "RUNTIME_DIAGNOSTIC_FAILED", "Codex diagnostic home could not be prepared")
 		}
 		defer release()
 		environment = prepared
 	}
-	outcome := probeRuntime(probe, kind, canonical, environment, budget, version, options.RuntimeHomeRoot)
+	outcome := probeRuntime(probe, kind, canonical, environment, budget, probeOptions{
+		runtimeHomeRoot: options.RuntimeHomeRoot,
+		tempBase:        options.TempBase,
+	})
 	observation.Status = outcome.Status
 	observation.authProbeFailed = outcome.protocolVerified && outcome.Status == "error" && outcome.Code == "RUNTIME_DIAGNOSTIC_FAILED"
 	if outcome.Status != "ready" {
@@ -207,10 +271,10 @@ func diagnose(ctx context.Context, kind, executable, protocol string, options Di
 	// Catalogs use live protocol exchanges. Preserve a failed protocol/auth
 	// probe instead of replacing it with a second failure from model discovery.
 	// Logged-out Claude must not receive an initialize request.
-	catalogAllowed := outcome.Status == "ready" || ((kind == "codex" || kind == "pi") && outcome.Status == "authentication_required")
+	catalogAllowed := !options.SkipModelCatalog && (outcome.Status == "ready" || ((kind == "codex" || kind == "pi") && outcome.Status == "authentication_required"))
 	if catalogAllowed {
 		catalogCtx, stop := context.WithTimeout(ctx, budget)
-		observation.Models, observation.ModelCatalogError = probedRuntimeModels(catalogCtx, kind, canonical, environment, outcome)
+		observation.Models, observation.ModelCatalogError = probedRuntimeModels(catalogCtx, kind, canonical, environment, outcome, options.TempBase)
 		if observation.ModelCatalogError == "" {
 			getModelLink := newGetModelLink(catalogCtx, kind, environment)
 			for i := range observation.Models {
@@ -257,15 +321,24 @@ func versionProbeTimedOut(err error) bool {
 
 // probedRuntimeModels uses the catalog the probe already read, or discovers
 // it.
-func probedRuntimeModels(ctx context.Context, kind, executable string, environment map[string]string, outcome runtimeProbeOutcome) ([]RuntimeModel, string) {
+func probedRuntimeModels(ctx context.Context, kind, executable string, environment map[string]string, outcome runtimeProbeOutcome, tempBase string) ([]RuntimeModel, string) {
 	if outcome.catalog != nil {
 		return catalogModels(*outcome.catalog, nil)
 	}
-	return discoverRuntimeModels(ctx, kind, executable, environment)
+	return discoverRuntimeModels(ctx, kind, executable, environment, tempBase)
 }
 
-func discoverRuntimeModels(ctx context.Context, kind, executable string, environment map[string]string) ([]RuntimeModel, string) {
-	return catalogModels(native.DiscoverModels(ctx, kind, native.NewInvocation(executable, nil).WithEnvironment(environment)))
+func discoverRuntimeModels(ctx context.Context, kind, executable string, environment map[string]string, tempBase string) ([]RuntimeModel, string) {
+	inv := native.NewInvocation(executable, nil).WithEnvironment(environment)
+	if kind == "antigravity" {
+		catalog, err := native.DiscoverAntigravityModels(ctx, inv, tempBase)
+		if errors.Is(err, native.ErrAntigravityProbePrepare) {
+			slog.Warn("runner.runtime_models.prepare_failed", "runtime_type", kind, "error", redact.Text(err.Error()))
+			return []RuntimeModel{}, "Antigravity diagnostic environment could not be prepared"
+		}
+		return catalogModels(catalog, err)
+	}
+	return catalogModels(native.DiscoverModels(ctx, kind, inv))
 }
 
 func catalogModels(catalog native.ModelList, err error) ([]RuntimeModel, string) {
@@ -312,8 +385,11 @@ func normalizeRuntimeModels(catalog []native.ModelOption) []RuntimeModel {
 		}
 		if entry.Effort != nil {
 			for _, effort := range entry.Effort.Options {
-				if validRuntimeReasoningEffort(effort.Value) && !slices.Contains(model.AllowedReasoningEffort, effort.Value) {
+				if ValidRuntimeReasoningEffort(effort.Value) && !slices.Contains(model.AllowedReasoningEffort, effort.Value) {
 					model.AllowedReasoningEffort = append(model.AllowedReasoningEffort, effort.Value)
+					if len(model.AllowedReasoningEffort) == MaxRuntimeModelReasoningEfforts {
+						break
+					}
 				}
 			}
 			if slices.Contains(model.AllowedReasoningEffort, entry.Effort.Default) {
@@ -328,11 +404,12 @@ func normalizeRuntimeModels(catalog []native.ModelOption) []RuntimeModel {
 	return result
 }
 
-// Bounds of a Runtime's model catalog: how many models it lists, and how
-// many runes a model ID or label may have.
+// Bounds of a Runtime's model catalog: how many models it lists, how many
+// reasoning efforts a model lists, and how many runes a model ID or label may have.
 const (
-	MaxRuntimeModels         = 100
-	MaxRuntimeModelTextRunes = 160
+	MaxRuntimeModels                = 100
+	MaxRuntimeModelReasoningEfforts = 32
+	MaxRuntimeModelTextRunes        = 160
 )
 
 // MaxRuntimeModelContextWindow is the largest context window a catalog
@@ -346,11 +423,12 @@ const MaxRuntimeModelContextWindow = maxModelContextWindow
 // link.
 func ValidRuntimeModel(model RuntimeModel) bool {
 	if strings.TrimSpace(model.ID) != model.ID || model.ID == "" || len([]rune(model.ID)) > MaxRuntimeModelTextRunes ||
-		model.Label == "" || len([]rune(model.Label)) > MaxRuntimeModelTextRunes || model.AllowedReasoningEffort == nil {
+		model.Label == "" || len([]rune(model.Label)) > MaxRuntimeModelTextRunes || model.AllowedReasoningEffort == nil ||
+		len(model.AllowedReasoningEffort) > MaxRuntimeModelReasoningEfforts {
 		return false
 	}
 	for index, effort := range model.AllowedReasoningEffort {
-		if !validRuntimeReasoningEffort(effort) || slices.Contains(model.AllowedReasoningEffort[:index], effort) {
+		if !ValidRuntimeReasoningEffort(effort) || slices.Contains(model.AllowedReasoningEffort[:index], effort) {
 			return false
 		}
 	}
@@ -368,8 +446,59 @@ func ClipRuntimeModelLabel(label string) string {
 	return truncateRunes(label, MaxRuntimeModelTextRunes)
 }
 
-func validRuntimeReasoningEffort(value string) bool {
-	return slices.Contains([]string{"none", "low", "medium", "high", "xhigh", "max", "ultra"}, value)
+// ValidRuntimeReasoningEffort reports whether value matches the wire
+// reasoning-effort token grammar.
+func ValidRuntimeReasoningEffort(value string) bool {
+	return native.ValidEffortToken(value)
+}
+
+// LegacyRuntimeReasoningEffort reports whether value is one of the seven
+// reasoning efforts accepted by Agent Services before dynamic_reasoning_efforts.
+func LegacyRuntimeReasoningEffort(value string) bool {
+	switch value {
+	case "none", "low", "medium", "high", "xhigh", "max", "ultra":
+		return true
+	default:
+		return false
+	}
+}
+
+// FilterLegacyReasoningEfforts returns a copy of observations with any
+// non-legacy reasoning efforts removed from each model's catalog, and reports
+// whether anything was removed.
+func FilterLegacyReasoningEfforts(observations []RuntimeDiagnostic) ([]RuntimeDiagnostic, bool) {
+	changed := false
+	filtered := make([]RuntimeDiagnostic, len(observations))
+	for i, diagnostic := range observations {
+		filtered[i] = diagnostic
+		if diagnostic.Models == nil {
+			continue
+		}
+		models := make([]RuntimeModel, len(diagnostic.Models))
+		for j, model := range diagnostic.Models {
+			models[j] = model
+			if model.AllowedReasoningEffort != nil {
+				kept := make([]string, 0, len(model.AllowedReasoningEffort))
+				for _, effort := range model.AllowedReasoningEffort {
+					if LegacyRuntimeReasoningEffort(effort) {
+						kept = append(kept, effort)
+					} else {
+						changed = true
+					}
+				}
+				models[j].AllowedReasoningEffort = kept
+			}
+			if model.DefaultReasoningEffort != "" && !LegacyRuntimeReasoningEffort(model.DefaultReasoningEffort) {
+				models[j].DefaultReasoningEffort = ""
+				changed = true
+			}
+		}
+		filtered[i].Models = models
+	}
+	if !changed {
+		return observations, false
+	}
+	return filtered, true
 }
 func truncateRunes(value string, limit int) string {
 	characters := []rune(value)
@@ -384,36 +513,191 @@ func boundedModelCatalogError(err error) string {
 
 func resolveExecutableEntry(ctx context.Context, kind, name string, options DiscoveryOptions) (string, error) {
 	if selected := options.ConfiguredPaths[kind]; selected != "" {
-		return selected, nil
+		if options.ManagedPaths[kind] == "" && options.BundledPaths[kind] == "" {
+			return selected, nil
+		}
+		if _, err := canonicalExecutable(selected); err == nil {
+			return selected, nil
+		}
 	}
-	path := options.Environment["PATH"]
+	env := platformEnvironment(options.Environment)
+	path := env["PATH"]
 	if path == "" {
 		path = os.Getenv("PATH")
 	}
-	for _, directory := range executableDirectories(path, options.Environment) {
-		if !filepath.IsAbs(directory) {
-			continue
-		}
-		for _, filename := range executableNames(name) {
-			candidate := filepath.Join(directory, filename)
-			if _, err := canonicalExecutable(candidate); err == nil {
-				return candidate, nil
-			}
+	for _, candidate := range executableCandidates(name, path, env) {
+		if _, err := canonicalExecutable(candidate); err == nil {
+			return candidate, nil
 		}
 	}
-	if bundle := applicationBundles[kind]; bundle != "" && runtime.GOOS == "darwin" {
-		for _, parent := range []string{"/", options.Environment["HOME"]} {
-			candidate := filepath.Join(parent, "Applications", bundle, "Contents", "Resources", name)
-			if _, err := canonicalExecutable(candidate); err == nil {
-				return candidate, nil
-			}
+	switch runtime.GOOS {
+	case "darwin":
+		if candidate := resolveMacApplicationBundle(kind, env["HOME"]); candidate != "" {
+			return candidate, nil
+		}
+	case "windows":
+		if candidate := resolveWindowsDesktopCLI(kind, env["APPDATA"]); candidate != "" {
+			return candidate, nil
+		}
+	}
+	if managed := options.ManagedPaths[kind]; managed != "" {
+		if _, err := canonicalExecutable(managed); err == nil {
+			return managed, nil
+		}
+	}
+	if bundled := options.BundledPaths[kind]; bundled != "" {
+		if _, err := canonicalExecutable(bundled); err == nil {
+			return bundled, nil
 		}
 	}
 	return "", os.ErrNotExist
 }
 
-// macOS desktop apps ship their CLI inside the bundle, outside PATH.
-var applicationBundles = map[string]string{"codex": "Codex.app", "claude": "Claude.app"}
+// Windows Claude Desktop stores versioned Claude Code binaries under
+// %APPDATA%\Claude\claude-code\<version>\claude.exe (or nested under a hash dir).
+func resolveWindowsDesktopCLI(kind, appData string) string {
+	if kind != "claude" || strings.TrimSpace(appData) == "" {
+		return ""
+	}
+	return resolveClaudeDesktopManagedCLIAt(filepath.Join(appData, "Claude", "claude-code"), "claude.exe")
+}
+
+// macOS desktop apps ship their CLI inside the app bundle or Application Support,
+// outside PATH.
+var macApplicationRelativePaths = map[string][][]string{
+	"codex": {
+		{"Applications", "Codex.app", "Contents", "Resources", "codex"},
+		{"Applications", "Codex.app", "Contents", "Resources", "codex-cli", "bin", "codex"},
+		{"Applications", "ChatGPT.app", "Contents", "Resources", "codex-cli", "bin", "codex"},
+	},
+	"claude": {
+		{"Applications", "Claude.app", "Contents", "Resources", "claude"},
+	},
+}
+
+var macApplicationSystemRoot = "/"
+
+func resolveMacApplicationBundle(kind, home string) string {
+	return resolveMacApplicationBundleIn(kind, macApplicationSystemRoot, home)
+}
+
+func resolveMacApplicationBundleIn(kind, systemRoot, home string) string {
+	if paths := macApplicationRelativePaths[kind]; len(paths) > 0 {
+		parents := []string{systemRoot}
+		if strings.TrimSpace(home) != "" {
+			parents = append(parents, home)
+		}
+		for _, parts := range paths {
+			for _, parent := range parents {
+				candidate := filepath.Join(append([]string{parent}, parts...)...)
+				if _, err := canonicalExecutable(candidate); err == nil {
+					return candidate
+				}
+			}
+		}
+	}
+	if kind == "claude" && strings.TrimSpace(home) != "" {
+		if candidate := resolveClaudeDesktopManagedCLI(home); candidate != "" {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// Claude Desktop downloads versioned Claude Code bundles into
+// ~/Library/Application Support/Claude/claude-code/<version>/<hash>/claude.app/Contents/MacOS/claude
+// (or <version>/claude on earlier releases, and %APPDATA%\Claude\claude-code\<version>\claude.exe
+// on Windows). Pick the highest semver first.
+func resolveClaudeDesktopManagedCLI(home string) string {
+	return resolveClaudeDesktopManagedCLIAt(
+		filepath.Join(home, "Library", "Application Support", "Claude", "claude-code"),
+		"claude",
+	)
+}
+
+func resolveClaudeDesktopManagedCLIAt(root, binaryName string) string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	versions := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			versions = append(versions, entry.Name())
+		}
+	}
+	slices.SortFunc(versions, func(a, b string) int {
+		return compareNumericVersions(b, a)
+	})
+	for _, version := range versions {
+		versionDir := filepath.Join(root, version)
+		direct := filepath.Join(versionDir, binaryName)
+		if _, err := canonicalExecutable(direct); err == nil {
+			return direct
+		}
+		children, err := os.ReadDir(versionDir)
+		if err != nil {
+			continue
+		}
+		// Prefer verified sub-bundles when more than one hash folder exists.
+		var fallback string
+		for _, child := range children {
+			if !child.IsDir() {
+				continue
+			}
+			hashDir := filepath.Join(versionDir, child.Name())
+			candidates := []string{
+				filepath.Join(hashDir, "claude.app", "Contents", "MacOS", binaryName),
+				filepath.Join(hashDir, binaryName),
+			}
+			for _, candidate := range candidates {
+				if _, err := canonicalExecutable(candidate); err != nil {
+					continue
+				}
+				if _, err := os.Stat(filepath.Join(hashDir, ".verified")); err == nil {
+					return candidate
+				}
+				if fallback == "" {
+					fallback = candidate
+				}
+			}
+		}
+		if fallback != "" {
+			return fallback
+		}
+	}
+	return ""
+}
+
+func compareNumericVersions(a, b string) int {
+	pa := strings.Split(a, ".")
+	pb := strings.Split(b, ".")
+	limit := max(len(pa), len(pb))
+	for i := 0; i < limit; i++ {
+		var sa, sb string
+		if i < len(pa) {
+			sa = pa[i]
+		}
+		if i < len(pb) {
+			sb = pb[i]
+		}
+		na, errA := strconv.Atoi(sa)
+		nb, errB := strconv.Atoi(sb)
+		if errA == nil && errB == nil {
+			if na != nb {
+				if na < nb {
+					return -1
+				}
+				return 1
+			}
+			continue
+		}
+		if cmp := strings.Compare(sa, sb); cmp != 0 {
+			return cmp
+		}
+	}
+	return 0
+}
 
 // GatewayDiagnostics drops the Antigravity diagnostic when `agy` is not
 // installed. An Agent Service released before Antigravity support rejects a

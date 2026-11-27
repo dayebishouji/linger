@@ -7,21 +7,16 @@ import type {
 } from "@linger/wire-contracts/runner-gateway/types";
 import { isRecord } from "@linger/service-kit";
 import { isDeepStrictEqual } from "node:util";
-import {
-  admissionLimit,
-  INTERACTIVE_PRIORITY,
-  runPriorities,
-  RunPriority,
-  softLimit,
-} from "../../model-tasks.js";
+import { runPriorities, RunPriority } from "../../model-tasks.js";
 import { logAgentEvent } from "../observability/agent-log.js";
 import {
+  FIRST_PREVIOUS_SESSION_COMPUTER_VERSION,
   FIRST_STOP_HOOK_COMPUTER_VERSION,
   isComputerVersionAtLeast,
   LocalComputerOfflineError,
   resolveOperationModel,
 } from "./local-computer-management.js";
-import { INTERACTIVE_STALL_MS, type ModelEndpoint } from "./model-queue.js";
+import type { ModelEndpoint } from "./model-queue.js";
 import { isServingConnection } from "./runner-connections.js";
 import type {
   CapacitySignal,
@@ -113,10 +108,6 @@ export class RunnerOperations {
     }
   >();
 
-  readonly #capacityWaiters = new Set<
-    RunnerCapacityTarget & { rank?: number; queuedAt: number }
-  >();
-
   #capacitySignal = capacitySignal();
 
   constructor(
@@ -138,137 +129,46 @@ export class RunnerOperations {
     target: RunnerCapacityTarget,
     signal: AbortSignal,
   ): Promise<RunnerCapacityPermit> {
-    const source = target.priority ?? runPriorities.chat;
-    const known = typeof source === "number" || source instanceof RunPriority;
-    const waiter = {
-      ...target,
-      queuedAt: known ? performance.now() : source.queuedAt,
-      rank:
-        typeof source === "number"
-          ? source
-          : source instanceof RunPriority
-            ? source.value
-            : undefined,
-    };
-    const unsubscribe =
-      source instanceof RunPriority
-        ? source.onRaise(() => {
-            waiter.rank = source.value;
-            this.wakeCapacityWaiters();
-          })
-        : undefined;
-    const waitStartedAt = Date.now();
-    let stall: ReturnType<typeof setTimeout> | undefined;
-    const watchStall = () => {
-      stall = setTimeout(() => {
-        if (waiter.rank === undefined || waiter.rank > INTERACTIVE_PRIORITY)
-          return watchStall();
-        logAgentEvent("warn", "runner.capacity.interactive_waiting", {
-          computer_id: target.runnerId,
-          execution_context_key: target.executionContextKey,
-          priority: waiter.rank,
-          waited_ms: Date.now() - waitStartedAt,
-          capacity:
-            this.owners.connections().getConnection(target.runnerId)?.hello
-              .capacity ?? null,
-          reservations: [...this.#capacityReservations.values()].filter(
-            (item) => item.target.runnerId === target.runnerId,
-          ).length,
-          holders: this.describeHolders(target.runnerId),
-        });
-      }, INTERACTIVE_STALL_MS);
-      stall.unref?.();
-    };
-    if (typeof source !== "number" || source <= INTERACTIVE_PRIORITY)
-      watchStall();
-    this.#capacityWaiters.add(waiter);
-    try {
-      for (;;) {
-        signal.throwIfAborted();
-        // Taken before any read, so a change during the reads still wakes us.
-        const { changed } = this.#capacitySignal;
-        const connection = this.owners
-          .connections()
-          .getConnection(target.runnerId);
-        if (!isServingConnection(connection)) {
-          // Waiting for capacity is not waiting for connectivity: an offline
-          // Computer fails the Run visibly.
-          throw new LocalComputerOfflineError(
-            "Local Computer is offline or not yet reconciled",
-          );
-        }
-        const active = this.activeOperations(target.runnerId);
-        const reservations = [...this.#capacityReservations.values()].filter(
-          (item) =>
-            item.target.runnerId === target.runnerId && !item.operationId,
+    for (;;) {
+      signal.throwIfAborted();
+      // Taken before any read, so a change during the reads still wakes us.
+      const { changed } = this.#capacitySignal;
+      const connection = this.owners
+        .connections()
+        .getConnection(target.runnerId);
+      if (!isServingConnection(connection)) {
+        // Waiting for capacity is not waiting for connectivity: an offline
+        // Computer fails the Run visibly.
+        throw new LocalComputerOfflineError(
+          "Local Computer is offline or not yet reconciled",
         );
-        const occupied = [
-          ...active.map((operation) => ({
-            runnerId: operation.start.runner_id,
-            tenantId: operation.start.tenant_id,
-            agentId: operation.start.agent_id,
-            executionContextKey: operation.start.execution_context_key,
-          })),
-          ...reservations.map((item) => item.target),
-        ];
-        const isBusy = (candidate: RunnerCapacityTarget): boolean =>
-          occupied.some(
-            (other) =>
-              candidate.runnerId === other.runnerId &&
-              candidate.tenantId === other.tenantId &&
-              candidate.executionContextKey === other.executionContextKey,
-          );
-        const hard = connection.hello.capacity;
-        const soft = hard === undefined ? Infinity : softLimit(hard);
-        const peers = [...this.#capacityWaiters].filter(
-          (other) => other.runnerId === target.runnerId && !isBusy(other),
-        );
-        if (
-          hard !== undefined &&
-          waiter.rank === undefined &&
-          !known &&
-          (occupied.length >= soft || peers.length > 1)
-        ) {
-          waiter.rank = await source.resolve();
-          this.wakeCapacityWaiters();
-          continue;
-        }
-        const rank = waiter.rank ?? runPriorities.chat;
-        // An unresolved contender may be interactive. Its lookup wakes every waiter.
-        const first = peers.sort(
-          (a, b) =>
-            (a.rank ?? runPriorities.chat) - (b.rank ?? runPriorities.chat) ||
-            a.queuedAt - b.queuedAt,
-        )[0];
-        if (
-          first === waiter &&
-          (hard === undefined || occupied.length < admissionLimit(hard, rank))
-        ) {
-          const id = this.context.createId();
-          this.#capacityReservations.set(id, { target, connection });
-          return {
-            id,
-            reservedForChat: occupied.length >= soft && hard !== 1,
-            release: () => {
-              if (this.#capacityReservations.delete(id))
-                this.wakeCapacityWaiters();
-            },
-          };
-        }
-        if (
-          first === waiter &&
-          waiter.rank !== undefined &&
-          rank <= INTERACTIVE_PRIORITY
-        )
-          yieldLowerRun(active, rank);
-        await waitForCapacityChange(changed, signal);
       }
-    } finally {
-      clearTimeout(stall);
-      unsubscribe?.();
-      this.#capacityWaiters.delete(waiter);
-      // A leaving waiter may have held the FIFO position others wait behind.
-      this.wakeCapacityWaiters();
+      const sameContext = (other: RunnerCapacityTarget) =>
+        other.runnerId === target.runnerId &&
+        other.tenantId === target.tenantId &&
+        other.executionContextKey === target.executionContextKey;
+      const busy =
+        this.activeOperations(target.runnerId).some(
+          ({ start }) =>
+            start.tenant_id === target.tenantId &&
+            start.execution_context_key === target.executionContextKey,
+        ) ||
+        [...this.#capacityReservations.values()].some(
+          (reservation) =>
+            !reservation.operationId && sameContext(reservation.target),
+        );
+      if (!busy) {
+        const id = this.context.createId();
+        this.#capacityReservations.set(id, { target, connection });
+        return {
+          id,
+          release: () => {
+            if (this.#capacityReservations.delete(id))
+              this.wakeCapacityWaiters();
+          },
+        };
+      }
+      await waitForCapacityChange(changed, signal);
     }
   }
 
@@ -279,19 +179,15 @@ export class RunnerOperations {
     const priority =
       target.priority ??
       new RunPriority(runPriorities[target.runKind ?? "chat"]);
-    let permit = target.capacityPermit;
-    // The durable claim may select a different Run than the scheduling hint.
-    if (permit?.reservedForChat && priority.value > INTERACTIVE_PRIORITY) {
-      permit.release();
-      permit = undefined;
-    }
-    permit ??= await this.acquireOperationCapacity(
-      { ...target, priority },
-      target.signal ?? new AbortController().signal,
-    );
+    const signal = target.signal ?? new AbortController().signal;
+    const waitSignal = target.preemptSignal
+      ? AbortSignal.any([signal, target.preemptSignal])
+      : signal;
+    const permit =
+      target.capacityPermit ??
+      (await this.acquireOperationCapacity(target, waitSignal));
     try {
-      // The whole Run is one unit of its endpoint's model queue. It waits
-      // holding its capacity, and readiness is checked after both waits.
+      // Holding this Context excludes a second Operation in the same session.
       const lease = await this.owners.queue().acquire(
         {
           computerId: target.runnerId,
@@ -302,11 +198,11 @@ export class RunnerOperations {
           kind: target.runKind ?? "chat",
           key: target.request.run_context.execution_run_ref,
         },
-        target.signal ?? new AbortController().signal,
+        waitSignal,
       );
       try {
         if (target.beforeYieldResume) await target.beforeYieldResume();
-        target.signal?.throwIfAborted();
+        waitSignal.throwIfAborted();
         const reservation = this.#capacityReservations.get(permit.id);
         if (
           !reservation ||
@@ -353,6 +249,16 @@ export class RunnerOperations {
         execution_context_key: operation.start.execution_context_key,
         runtime_type: operation.start.runtime_type,
         priority: operation.priority,
+        phase: operation.phase,
+        ...(operation.phase === "waiting_background"
+          ? {
+              background_tools: operation.backgroundTools.map((tool) => ({
+                call_id: tool.callId,
+                tool_name: tool.toolName,
+                started_at_unix_ms: tool.startedAtUnixMs,
+              })),
+            }
+          : {}),
         yield_blocker: operation.yieldBlocker ?? null,
       }));
   }
@@ -767,7 +673,16 @@ export class RunnerOperations {
       return;
     }
     const wasYieldable = operation.yieldBlocker === undefined;
+    const previousPhase = operation.phase;
     const acknowledgement = await operation.receive(envelope);
+    if (!operation.terminal && operation.phase !== previousPhase) {
+      const lease = this.#leases.get(operation.start.operation_id);
+      if (operation.phase === "waiting_background") {
+        lease?.suspend();
+      } else {
+        lease?.resume();
+      }
+    }
     if (
       envelope.type === "operation.event" &&
       envelope.event.type === "model.responded"
@@ -806,6 +721,11 @@ export class RunnerOperations {
       type: "latency",
       source: "run",
       latencyMs: response.first_item_at_unix_ms - response.started_at_unix_ms,
+      // The report arrives once the whole response is written.
+      endedMsAgo: Math.max(
+        0,
+        response.responded_at_unix_ms - response.first_item_at_unix_ms,
+      ),
       workTokens: response.usage.input,
     });
   }
@@ -934,19 +854,30 @@ function filterOperationTargetForDaemon(
   target: RunnerOperationTarget,
   daemonVersion: string,
 ): RunnerOperationTarget {
-  if (
-    isComputerVersionAtLeast(daemonVersion, FIRST_STOP_HOOK_COMPUTER_VERSION) ||
-    target.request.run_context.stop_hook === undefined
-  ) {
+  const stripStopHook =
+    !isComputerVersionAtLeast(
+      daemonVersion,
+      FIRST_STOP_HOOK_COMPUTER_VERSION,
+    ) && target.request.run_context.stop_hook !== undefined;
+  const stripPreviousSession =
+    !isComputerVersionAtLeast(
+      daemonVersion,
+      FIRST_PREVIOUS_SESSION_COMPUTER_VERSION,
+    ) && target.request.previous_session !== undefined;
+  if (!stripStopHook && !stripPreviousSession) {
     return target;
   }
-  const filteredRunContext = { ...target.request.run_context };
-  delete filteredRunContext.stop_hook;
+  const filteredRequest = { ...target.request };
+  if (stripStopHook) {
+    const filteredRunContext = { ...filteredRequest.run_context };
+    delete filteredRunContext.stop_hook;
+    filteredRequest.run_context = filteredRunContext;
+  }
+  if (stripPreviousSession) {
+    delete filteredRequest.previous_session;
+  }
   return {
     ...target,
-    request: {
-      ...target.request,
-      run_context: filteredRunContext,
-    },
+    request: filteredRequest,
   };
 }

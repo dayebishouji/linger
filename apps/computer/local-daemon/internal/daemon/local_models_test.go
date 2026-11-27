@@ -344,7 +344,13 @@ func TestPublishLocalModelsDowngradesDiagnosticsForOlderServices(t *testing.T) {
 		},
 	}
 
-	// Without local_models_diagnostics or local_models_engine, new fields and codes are downgraded cleanly.
+	// Without local_models_diagnostics, local_models_engine, or local_models_concurrency_probe,
+	// new fields and codes are downgraded cleanly.
+	probing := true
+	rich.Models = append(rich.Models, wire.LocalModel{
+		ID: "m4:Q4", Name: "M4", Quant: "Q4", Fit: "gpu", Pool: "gpu:0", State: "loading",
+		ConcurrencyProbing: &probing,
+	})
 	streamOld := &browserEventStream{}
 	dOld := &Daemon{computerID: "computer", protocolVersion: protocol.Version, localModelsStream: streamOld}
 	dOld.PublishLocalModels(rich)
@@ -358,6 +364,9 @@ func TestPublishLocalModelsDowngradesDiagnosticsForOlderServices(t *testing.T) {
 	if oldFrame.LocalModels.Models[0].Engine != "" || oldFrame.LocalModels.Models[0].EngineLabel != "" ||
 		oldFrame.LocalModels.Models[0].Concurrency != nil || oldFrame.LocalModels.Models[0].HostRamBytes != nil {
 		t.Fatalf("legacy service received engine metadata: %+v", oldFrame.LocalModels.Models[0])
+	}
+	if oldFrame.LocalModels.Models[3].ConcurrencyProbing != nil {
+		t.Fatalf("legacy service received concurrency_probing: %+v", oldFrame.LocalModels.Models[3])
 	}
 	r0 := oldFrame.LocalModels.Models[0].Availability.Reason
 	if r0 == nil || r0.Code != "PLATFORM_UNSUPPORTED" || r0.RequiredCuda != "" || r0.DetectedCuda != "" {
@@ -391,11 +400,13 @@ func TestPublishLocalModelsDowngradesDiagnosticsForOlderServices(t *testing.T) {
 		t.Fatalf("diagnostics-only service received engine metadata: %+v", diagFrame.LocalModels.Models[0])
 	}
 
-	// With both local_models_diagnostics and local_models_engine, all fields pass through intact.
+	// With local_models_diagnostics, local_models_engine, and local_models_concurrency_probe,
+	// all fields pass through intact.
 	streamFull := &browserEventStream{}
 	dFull := &Daemon{computerID: "computer", protocolVersion: protocol.Version, localModelsStream: streamFull}
 	dFull.localModelsDiagnostics.Store(true)
 	dFull.localModelsEngine.Store(true)
+	dFull.localModelsConcurrencyProbe.Store(true)
 	dFull.PublishLocalModels(rich)
 	var fullFrame wire.RunnerLocalModels
 	if err := json.Unmarshal(streamFull.events[0].Payload, &fullFrame); err != nil {
@@ -406,5 +417,54 @@ func TestPublishLocalModelsDowngradesDiagnosticsForOlderServices(t *testing.T) {
 		m0.Concurrency == nil || *m0.Concurrency != 1 ||
 		m0.HostRamBytes == nil || *m0.HostRamBytes != hostRAM {
 		t.Fatalf("full frame lost engine fields: %+v", m0)
+	}
+	if m3 := fullFrame.LocalModels.Models[3]; m3.ConcurrencyProbing == nil || !*m3.ConcurrencyProbing {
+		t.Fatalf("full frame lost concurrency_probing: %+v", m3)
+	}
+	// Diagnostics + engine without concurrency_probe still strips concurrency_probing.
+	if diagFrame.LocalModels.Models[3].ConcurrencyProbing != nil {
+		t.Fatalf("service without concurrency_probe received concurrency_probing: %+v", diagFrame.LocalModels.Models[3])
+	}
+}
+
+func TestPublishLocalModelsGatesExternalHolders(t *testing.T) {
+	snapshot := wire.LocalModelsSnapshot{
+		Pools: []wire.LocalModelPool{
+			{ID: "gpu:0", Kind: "gpu", ExternalHolders: []wire.LocalModelPoolExternalHolder{{Name: "msedge", Bytes: 10}}},
+			{ID: "ram", Kind: "ram", ExternalHolders: []wire.LocalModelPoolExternalHolder{}},
+		},
+	}
+	publish := func(feature bool) []map[string]any {
+		t.Helper()
+		stream := &browserEventStream{}
+		d := &Daemon{computerID: "computer", protocolVersion: protocol.Version, localModelsStream: stream}
+		d.localModelsExternalHolders.Store(feature)
+		d.PublishLocalModels(snapshot)
+		var frame struct {
+			LocalModels struct {
+				Pools []map[string]any `json:"pools"`
+			} `json:"local_models"`
+		}
+		if err := json.Unmarshal(stream.events[0].Payload, &frame); err != nil {
+			t.Fatal(err)
+		}
+		return frame.LocalModels.Pools
+	}
+
+	for _, pool := range publish(false) {
+		if _, ok := pool["external_holders"]; ok {
+			t.Fatalf("legacy service received external_holders: %+v", pool)
+		}
+	}
+	if len(snapshot.Pools[0].ExternalHolders) != 1 || snapshot.Pools[1].ExternalHolders == nil {
+		t.Fatalf("stripping mutated the caller's snapshot: %+v", snapshot.Pools)
+	}
+
+	pools := publish(true)
+	if holders, ok := pools[0]["external_holders"].([]any); !ok || len(holders) != 1 {
+		t.Fatalf("holders did not pass through: %+v", pools[0])
+	}
+	if holders, ok := pools[1]["external_holders"].([]any); !ok || len(holders) != 0 {
+		t.Fatalf("empty holders did not pass through as []: %+v", pools[1])
 	}
 }

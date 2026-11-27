@@ -213,6 +213,53 @@ describe("Agent memory lifecycle", () => {
     },
   );
 
+  it("extracts and publishes Antigravity memory when history inspection is available, and skips when unsupported", async () => {
+    const supported = fixture({
+      ghostRuntime: {
+        type: "local",
+        placement: {
+          ...OWNER,
+          runtimeType: "antigravity",
+          computerId: "computer-1",
+        },
+      },
+      canReadHistory: (_computerId, runtimeType) =>
+        runtimeType === "antigravity",
+    });
+    try {
+      await supported.coordinator.wake("A");
+      expect(supported.host.inspectDebugContextHistory).toHaveBeenCalled();
+      expect(supported.stages()).toEqual(["extract", "consolidate"]);
+      expect(supported.documents.get("A")?.memory).toContain("lantern-482");
+      expect(supported.respond.mock.calls[0]?.[0]).toMatchObject({
+        placement: expect.objectContaining({ runtimeType: "antigravity" }),
+      });
+    } finally {
+      await supported.coordinator.close();
+    }
+
+    const unsupported = fixture({
+      ghostRuntime: {
+        type: "local",
+        placement: {
+          ...OWNER,
+          runtimeType: "antigravity",
+          computerId: "computer-legacy",
+        },
+      },
+      canReadHistory: () => false,
+    });
+    try {
+      await unsupported.coordinator.wake("A");
+      expect(
+        unsupported.host.inspectDebugContextHistory,
+      ).not.toHaveBeenCalled();
+      expect(unsupported.stages()).toEqual([]);
+    } finally {
+      await unsupported.coordinator.close();
+    }
+  });
+
   it("extracts, consolidates and publishes in one wake on the Agent's own Computer", async () => {
     const f = fixture();
     try {
@@ -1950,6 +1997,219 @@ describe("Agent memory sized to the model's context window", () => {
       f.advance(60_000);
       await f.coordinator.wake("A");
       expect(f.stages()).toEqual(["extract", "consolidate"]);
+    } finally {
+      await f.coordinator.close();
+    }
+  });
+
+  it("persists pending.target, survives offline switch and restart, and recovers on Runtime or model change", async () => {
+    let runtimeType: "codex" | "claude" = "codex";
+    let model = "gpt-5-old";
+    let readable = true;
+    const f = fixture({ canReadHistory: () => readable });
+    vi.mocked(f.host.getGhost).mockImplementation(
+      async () =>
+        ({
+          runtime: {
+            type: "local",
+            model,
+            placement: {
+              ...OWNER,
+              computerId: "computer-1",
+              runtimeType,
+            },
+          },
+        }) as never,
+    );
+    f.respond.mockImplementation(async (request) => {
+      if (model === "gpt-5-old" && stageOf(request) === "extract") {
+        throw new ModelCallError("timed_out", "Timed out on previous model");
+      }
+      return validOutput(request);
+    });
+    try {
+      await f.coordinator.wake("A");
+      f.advance(60_000);
+      await f.coordinator.wake("A");
+      f.advance(2 * 60_000);
+      await f.coordinator.wake("A");
+      expect(f.documents.get("A")!.pending).toMatchObject({
+        stage: "extract",
+        attempt: 3,
+        target: JSON.stringify(["computer-1", "codex", "gpt-5-old"]),
+      });
+
+      // Switch Runtime while Computer history is offline: must NOT overwrite pending.target.
+      runtimeType = "claude";
+      model = "claude-sonnet-4-6";
+      readable = false;
+      f.advance(4 * 60_000);
+      await f.coordinator.wake("A");
+      expect(f.documents.get("A")!.pending).toMatchObject({
+        stage: "extract",
+        attempt: 3,
+        target: JSON.stringify(["computer-1", "codex", "gpt-5-old"]),
+      });
+
+      // Once Computer is readable again, the persisted target mismatch resets the checkpoint.
+      readable = true;
+      f.advance(8 * 60_000);
+      await f.coordinator.wake("A");
+      expect(f.logger.log).toHaveBeenCalledWith(
+        "info",
+        "agent_memory.pending_reset",
+        expect.objectContaining({
+          agentId: "A",
+          stage: "extract",
+          reason: "runtime_changed",
+        }),
+      );
+      expect(f.documents.get("A")!.pending).toBeUndefined();
+      expect(f.documents.get("A")!.memory).toContain("lantern-482");
+    } finally {
+      await f.coordinator.close();
+    }
+  });
+
+  it("recovers a persisted exhausted consolidate checkpoint after restart when target changed", async () => {
+    const f = fixture();
+    f.documents.set("A", {
+      revision: 3,
+      summary: "",
+      memory: "",
+      sessions: {
+        ["a".repeat(64)]: {
+          context_key: encodeExecutionContextRef({
+            kind: "meta",
+            agentId: "A",
+            roomId: "room-A",
+          }),
+          thread_id: "thread-A",
+          through: 1,
+          updated_revision: 3,
+          summary: "Discussed lantern-482",
+          raw_memory: "Remember lantern-482",
+        },
+      },
+      cursors: {},
+      pending: {
+        stage: "consolidate",
+        prompt: JSON.stringify({
+          previous: "",
+          memory_sections: [],
+          extractions: [],
+        }),
+        attempt: 3,
+        target: JSON.stringify(["computer-1", "codex", "gpt-5-old"]),
+      },
+    });
+    try {
+      await f.coordinator.wake("A");
+      expect(f.logger.log).toHaveBeenCalledWith(
+        "info",
+        "agent_memory.pending_reset",
+        expect.objectContaining({
+          agentId: "A",
+          stage: "consolidate",
+          reason: "runtime_changed",
+        }),
+      );
+      expect(f.documents.get("A")!.pending).toBeUndefined();
+      expect(f.documents.get("A")!.memory).toContain("lantern-482");
+    } finally {
+      await f.coordinator.close();
+    }
+  });
+
+  it("recovers an exhausted extract checkpoint on the same target when the native thread changed", async () => {
+    const f = fixture();
+    const contextKey = encodeExecutionContextRef({
+      kind: "meta",
+      agentId: "A",
+      roomId: "room-A",
+    });
+    f.documents.set("A", {
+      revision: 3,
+      summary: "",
+      memory: "",
+      sessions: {},
+      cursors: {},
+      pending: {
+        stage: "extract",
+        prompt: JSON.stringify({
+          source_context: contextKey,
+          previous: null,
+          records: [],
+        }),
+        source_key: "source-key",
+        thread_id: "old-thread-from-prior-runtime",
+        through: 0,
+        attempt: 3,
+        target: JSON.stringify(["computer-1", "codex", ""]),
+      },
+    });
+    try {
+      await f.coordinator.wake("A");
+      expect(f.logger.log).toHaveBeenCalledWith(
+        "info",
+        "agent_memory.pending_reset",
+        expect.objectContaining({
+          agentId: "A",
+          stage: "extract",
+          reason: "thread_changed",
+        }),
+      );
+      expect(f.documents.get("A")!.pending).toBeUndefined();
+      expect(f.documents.get("A")!.memory).toContain("lantern-482");
+    } finally {
+      await f.coordinator.close();
+    }
+  });
+
+  it("recovers a legacy exhausted consolidate checkpoint without target once after upgrade", async () => {
+    const f = fixture();
+    f.documents.set("A", {
+      revision: 3,
+      summary: "",
+      memory: "",
+      sessions: {
+        ["a".repeat(64)]: {
+          context_key: encodeExecutionContextRef({
+            kind: "meta",
+            agentId: "A",
+            roomId: "room-A",
+          }),
+          thread_id: "thread-A",
+          through: 1,
+          updated_revision: 3,
+          summary: "Discussed lantern-482",
+          raw_memory: "Remember lantern-482",
+        },
+      },
+      cursors: {},
+      pending: {
+        stage: "consolidate",
+        prompt: JSON.stringify({
+          previous: "",
+          memory_sections: [],
+          extractions: [],
+        }),
+        attempt: 3,
+      },
+    });
+    try {
+      await f.coordinator.wake("A");
+      expect(f.logger.log).toHaveBeenCalledWith(
+        "info",
+        "agent_memory.pending_reset",
+        expect.objectContaining({
+          agentId: "A",
+          stage: "consolidate",
+          reason: "legacy_target_unknown",
+        }),
+      );
+      expect(f.documents.get("A")!.pending).toBeUndefined();
+      expect(f.documents.get("A")!.memory).toContain("lantern-482");
     } finally {
       await f.coordinator.close();
     }

@@ -70,6 +70,11 @@ components:
           $ref: "./common.yaml#/components/schemas/Id"
         local_runtime_type:
           $ref: "./domain.yaml#/components/schemas/LocalRuntimeType"
+        runtime_model:
+          type: string
+          minLength: 1
+          maxLength: 160
+          description: The model configured for the Another Me on its local Runtime.
         status:
           type: string
           enum: [active, updating]
@@ -607,6 +612,10 @@ components:
           allOf:
             - $ref: "#/components/schemas/AgentRuntimePositiveInt64"
           description: Loaded registration revision for automatic stale-session clearing. Requires the same active registration and rejects a Session compatible through proven profile initialization. Omit only for an explicit Session reset.
+        recovery_reason:
+          type: string
+          enum: [session_not_found, context_too_long]
+          description: Runtime failure code that triggers a same-revision Session reset on an idle active Context. Mutually exclusive with expected_current_configuration_revision.
     ClearAgentRuntimeSessionResult:
       type: object
       additionalProperties: false
@@ -692,6 +701,15 @@ components:
             unattributed conversation Message, presentation sequence, or emoji
             Reaction written by the Context's Agent in the Room or its Threads
             since the Run started.
+        replied_inbox_ids:
+          type: array
+          items:
+            type: string
+          description: >-
+            The Inboxes that hold such a reply: the Inbox of the Room or
+            Thread it is in (`room:<id>`, `thread:<id>`) and of each Task whose
+            work Room that is (`task:<id>`). A Run that took up mentions from
+            several Inboxes has answered only those listed.
     ClaimAgentLocalRunRequest:
       type: object
       additionalProperties: false
@@ -729,6 +747,43 @@ components:
         continues_context:
           type: boolean
           description: The Context received input before this Run's first input.
+        recent_messages:
+          $ref: "#/components/schemas/AgentLocalRunRecentMessages"
+    AgentLocalRunRecentMessage:
+      type: object
+      additionalProperties: false
+      required: [message_id, author, author_kind, body, created_at]
+      properties:
+        message_id:
+          type: string
+        author:
+          type: string
+        author_kind:
+          type: string
+        body:
+          type: string
+        truncated:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+    AgentLocalRunRecentMessages:
+      type: object
+      additionalProperties: false
+      description: >-
+        Bounded slice of recent product messages preceding a Run's first input,
+        returned only when the Context currently has no persisted Runtime Session
+        and continues earlier work.
+      required: [inbox_id, messages]
+      properties:
+        inbox_id:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentLocalRunRecentMessage"
+        next_cursor:
+          type: string
     AgentProfileUpdate:
       type: object
       additionalProperties: false
@@ -1005,14 +1060,6 @@ components:
           type: boolean
         has_pending_work:
           type: boolean
-        next_run_origins:
-          type: array
-          description: >-
-            Distinct scheduling metadata of the initial inputs of every
-            claimable queued Run. The Run claimed next serves them all, so it
-            waits as the most urgent of them.
-          items:
-            $ref: "#/components/schemas/AgentRunInputOrigin"
         message_steers:
           type: array
           maxItems: 1024
@@ -1023,29 +1070,6 @@ components:
             or a native question's answer assigned to the Run that asked it.
           items:
             $ref: "#/components/schemas/StoredAgentRuntimeInput"
-    AgentRunInputOrigin:
-      type: object
-      additionalProperties: false
-      required:
-        [
-          notification,
-          task_inbox,
-          author_type,
-          message_kind,
-          fired_routine,
-          human_waiting,
-        ]
-      properties:
-        notification: { type: boolean }
-        task_inbox: { type: boolean }
-        author_type: { type: string }
-        message_kind: { type: string }
-        fired_routine: { type: boolean }
-        human_waiting:
-          type: boolean
-          description: >-
-            A Human acted through this hidden Message, by answering a card or
-            asking during a recording, and waits for the Agent's answer.
     AgentRuntimeWaitingContexts:
       type: object
       additionalProperties: false
@@ -1093,21 +1117,23 @@ components:
           const: status.changed
         status:
           type: string
-          enum: [queued, working, thinking]
+          enum: [queued, working, thinking, waiting_background]
         title:
           type: string
           minLength: 1
           maxLength: 50000
           description: >-
-            Optional public queue label for queued, or the full provider-visible reasoning
-            summary title for thinking. Omit for working; raw reasoning is never allowed.
+            Optional public queue label for queued, or the full provider-visible reasoning summary
+            title for thinking. Omit for working and waiting_background; raw reasoning is never
+            allowed.
     AgentRuntimeExecutionFailure:
       type: object
       additionalProperties: false
       required: [code]
       description: >-
-        Public classified failure; contains no native error text, paths, credentials, or task input.
+        Public classified failure; contains no credentials, raw secrets, or task input.
         Each code is set where the failure is observed, from structured signals only.
+        detail is an optional redacted, single-line diagnostic summary for Activity display.
         model_unavailable means the model service refused the selected model for the
         Runtime's account, so the Agent needs another model or another sign-in.
         model_not_offered means the Agent's Computer does not offer the selected model for
@@ -1117,6 +1143,10 @@ components:
         model (not enough free memory, not fully downloaded, or loading took too long), so the
         Runtime did not start; the person can manage it on the Computer's Models page or
         choose another model.
+        model_gateway_unavailable means the Agent's Computer could not start or reach its
+        local model gateway (such as Bifrost for BYOK), so the Runtime did not start; the
+        person can check the Computer's Models page or Local Computer diagnostics before
+        retrying.
         context_too_long means the conversation no longer fits the model's context window.
         model_service_error means the model service reported a server-side error.
         timeout means the Runtime hit its local execution deadline.
@@ -1127,11 +1157,13 @@ components:
         authorization checks that fail or time out, and authorization expiry. This code
         does not currently cover unknown effects caused by control-plane disconnection.
         It remains a failed Run and must not be automatically replayed; verify its effects
-        before starting another Run. reply_undelivered means a Room Run finished, but every
-        message the Agent tried to post failed, so the Room received no reply from it.
-        reply_not_sent means a Room Run finished without trying to post anything while a
-        Human who mentioned the Agent waited for its reply; the Runtime ended the turn in
-        text nobody sees, which is not posted for it.
+        before starting another Run. reply_undelivered means a Room Run finished while
+        a Human who mentioned the Agent waited for its reply, every message write the
+        Agent tried to post failed, and no reply reached the Room.
+        reply_not_sent means a Room Run finished while a Human who mentioned the Agent
+        waited for its reply and no reply reached the Room without any failed message
+        write attempt (for instance, the Runtime ended the turn in text nobody sees,
+        which is not posted for it).
         interrupted means the Run stopped before it finished for a reason other than a user
         cancellation, such as a restart or a Runner stopped on its Computer; part of its work
         may have taken effect and it is not replayed.
@@ -1155,6 +1187,7 @@ components:
               model_unavailable,
               model_not_offered,
               local_model_unavailable,
+              model_gateway_unavailable,
               context_too_long,
               model_service_error,
               timeout,
@@ -1174,6 +1207,13 @@ components:
           type: string
           maxLength: 80
           pattern: '^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$'
+        detail:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: >-
+            Optional redacted, single-line diagnostic detail explaining why the Run failed,
+            for display in the Activity log. Must contain no credentials or control characters.
     AgentRuntimeStoppedStatusChangedEvent:
       type: object
       additionalProperties: false
@@ -1464,9 +1504,6 @@ components:
         last_seen_at:
           type: string
           format: date-time
-        capacity:
-          type: integer
-          minimum: 0
         runtimes:
           type: array
           items:
@@ -1541,6 +1578,8 @@ components:
         capacity:
           type: integer
           minimum: 0
+          deprecated: true
+          description: Accepted from older Agent Services and ignored by TeamHub.
         runtimes:
           type: array
           items:
@@ -1778,7 +1817,18 @@ components:
               type: integer
               minimum: 0
               maximum: 3
-              description: Invalid or timed-out outputs produced for this stage; 3 stops maintenance for this Agent.
+              description: >-
+                Invalid or timed-out outputs produced for this stage; 3 pauses
+                maintenance for this Agent until its execution target or source
+                thread changes.
+            target:
+              type: string
+              minLength: 1
+              maxLength: 512
+              description: >-
+                Execution target (Computer, Runtime, and model) that recorded
+                the current pending attempts; switching to another target resets
+                an exhausted pending stage.
 
     CreateRuntimeHumanInteractionRequest:
       type: object

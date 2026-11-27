@@ -38,7 +38,15 @@ export type ServiceFeature =
   | "local_models_diagnostics"
   | "model_invoke_outcomes"
   | "local_models_engine"
-  | "local_model_unavailable";
+  | "local_models_concurrency_probe"
+  | "local_model_unavailable"
+  | "model_gateway_unavailable"
+  | "local_models_external_holders"
+  | "runtime_failure_detail"
+  | "operation_background_wait"
+  | "dynamic_reasoning_efforts"
+  | "antigravity_history"
+  | "antigravity_usage_provider";
 export type JsonValue =
   | null
   | boolean
@@ -55,6 +63,7 @@ export type AgentRunnerEnsure = AgentRunnerWireIdentity & {
   registration_id: Id;
   assignment_revision: PositiveInteger;
 };
+export type ReasoningEffort = string;
 export type AgentRunnerRemove = AgentRunnerWireIdentity & {
   type: "agent_runner.remove";
 };
@@ -725,6 +734,20 @@ export type RunEvent =
       path: string;
     }
   | {
+      type: "run.background_waiting";
+      observed_at_unix_ms: NonNegativeInteger;
+      tools: {
+        call_id: Id;
+        tool_name: string;
+        started_at_unix_ms: NonNegativeInteger;
+      }[];
+    }
+  | {
+      type: "run.background_resumed";
+      observed_at_unix_ms: NonNegativeInteger;
+      trigger: "background_continuation" | "user_input";
+    }
+  | {
       type: "run.completed";
     }
   | {
@@ -782,7 +805,7 @@ export type RunUsage = [
     output: NonNegativeInteger;
     reasoning?: NonNegativeInteger;
     model: string;
-    provider: "openai" | "anthropic" | "unknown";
+    provider: "openai" | "anthropic" | "antigravity" | "unknown";
     last?: RunTokenCounts;
     compaction_count?: NonNegativeInteger;
   },
@@ -793,7 +816,7 @@ export type RunUsage = [
     output: NonNegativeInteger;
     reasoning?: NonNegativeInteger;
     model: string;
-    provider: "openai" | "anthropic" | "unknown";
+    provider: "openai" | "anthropic" | "antigravity" | "unknown";
     last?: RunTokenCounts;
     compaction_count?: NonNegativeInteger;
   }[],
@@ -902,14 +925,7 @@ export interface AgentRunnerWireIdentity {
 export interface RuntimeConfig {
   type: "codex" | "claude" | "pi" | "antigravity";
   model?: string;
-  reasoning_effort?:
-    | "none"
-    | "low"
-    | "medium"
-    | "high"
-    | "xhigh"
-    | "max"
-    | "ultra";
+  reasoning_effort?: ReasoningEffort;
 }
 export interface AgentCliProfile {
   url: string;
@@ -1008,7 +1024,7 @@ export interface ProviderPrepare {
   connection_epoch: PositiveInteger;
   agent_id: Id;
   workspace_grant_id: Id;
-  runtime_type: "codex" | "claude" | "pi";
+  runtime_type: "codex" | "claude" | "pi" | "antigravity";
   execution_context_key: ExecutionContextKey;
   runtime_instance_id: ExecutionContextKey;
   context_view_ref: ContextViewRef;
@@ -1024,7 +1040,7 @@ export interface ProviderPrepareRunContext {
   stop_hook?: boolean;
 }
 /**
- * Compacts the native session of the process parked for this Context with the Runtime's own compaction. It never starts a process; without a parked process the answer is no_process.
+ * Compacts the native session of the process parked for this Context with the Runtime's own compaction. It never starts a process; without a parked process the answer is no_process. Pi and Antigravity compaction are sent only to Computer releases that decode them.
  */
 export interface SessionCompact {
   type: "execute";
@@ -1034,13 +1050,13 @@ export interface SessionCompact {
   runner_id: Id;
   connection_epoch: PositiveInteger;
   agent_id: Id;
-  runtime_type: "codex" | "claude";
+  runtime_type: "codex" | "claude" | "pi" | "antigravity";
   execution_context_key: ExecutionContextKey;
   instructions?: string;
   kind: "session_compact";
 }
 /**
- * Runs one model call on the Computer's signed-in Codex or Claude CLI in a fresh temporary directory, outside the Operation ledger and without a Context. Only structured carries output_schema, which it requires; only workspace carries workspace_files, the input files of the temporary directory, and gets its tree back. A workspace file may not be AGENTS.md, AGENTS.override.md or CLAUDE.md at the root or lie under a .codex or .claude directory. Codex cannot read files in workspace mode, so the Daemon also inlines the workspace files into the prompt and Codex writes only through apply_patch. The Daemon answers failed for a request that breaks these rules, and for a reply whose encoded model.invoked would exceed the frame limit.
+ * Runs one model call on the Computer's signed-in Codex, Claude, Pi, or Antigravity CLI in a fresh temporary directory, outside the Operation ledger and without a Context. Only structured carries output_schema, which it requires; only workspace carries workspace_files, the input files of the temporary directory, and gets its tree back. A workspace file may not be AGENTS.md, AGENTS.override.md or CLAUDE.md at the root or lie under a .codex or .claude directory. Codex cannot read files in workspace mode, so the Daemon also inlines the workspace files into the prompt and Codex writes only through apply_patch. Pi and Antigravity do not support workspace mode. The Daemon answers failed for a request that breaks these rules, and for a reply whose encoded model.invoked would exceed the frame limit.
  */
 export interface ModelInvoke {
   type: "execute";
@@ -1052,7 +1068,11 @@ export interface ModelInvoke {
   tenant_id: Id;
   owner_actor_id: Id;
   agent_id: Id;
-  runtime_type: "codex" | "claude" | "pi";
+  runtime_type: "codex" | "claude" | "pi" | "antigravity";
+  /**
+   * Explicit provider model to run on this Runtime. Omitted leaves selection to the Runtime's own default; sent only to a Computer release that decodes it.
+   */
+  model?: string;
   mode: "structured" | "text" | "workspace";
   reasoning_effort: "low" | "medium" | "high";
   instructions?: string;
@@ -1082,10 +1102,18 @@ export interface ContextRunStartRequest {
   runtime: RuntimeConfig;
   session_options: SessionOptions;
   session: OpaqueObject;
+  previous_session?: PreviousRuntimeSession;
   input: AgentInput;
   run_context: ContextRunContext;
   cli_run_context?: CliRunContext;
   run_resources: LocalRunResources;
+}
+/**
+ * Identifies the superseded native session of this Context so a fresh run.start can export its local transcript into ./playground/.previous-context.md.
+ */
+export interface PreviousRuntimeSession {
+  provider_type: "codex" | "claude" | "pi" | "antigravity";
+  session_id: string;
 }
 export interface AgentInput {
   type: "text";
@@ -1177,7 +1205,7 @@ export interface RunnerHello {
   runtime_registrations: RuntimeRegistrationObservation[];
   sent_at: Timestamp;
   /**
-   * Optional Computer-wide active Operation limit. Omission means unlimited.
+   * Deprecated. Older Computers can report a locally enforced Operation limit. The gateway schedules by model endpoint.
    */
   capacity?: number;
   /**
@@ -1223,23 +1251,11 @@ export interface RuntimeDiagnostic {
 export interface RuntimeModel {
   id: string;
   label: string;
-  allowed_reasoning_effort: (
-    | "none"
-    | "low"
-    | "medium"
-    | "high"
-    | "xhigh"
-    | "max"
-    | "ultra"
-  )[];
-  default_reasoning_effort?:
-    | "none"
-    | "low"
-    | "medium"
-    | "high"
-    | "xhigh"
-    | "max"
-    | "ultra";
+  /**
+   * @maxItems 32
+   */
+  allowed_reasoning_effort: ReasoningEffort[];
+  default_reasoning_effort?: ReasoningEffort;
   /**
    * Context length in tokens, from the gateway on the Runtime's API link, the window declared to Claude on its API link, or the Runtime's own catalog; absent when unknown.
    */
@@ -1383,6 +1399,13 @@ export interface LocalModelPool {
    * @maxItems 256
    */
   holders: LocalModelPoolHolder[];
+  /**
+   * Closeable desktop applications holding this pool's memory, as localmodels reports them. [] means localmodels looked and found none; an absent field means not reported. Sent only when service_features declares local_models_external_holders.
+   *
+   * @minItems 0
+   * @maxItems 256
+   */
+  external_holders?: LocalModelPoolExternalHolder[];
 }
 /**
  * Something holding pool memory. A component is a foundation service (embedding, reranker, speech) that is never a model row.
@@ -1390,6 +1413,13 @@ export interface LocalModelPool {
 export interface LocalModelPoolHolder {
   kind: "model" | "component";
   id: string;
+  name: string;
+  bytes: NonNegativeInteger;
+}
+/**
+ * A desktop application outside localmodels holding pool memory, such as a browser, video player, or game, that the user could close.
+ */
+export interface LocalModelPoolExternalHolder {
   name: string;
   bytes: NonNegativeInteger;
 }
@@ -1473,9 +1503,13 @@ export interface LocalModel {
    */
   engine_label?: string;
   /**
-   * Maximum concurrent request slots for this model when loaded. Sent only when runner.welcome service_features names local_models_engine.
+   * Maximum concurrent request slots configured or probed for this model when loaded. Sent only when runner.welcome service_features names local_models_engine.
    */
   concurrency?: number;
+  /**
+   * True while a model is running its post-load max-concurrency probe before reporting loaded. Sent only when runner.welcome service_features names local_models_concurrency_probe.
+   */
+  concurrency_probing?: boolean;
   /**
    * Additional host system RAM used alongside GPU VRAM for hybrid offload engines. Sent only when runner.welcome service_features names local_models_engine.
    */
@@ -1741,7 +1775,11 @@ export interface DebugHistoryInspectionResult {
   status: DebugInspectionStatus;
   provider_kind: string;
   reason?: string;
-  source?: "codex_rollout" | "claude_transcript" | "pi_session";
+  source?:
+    | "codex_rollout"
+    | "claude_transcript"
+    | "pi_session"
+    | "antigravity_transcript";
   snapshot?: DebugHistorySnapshot;
   instructions: DebugHistoryInstructions;
   /**
@@ -1759,7 +1797,11 @@ export interface DebugHistorySnapshot {
 }
 export interface DebugHistoryInstructions {
   status: "available" | "unavailable";
-  source: "codex_rollout" | "claude_transcript" | "pi_session";
+  source:
+    | "codex_rollout"
+    | "claude_transcript"
+    | "pi_session"
+    | "antigravity_transcript";
   reason?: string;
   /**
    * @maxItems 512
@@ -2109,14 +2151,7 @@ export interface ModelSourceStatus {
   /**
    * After apply, the reasoning effort runtime_model needs; absent when it offers none.
    */
-  reasoning_effort?:
-    | "none"
-    | "low"
-    | "medium"
-    | "high"
-    | "xhigh"
-    | "max"
-    | "ultra";
+  reasoning_effort?: string;
   gateway_url?: string;
   byok: ByokSummary;
 }
@@ -2257,13 +2292,16 @@ export interface RuntimeExecutionFailure {
     | "network_error"
     | "rate_limited"
     | "model_unavailable"
+    | "model_not_offered"
     | "local_model_unavailable"
+    | "model_gateway_unavailable"
     | "context_too_long"
     | "model_service_error"
     | "timeout"
     | "execution_failed";
   runtime_type: "codex" | "claude" | "pi" | "antigravity";
   runtime_version?: string;
+  detail?: string;
 }
 export interface RuntimeFailureDiagnostics {
   exitCode?: number;

@@ -3,7 +3,7 @@ import { isInkling2MiniModelId } from "@linger/service-kit/featured-models";
 import type { Translate } from "@/i18n/language";
 import { formatBytes } from "@/lib/format-bytes";
 
-import { architectureCopy, capabilityCopy } from "./local-models-copy";
+import { architectureCopy } from "./local-models-copy";
 import { localModelsMessages as m } from "./local-models.messages";
 import type {
   LocalModel,
@@ -82,30 +82,81 @@ const fitOrder: Record<LocalModel["fit"], number> = {
   unified: 0,
 };
 
-const PREFERRED_POLY_INKLING_ID = "inkling-2-mini-q4-poly:ud-q4_k_xl";
-const PREFERRED_POLY_INKLING_QUANT = "UD-Q4_K_XL";
-const PREFERRED_INKLING_ID = "inkling-2-mini:ud-q4_k_m";
-const PREFERRED_INKLING_QUANT = "UD-Q4_K_M";
+const PREFERRED_POLY_Q4_INKLING_ID = "inkling-2-mini-q4-poly:ud-q4_k_xl";
+const PREFERRED_POLY_Q4_INKLING_QUANT = "UD-Q4_K_XL";
+const PREFERRED_INKLING_Q4_ID = "inkling-2-mini:ud-q4_k_m";
+const PREFERRED_INKLING_Q4_QUANT = "UD-Q4_K_M";
+const PREFERRED_POLY_Q3_INKLING_ID = "inkling-2-mini-q3-poly:ud-q3_k_xl";
+const PREFERRED_POLY_Q3_INKLING_QUANT = "UD-Q3_K_XL";
+const PREFERRED_INKLING_IQ3_ID = "inkling-2-mini-iq3xxs:ud-iq3_xxs";
+const PREFERRED_INKLING_IQ3_QUANT = "UD-IQ3_XXS";
+const PREFERRED_POLY_Q2_INKLING_ID = "inkling-2-mini-q2-poly:ud-q2_k_xl";
+const PREFERRED_POLY_Q2_INKLING_QUANT = "UD-Q2_K_XL";
 
 function preferredInklingRank(model: LocalModel): number {
   const id = model.id.toLowerCase();
   if (
-    id === PREFERRED_POLY_INKLING_ID ||
+    id === PREFERRED_POLY_Q4_INKLING_ID ||
     (model.engine === "polystrata" &&
-      model.quant === PREFERRED_POLY_INKLING_QUANT)
+      model.quant === PREFERRED_POLY_Q4_INKLING_QUANT)
+  ) {
+    return 5;
+  }
+  if (
+    id === PREFERRED_INKLING_Q4_ID ||
+    model.quant === PREFERRED_INKLING_Q4_QUANT
+  ) {
+    return 4;
+  }
+  if (
+    id === PREFERRED_POLY_Q3_INKLING_ID ||
+    (model.engine === "polystrata" &&
+      model.quant === PREFERRED_POLY_Q3_INKLING_QUANT)
+  ) {
+    return 3;
+  }
+  if (
+    id === PREFERRED_INKLING_IQ3_ID ||
+    model.quant === PREFERRED_INKLING_IQ3_QUANT
   ) {
     return 2;
   }
-  if (id === PREFERRED_INKLING_ID || model.quant === PREFERRED_INKLING_QUANT) {
+  if (
+    id === PREFERRED_POLY_Q2_INKLING_ID ||
+    (model.engine === "polystrata" &&
+      model.quant === PREFERRED_POLY_Q2_INKLING_QUANT)
+  ) {
     return 1;
   }
   return 0;
 }
 
+function isActionableUnavailableReason(model: LocalModel): boolean {
+  const code = model.availability.reason?.code;
+  return (
+    code === "DRIVER_UPDATE_REQUIRED" || code === "RUNTIME_DEPENDENCY_MISSING"
+  );
+}
+
+function memoryShortfallBytes(model: LocalModel): number {
+  const reason = model.availability.reason;
+  if (
+    reason?.code === "MEMORY_INSUFFICIENT" &&
+    reason.need_bytes !== undefined &&
+    reason.have_bytes !== undefined
+  ) {
+    return Math.max(0, reason.need_bytes - reason.have_bytes);
+  }
+  return reason?.need_bytes ?? model.memory_bytes;
+}
+
 /**
  * Picks the best Inkling 2 Mini entry from a Computer's library for the
  * featured spotlight: highest status first, then better hardware fit, then
- * Computer recommendation, preferring top Q4 variants when ties remain.
+ * Computer recommendation, preferring top variants when ties remain. When all
+ * variants are unavailable, actionable driver/runtime upgrades come first
+ * (preserving Computer suitability order), followed by the smallest memory
+ * shortfall.
  */
 export function featuredInklingEntry(
   entries: readonly ModelEntry[],
@@ -114,13 +165,191 @@ export function featuredInklingEntry(
     isInkling2MiniModelId(entry.model.id),
   );
   if (matching.length <= 1) return matching[0];
-  return [...matching].sort(
-    (a, b) =>
-      modelStatuses.indexOf(a.status) - modelStatuses.indexOf(b.status) ||
+  return [...matching].sort((a, b) => {
+    const statusDiff =
+      modelStatuses.indexOf(a.status) - modelStatuses.indexOf(b.status);
+    if (statusDiff !== 0) return statusDiff;
+    if (a.status === "unavailable" && b.status === "unavailable") {
+      const aActionable = isActionableUnavailableReason(a.model);
+      const bActionable = isActionableUnavailableReason(b.model);
+      if (aActionable !== bActionable) return aActionable ? -1 : 1;
+      if (aActionable && bActionable) return 0;
+      const shortfallDiff =
+        memoryShortfallBytes(a.model) - memoryShortfallBytes(b.model);
+      if (shortfallDiff !== 0) return shortfallDiff;
+      const aNeed =
+        a.model.availability.reason?.need_bytes ?? a.model.memory_bytes;
+      const bNeed =
+        b.model.availability.reason?.need_bytes ?? b.model.memory_bytes;
+      if (aNeed !== bNeed) return aNeed - bNeed;
+    }
+    return (
       fitOrder[a.model.fit] - fitOrder[b.model.fit] ||
       Number(b.model.recommended) - Number(a.model.recommended) ||
-      preferredInklingRank(b.model) - preferredInklingRank(a.model),
-  )[0];
+      preferredInklingRank(b.model) - preferredInklingRank(a.model)
+    );
+  })[0];
+}
+
+/**
+ * Whether a model is active on the Computer (installed, loading, downloading,
+ * or failed), as opposed to absent from disk (`available` or `unavailable`).
+ */
+export function isActiveOnComputer(status: ModelStatus): boolean {
+  return status !== "available" && status !== "unavailable";
+}
+
+const FEATURED_INKLING_GROUP_KEY = "featured:inkling-2-mini";
+
+/**
+ * Stable grouping key uniting sibling quantizations or engines of the same
+ * logical model. Derived strictly from structured fields (`id` for the featured
+ * Inkling 2 Mini family, else validated `source_url`, else full `id`).
+ */
+export function modelGroupKey(model: LocalModel): string {
+  if (isInkling2MiniModelId(model.id)) return FEATURED_INKLING_GROUP_KEY;
+  const sourceUrl = safeModelSourceUrl(model.source_url);
+  if (sourceUrl) return `source:${sourceUrl.toLowerCase()}`;
+  return `id:${model.id.toLowerCase()}`;
+}
+
+/**
+ * Clean model title for a grouped multi-version card: removes the structured
+ * trailing `(<quant>)` suffix appended by localmodels when a separate version
+ * picker shows the selected quantization.
+ */
+export function modelBaseName(model: LocalModel): string {
+  const name = model.name.trim();
+  if (model.quant) {
+    const suffix = ` (${model.quant})`;
+    if (
+      name.length > suffix.length &&
+      name.toLowerCase().endsWith(suffix.toLowerCase())
+    ) {
+      return name.slice(0, -suffix.length).trimEnd();
+    }
+  }
+  if (
+    isInkling2MiniModelId(model.id) &&
+    name.startsWith("Inkling 2 Mini (") &&
+    name.endsWith(")")
+  ) {
+    return "Inkling 2 Mini";
+  }
+  return model.name;
+}
+
+export interface ModelCardGroup {
+  /** Stable key for React rendering, expand state, and variant selection. */
+  key: string;
+  /** Best-fit variant for this Computer, shown by default. */
+  defaultEntry: ModelEntry;
+  /** All selectable variants in descending suitability order. */
+  variants: ModelEntry[];
+}
+
+export interface LibrarySections {
+  spotlight?: ModelCardGroup;
+  spotlightPosition: "top" | "afterAvailable";
+  onComputer: ModelCardGroup[];
+  available: ModelCardGroup[];
+  unavailable: ModelCardGroup[];
+  /** Show per-row engine pills when multiple engines or an accelerated engine exist. */
+  showEngineBadge: boolean;
+  /** True when every unavailable model failed solely for insufficient memory. */
+  unavailableAllMemory: boolean;
+}
+
+/**
+ * Groups ordered entries into logical model cards and page sections:
+ * Spotlight (Inkling 2 Mini), On this computer, Available to download, and
+ * Unavailable. Extra active variants of the same model stay visible as their
+ * own cards in On this computer so nothing installed or downloading is hidden.
+ */
+export function buildModelGroups(
+  entries: readonly ModelEntry[],
+): LibrarySections {
+  const engines = new Set(
+    entries.map((entry) => entry.model.engine).filter(Boolean),
+  );
+  const showEngineBadge =
+    engines.size > 1 || engines.has("polystrata") || engines.has("strata");
+
+  const grouped = new Map<string, ModelEntry[]>();
+  for (const entry of entries) {
+    const key = modelGroupKey(entry.model);
+    const list = grouped.get(key);
+    if (list) list.push(entry);
+    else grouped.set(key, [entry]);
+  }
+
+  let spotlight: ModelCardGroup | undefined;
+  const onComputer: ModelCardGroup[] = [];
+  const available: ModelCardGroup[] = [];
+  const unavailable: ModelCardGroup[] = [];
+
+  for (const [key, members] of grouped.entries()) {
+    const best =
+      key === FEATURED_INKLING_GROUP_KEY
+        ? (featuredInklingEntry(members) ?? members[0]!)
+        : members[0]!;
+    const ordered = [best, ...members.filter((item) => item !== best)];
+    const extraActive = ordered
+      .slice(1)
+      .filter((item) => isActiveOnComputer(item.status));
+    const extraSet = new Set(extraActive);
+    const primaryVariants = extraActive.length
+      ? ordered.filter((item) => !extraSet.has(item))
+      : ordered;
+    const primaryGroup: ModelCardGroup = {
+      defaultEntry: best,
+      key,
+      variants: primaryVariants,
+    };
+
+    if (key === FEATURED_INKLING_GROUP_KEY) {
+      spotlight = primaryGroup;
+    } else if (isActiveOnComputer(best.status)) {
+      onComputer.push(primaryGroup);
+    } else if (best.status === "available") {
+      available.push(primaryGroup);
+    } else {
+      unavailable.push(primaryGroup);
+    }
+
+    for (const extra of extraActive) {
+      onComputer.push({
+        defaultEntry: extra,
+        key: `active:${extra.model.id}`,
+        variants: [extra],
+      });
+    }
+  }
+
+  const spotlightPosition =
+    spotlight &&
+    spotlight.defaultEntry.status === "unavailable" &&
+    (onComputer.length > 0 || available.length > 0)
+      ? "afterAvailable"
+      : "top";
+
+  const unavailableAllMemory =
+    unavailable.length > 0 &&
+    unavailable.every(
+      (group) =>
+        group.defaultEntry.model.availability.reason?.code ===
+        "MEMORY_INSUFFICIENT",
+    );
+
+  return {
+    available,
+    onComputer,
+    showEngineBadge,
+    spotlight,
+    spotlightPosition,
+    unavailable,
+    unavailableAllMemory,
+  };
 }
 
 /** The library as one list: by status, then recommended, then featured, then by fit. */
@@ -213,9 +442,32 @@ export function poolHolderBytes(pool: LocalModelPool) {
   return pool.holders.reduce((sum, holder) => sum + holder.bytes, 0);
 }
 
-/** Memory in the pool used by other apps (games, browsers, video players). */
-export function poolOtherBytes(pool: LocalModelPool) {
+function poolResidualBytes(pool: LocalModelPool) {
   return Math.max(0, pool.used_bytes - poolHolderBytes(pool));
+}
+
+/**
+ * Memory in the pool held by other apps (games, browsers, video players)
+ * that the user could close. When localmodels lists those apps, only they
+ * count; an older localmodels lists none, so the whole residual counts.
+ */
+export function poolOtherBytes(pool: LocalModelPool) {
+  const residual = poolResidualBytes(pool);
+  if (pool.external_holders === undefined) return residual;
+  const listed = pool.external_holders.reduce(
+    (sum, holder) => sum + holder.bytes,
+    0,
+  );
+  return Math.min(residual, listed);
+}
+
+/**
+ * Used memory that no holder or listed app accounts for, such as an engine
+ * holding more than its catalog estimate or the driver and desktop. Closing
+ * other apps does not free it.
+ */
+export function poolUnaccountedBytes(pool: LocalModelPool) {
+  return poolResidualBytes(pool) - poolOtherBytes(pool);
 }
 
 /** Free memory plus memory currently held by external apps in one pool. */
@@ -227,11 +479,16 @@ function summarizePools(pools: readonly LocalModelPool[], gpu: boolean) {
   const totalBytes = pools.reduce((sum, pool) => sum + pool.total_bytes, 0);
   const usedBytes = pools.reduce((sum, pool) => sum + pool.used_bytes, 0);
   const otherBytes = pools.reduce((sum, pool) => sum + poolOtherBytes(pool), 0);
+  const unaccountedBytes = pools.reduce(
+    (sum, pool) => sum + poolUnaccountedBytes(pool),
+    0,
+  );
   return {
     freeBytes: Math.max(0, totalBytes - usedBytes),
     gpu,
     otherBytes,
     totalBytes,
+    unaccountedBytes,
     usedBytes,
   };
 }
@@ -261,12 +518,13 @@ export interface MemorySegments {
   componentBytes: number;
   models: MemorySegment[];
   otherBytes: number;
+  unaccountedBytes: number;
 }
 
-/** Breakdown of models, components, and other apps across the same pools `memorySummary` adds up. */
+/** Breakdown of models, components, other apps, and unaccounted use across the same pools `memorySummary` adds up. */
 export function memorySegments(view: LocalModelsView): MemorySegments {
   const { gpu, pools } = summaryPools(view);
-  const { otherBytes } = summarizePools(pools, gpu);
+  const { otherBytes, unaccountedBytes } = summarizePools(pools, gpu);
   const modelTotals = new Map<string, MemorySegment>();
   let componentBytes = 0;
   for (const pool of pools) {
@@ -288,6 +546,7 @@ export function memorySegments(view: LocalModelsView): MemorySegments {
     componentBytes,
     models: [...modelTotals.values()],
     otherBytes,
+    unaccountedBytes,
   };
 }
 
@@ -637,44 +896,6 @@ export function parametersLabel(model: LocalModel, t: Translate) {
   if (scale && architecture)
     return t(m.parametersWithArchitecture, { architecture, scale });
   return scale || architecture;
-}
-
-function allModelBadges(model: LocalModel, t: Translate): string[] {
-  const badges: string[] = [];
-  if (model.active_parameters) {
-    badges.push(t(m.activeParameters, { parameters: model.active_parameters }));
-  } else if (model.parameters) {
-    badges.push(model.parameters);
-  }
-  for (const capability of modelCapabilities(model)) {
-    badges.push(capabilityCopy(capability, t));
-  }
-  return badges;
-}
-
-const visibleBadgeCount = 3;
-
-export interface CollapsedRowBadges {
-  badges: string[];
-  overflowTitle?: string;
-}
-
-/** Concise badges and any `+N` overflow tooltip for the collapsed row, built once from structured fields. */
-export function collapsedRowBadges(
-  model: LocalModel,
-  t: Translate,
-): CollapsedRowBadges {
-  const badges = allModelBadges(model, t);
-  if (badges.length <= visibleBadgeCount) {
-    return { badges };
-  }
-  return {
-    badges: [
-      ...badges.slice(0, visibleBadgeCount),
-      `+${badges.length - visibleBadgeCount}`,
-    ],
-    overflowTitle: joinList(badges.slice(visibleBadgeCount), t),
-  };
 }
 
 function formatRemainingTime(seconds: number, t: Translate) {

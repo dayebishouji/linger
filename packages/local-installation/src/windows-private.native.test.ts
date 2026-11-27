@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   closeWindowsPrivateWorker,
+  parseWindowsPrivateFailure,
+  WINDOWS_PRIVATE_PREAMBLE,
   WINDOWS_PRIVATE_SCRIPT,
+  windowsPowerShellArguments,
+  windowsPrivateLocation,
   windowsPrivatePath,
 } from "./windows-private.js";
 import { runProcess } from "./process.js";
@@ -23,6 +27,17 @@ async function fixture() {
   await windowsPrivatePath(root, "directory", true);
   return root;
 }
+it.skipIf(process.platform !== "win32")(
+  "passes a literal path through stdin to both PowerShell launch modes",
+  { timeout: 60_000 },
+  async () => {
+    const root = await fixture();
+    const target = path.join(root, "spaces and 'quotes' \u6587");
+    await mkdir(target);
+    await windowsPrivatePath(target, "directory", true);
+    await windowsPrivatePath(target, "directory", false, runProcess);
+  },
+);
 it.skipIf(process.platform !== "win32")(
   "restores write access to a private directory with a read-only owner rule",
   { timeout: 30_000 },
@@ -85,12 +100,9 @@ it.skipIf(process.platform !== "win32")(
     const probe = (directory: string) =>
       runProcess(
         powershell,
-        [
-          "-NoProfile",
-          "-NonInteractive",
-          "-EncodedCommand",
-          Buffer.from(script, "utf16le").toString("base64"),
-        ],
+        // The full script as -EncodedCommand is the long command line that
+        // stalls behind some endpoint security; launch it as production does.
+        windowsPowerShellArguments(script),
         {
           input: JSON.stringify({
             path: directory,
@@ -228,7 +240,10 @@ it.skipIf(process.platform !== "win32")(
       },
     );
     expect(restricted.code).toBe(1);
-    expect(restricted.stdout.trim()).toBe("UNSAFE_OWNER");
+    expect(parseWindowsPrivateFailure(restricted.stdout)).toMatchObject({
+      reason: "UNSAFE_OWNER",
+      sid: "S-1-5-32-544",
+    });
   },
 );
 it.skipIf(process.platform !== "win32")(
@@ -243,6 +258,9 @@ it.skipIf(process.platform !== "win32")(
     ).rejects.toMatchObject({ reason: "UNSAFE_TYPE", path: junction });
     await expect(
       windowsPrivatePath(path.join(junction, "settings.json"), "file"),
+    ).rejects.toMatchObject({ reason: "UNSAFE_PARENT_LINK" });
+    await expect(
+      windowsPrivateLocation(path.join(junction, "not-created-yet")),
     ).rejects.toMatchObject({ reason: "UNSAFE_PARENT_LINK" });
   },
 );
@@ -278,11 +296,11 @@ it.skipIf(process.platform !== "win32")(
   },
 );
 it.skipIf(process.platform !== "win32")(
-  "accepts inherit-only ancestor Modify ACEs but rejects effective ancestor access and broad private target inheritance",
+  "accepts ancestor Modify ACEs while rejecting broad access on the private target itself",
   async () => {
     const root = await fixture();
     const child = path.join(root, "private");
-    const { mkdir } = await import("node:fs/promises");
+    const pending = path.join(root, "not-created-yet", "Linger");
     await mkdir(child);
     await windowsPrivatePath(child, "directory", true);
     const mutate = async (propagation: "InheritOnly" | "None") => {
@@ -309,14 +327,79 @@ it.skipIf(process.platform !== "win32")(
     await expect(
       windowsPrivatePath(child, "directory"),
     ).resolves.toBeUndefined();
-    // A private target also owns future descendants, so broad inheritance on
-    // the target remains forbidden even when it is inherit-only.
+    await expect(windowsPrivateLocation(child)).resolves.toBeUndefined();
+    await expect(windowsPrivateLocation(pending)).resolves.toBeUndefined();
+    // A private target also owns future descendants, so broad access on the
+    // target remains forbidden even when it is inherit-only.
     await expect(windowsPrivatePath(root, "directory")).rejects.toMatchObject({
       reason: "SHARED_ACCESS",
     });
     await mutate("None");
-    await expect(windowsPrivatePath(child, "directory")).rejects.toMatchObject({
-      reason: "UNSAFE_PARENT_ACCESS",
+    await expect(
+      windowsPrivatePath(child, "directory"),
+    ).resolves.toBeUndefined();
+    await expect(windowsPrivateLocation(child)).resolves.toBeUndefined();
+    await expect(windowsPrivateLocation(pending)).resolves.toBeUndefined();
+    await expect(windowsPrivatePath(root, "directory")).rejects.toMatchObject({
+      reason: "SHARED_ACCESS",
+    });
+    const inheritedChild = path.join(root, "inherited-child");
+    await mkdir(inheritedChild);
+    await expect(
+      windowsPrivateLocation(inheritedChild),
+    ).resolves.toBeUndefined();
+    await expect(
+      windowsPrivatePath(inheritedChild, "directory", false),
+    ).rejects.toMatchObject({ reason: "INHERITED_ACCESS" });
+    await expect(
+      windowsPrivatePath(inheritedChild, "directory", true),
+    ).resolves.toBeUndefined();
+    await expect(
+      windowsPrivatePath(inheritedChild, "directory", false),
+    ).resolves.toBeUndefined();
+  },
+);
+
+// Elevated runners return from Test-Administrator before the linked-token
+// check, so this builds and calls both Test-Administrator and
+// Test-LinkedTokenAdministrator directly.
+it.skipIf(process.platform !== "win32")(
+  "runs Test-Administrator and the in-memory linked-token check without Add-Type",
+  async () => {
+    expect(WINDOWS_PRIVATE_PREAMBLE).not.toContain("Add-Type");
+    expect(WINDOWS_PRIVATE_PREAMBLE).toContain("DefinePInvokeMethod");
+    const powershell = path.win32.join(
+      process.env.SystemRoot ?? "C:\\Windows",
+      "System32/WindowsPowerShell/v1.0/powershell.exe",
+    );
+    const probe = [
+      WINDOWS_PRIVATE_PREAMBLE,
+      "$res = [ordered]@{",
+      "  admin = (Test-Administrator).GetType().FullName",
+      "  linked = (Test-LinkedTokenAdministrator).GetType().FullName",
+      "}",
+      "[Console]::Out.Write(($res | ConvertTo-Json -Compress))",
+    ].join("\n");
+    const result = await runProcess(
+      powershell,
+      windowsPowerShellArguments(probe),
+      { timeoutMs: 30_000 },
+    );
+    expect(result.code, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      admin: "System.Boolean",
+      linked: "System.Boolean",
     });
   },
+  60_000,
+);
+it.skipIf(process.platform !== "win32")(
+  "validates existing and missing candidate directories with windowsPrivateLocation without creating them",
+  async () => {
+    const root = await fixture();
+    const pending = path.join(root, "not-created-yet", "computer");
+    await expect(windowsPrivateLocation(root)).resolves.toBeUndefined();
+    await expect(windowsPrivateLocation(pending)).resolves.toBeUndefined();
+  },
+  30_000,
 );

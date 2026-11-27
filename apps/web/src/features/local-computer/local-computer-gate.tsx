@@ -26,11 +26,12 @@ import {
   appNames,
   appOrder,
   appStatus,
+  appSupported,
   runtimeStatusLabels,
 } from "./computer-readiness";
 import { computerSetupMessages } from "./computer-setup.messages";
 import { computersMessages } from "./computers.messages";
-import { useDesktopComputer } from "./desktop-computer";
+import { useCliInstallAvailable, useDesktopComputer } from "./desktop-computer";
 import { DesktopComputerSetup } from "./desktop-computer-setup";
 import { localComputersQueryOptions } from "./local-computer-queries";
 import { LocalRuntimeAuthenticationGuidance } from "./local-runtime-authentication-guidance";
@@ -63,6 +64,7 @@ export function LocalComputerGate({
   const t = useT();
   const { client } = useTeamHubRuntime();
   const desktop = useDesktopComputer();
+  const cliInstallAvailable = useCliInstallAvailable();
   const [platform, setPlatform] = useState(browserComputerPlatform);
   // The desktop preloads this page hidden so "Open Linger" can reveal a
   // rendered Room, and the realtime stream is closed while hidden, so the gate
@@ -80,6 +82,9 @@ export function LocalComputerGate({
   const computer = gateComputer(computers.data?.items ?? []);
   const online = computer?.status === "online" && !computer.upgrade_required;
   const ready = online && hasReadyRuntime(computer);
+  const desktopOnlyStep = Boolean(
+    desktop && (!computer || !cliInstallAvailable),
+  );
   const command = computerCommand();
 
   return (
@@ -90,11 +95,8 @@ export function LocalComputerGate({
         className="workspace-scrollbar flex max-h-full w-full max-w-[560px] flex-col overflow-y-auto rounded-2xl border border-border bg-card text-foreground shadow-lg"
         role="dialog"
       >
-        <header className="border-b border-border px-6 pb-4 pt-5">
-          <p className="text-xs text-muted-foreground">
-            {t(computersMessages.gateKicker)}
-          </p>
-          <h2 className="mt-1 text-lg" id="local-computer-gate-title">
+        <header className="px-6 pb-4 pt-5">
+          <h2 className="text-lg" id="local-computer-gate-title">
             {t(computersMessages.gateTitle)}
           </h2>
           <p className="mt-1 text-sm text-muted-foreground">
@@ -114,14 +116,22 @@ export function LocalComputerGate({
             {t(computersMessages.gateReady)}
           </p>
         ) : (
-          <ol className="divide-y divide-border px-6">
-            {desktop && !computer ? (
+          <ol className="px-6">
+            {desktopOnlyStep && desktop ? (
               <GateStep
                 number={1}
-                state="current"
+                state={online ? "done" : "current"}
                 title={t(computerSetupMessages.connectThisComputer)}
               >
-                <DesktopComputerSetup desktop={desktop} />
+                {online && computer ? (
+                  <p className="mt-2 text-xs text-app-success" role="status">
+                    {t(computersMessages.computerOnline, {
+                      computer: computer.display_name,
+                    })}
+                  </p>
+                ) : (
+                  <DesktopComputerSetup desktop={desktop} />
+                )}
               </GateStep>
             ) : (
               <>
@@ -146,7 +156,7 @@ export function LocalComputerGate({
               </>
             )}
             <GateStep
-              number={desktop && !computer ? 2 : 3}
+              number={desktopOnlyStep ? 2 : 3}
               state={online ? "current" : "next"}
               title={t(computersMessages.setUpAiApp)}
             >
@@ -166,7 +176,7 @@ export function LocalComputerGate({
           </div>
         )}
 
-        <footer className="flex justify-end border-t border-border bg-muted/40 px-6 py-3">
+        <footer className="flex justify-end bg-muted/40 px-6 py-3">
           <Button
             data-voice-risk="never"
             disabled={signingOut}
@@ -239,19 +249,23 @@ function AppSetup({
   tenantId: string;
 }) {
   const t = useT();
-  const missing = appOrder.filter(
+  const apps = appOrder.filter((app) => appSupported(computer, app));
+  const missing = apps.filter(
     (app) => appStatus(computer, app) === "not_installed",
   );
-  const signIn = appOrder.filter(
+  const outdated = apps.filter(
+    (app) => appStatus(computer, app) === "incompatible",
+  );
+  const signIn = apps.filter(
     (app) => appStatus(computer, app) === "authentication_required",
   );
   return (
     <div className="mt-2 space-y-3">
       <p className="text-xs text-muted-foreground">
-        {t(computersMessages.oneReadyAppEnough)}
+        {t(computersMessages.aiAppsHint)}
       </p>
-      <ul className="divide-y divide-border rounded-lg border border-border">
-        {appOrder.map((app) => (
+      <ul className="rounded-lg border border-border">
+        {apps.map((app) => (
           <AppRow app={app} key={app} status={appStatus(computer, app)} />
         ))}
       </ul>
@@ -265,11 +279,19 @@ function AppSetup({
         </div>
       ))}
       {signIn.length === 0 ? (
-        <LocalRuntimeInstallGuidance
-          computerName={computer.display_name}
-          platform={computer.platform}
-          runtimeTypes={missing}
-        />
+        <>
+          <LocalRuntimeInstallGuidance
+            action="update"
+            computerName={computer.display_name}
+            platform={computer.platform}
+            runtimeTypes={outdated}
+          />
+          <LocalRuntimeInstallGuidance
+            computerName={computer.display_name}
+            platform={computer.platform}
+            runtimeTypes={missing}
+          />
+        </>
       ) : null}
       <p className="text-xs text-muted-foreground">
         <RichMessage

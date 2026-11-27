@@ -15,7 +15,6 @@ OWNER_FILE="${LINGER_LOCAL_OWNER_FILE:-$ROOT/.linger-runtime/local-owner.json}"
 WORKSPACE_PATH="${LINGER_LOCAL_COMPUTER_WORKSPACE:-$ROOT}"
 GRANT_ID="${LINGER_LOCAL_COMPUTER_GRANT_ID:-workspace-local-dev}"
 GRANT_LABEL="${LINGER_LOCAL_COMPUTER_GRANT_LABEL:-Linger Workspace}"
-MAX_CONCURRENT_RUNS="${LINGER_LOCAL_COMPUTER_MAX_CONCURRENT_RUNS:-${LINGER_LOCAL_COMPUTER_CAPACITY:-}}"
 STATE_DIRECTORY="${LINGER_LOCAL_COMPUTER_STATE_DIRECTORY:-$ROOT/.linger-runtime/computer}"
 CONFIG_PATH="${LINGER_LOCAL_COMPUTER_CONFIG:-$STATE_DIRECTORY/config.json}"
 CODEX_AUTH_FILE="${LINGER_CODEX_AUTH_FILE:-${CODEX_HOME:-$HOME/.codex}/auth.json}"
@@ -70,13 +69,6 @@ ensure_registration() {
 }
 
 write_config() {
-  if [[ -n "$MAX_CONCURRENT_RUNS" ]]; then
-    [[ "$MAX_CONCURRENT_RUNS" =~ ^[1-9][0-9]*$ ]] &&
-      ((MAX_CONCURRENT_RUNS <= 100)) || {
-      printf 'LINGER_LOCAL_COMPUTER_MAX_CONCURRENT_RUNS must be an integer between 1 and 100\n' >&2
-      exit 2
-    }
-  fi
   WORKSPACE_PATH="$(absolute_path "$WORKSPACE_PATH")"
   [[ -d "$WORKSPACE_PATH" ]] || {
     printf 'Local workspace is not a directory: %s\n' "$WORKSPACE_PATH" >&2
@@ -94,6 +86,38 @@ write_config() {
     [[ -n "$runtime_path" ]] || continue
     runtime_paths="$(jq -c --arg type "$runtime_type" --arg path "$(absolute_path "$runtime_path")" '. + {($type): $path}' <<<"$runtime_paths")"
   done
+  # Optional localmodels checkout override for direct `pnpm dev` testing.
+  local local_models='null'
+  if [[ -n "${LINGER_LOCALMODELS_DEV_PYTHON:-}" || -n "${LINGER_LOCALMODELS_DEV_MODULE_DIR:-}" ]]; then
+    if [[ -z "${LINGER_LOCALMODELS_DEV_PYTHON:-}" || -z "${LINGER_LOCALMODELS_DEV_MODULE_DIR:-}" ]]; then
+      printf 'LINGER_LOCALMODELS_DEV_PYTHON and LINGER_LOCALMODELS_DEV_MODULE_DIR must be set together\n' >&2
+      exit 2
+    fi
+    local lm_python lm_module lm_home lm_state lm_base
+    lm_python="$(absolute_path "$LINGER_LOCALMODELS_DEV_PYTHON")"
+    lm_module="$(absolute_path "$LINGER_LOCALMODELS_DEV_MODULE_DIR")"
+    if [[ -n "${LINGER_HOME:-}" ]]; then
+      lm_home="$(absolute_path "$LINGER_HOME")"
+      lm_state="$lm_home/runtime/localmodels/state"
+      lm_base="$lm_home/runtime/localmodels/models"
+    else
+      lm_state="$STATE_DIRECTORY/localmodels/state"
+      lm_base="$STATE_DIRECTORY/localmodels/models"
+    fi
+    mkdir -p "$lm_state" "$lm_base"
+    chmod 700 "$lm_state" "$lm_base"
+    local_models="$(jq -nc \
+      --arg python "$lm_python" \
+      --arg module_directory "$lm_module" \
+      --arg state_directory "$lm_state" \
+      --arg base_directory "$lm_base" \
+      '{
+        python: $python,
+        module_directory: $module_directory,
+        state_directory: $state_directory,
+        base_directory: $base_directory
+      }')"
+  fi
   mkdir -p "$STATE_DIRECTORY" "$(dirname "$CONFIG_PATH")"
   jq -n \
     --arg computer "$COMPUTER_ID" \
@@ -106,8 +130,8 @@ write_config() {
     --arg grant_label "$GRANT_LABEL" \
     --arg tenant "$TENANT_ID" \
     --arg workspace "$WORKSPACE_PATH" \
-    --arg max_concurrent_runs "$MAX_CONCURRENT_RUNS" \
     --argjson runtime_paths "$runtime_paths" \
+    --argjson local_models "$local_models" \
     '{
       runner_id: $computer,
       display_name: $display,
@@ -123,8 +147,8 @@ write_config() {
         scope: "owner"
       }]
     }
-    + (if $max_concurrent_runs == "" then {} else {max_concurrent_operations: ($max_concurrent_runs | tonumber)} end)
-    + (if $auth == "" then {} else {codex: {auth_file: $auth}} end)' >"$CONFIG_PATH"
+    + (if $auth == "" then {} else {codex: {auth_file: $auth}} end)
+    + (if $local_models == null then {} else {local_models: $local_models} end)' >"$CONFIG_PATH"
   chmod 600 "$CONFIG_PATH"
 }
 

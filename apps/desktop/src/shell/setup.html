@@ -65,6 +65,10 @@
         height: 190px;
         background: #f4f4f0 url("/welcome-scene.png") center / cover no-repeat;
         -webkit-app-region: drag;
+        transition: height 360ms var(--ease);
+      }
+      body[data-customizing="true"] .scene {
+        height: 76px;
       }
       .topbar {
         position: absolute;
@@ -99,6 +103,10 @@
         margin: 0 auto;
         padding: 20px 24px 16px;
         text-align: center;
+      }
+      body[data-customizing="true"] main {
+        padding-top: 14px;
+        padding-bottom: 12px;
       }
       section {
         display: none;
@@ -501,13 +509,20 @@
         margin-bottom: 0;
       }
       /* Customizing makes room for the options. */
-      section[data-customizing="true"] {
+      section[data-step="welcome"][data-customizing="true"] {
+        justify-content: safe center;
+        overflow: hidden;
         padding-bottom: 0;
+      }
+      section[data-step="welcome"][data-customizing="true"] > h1,
+      section[data-step="welcome"][data-customizing="true"] > .lead,
+      section[data-step="welcome"][data-customizing="true"] > .error {
+        flex: none;
       }
       section[data-customizing="true"] h1 {
         margin-bottom: 2px;
-        font-size: 22px;
-        line-height: 28px;
+        font-size: 21px;
+        line-height: 26px;
       }
       section[data-customizing="true"] .lead {
         font-size: 12.5px;
@@ -519,8 +534,25 @@
       section[data-customizing="true"] .spotlight-card {
         display: none;
       }
+      .welcome-scroll {
+        flex: none;
+        overflow: visible;
+        padding: 0;
+      }
+      section[data-customizing="true"] .welcome-scroll {
+        flex: 0 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        padding: 6px 0 12px;
+      }
       section[data-customizing="true"] .start {
+        flex: none;
         padding-top: 10px;
+        border-top: 1px solid transparent;
+        transition: border-color 160ms ease;
+      }
+      section[data-customizing="true"] .start[data-scrollable="true"] {
+        border-top-color: var(--line);
       }
       section[data-customizing="true"] .primary.large {
         min-height: 40px;
@@ -638,13 +670,17 @@
         background: #d9822b;
       }
       .spotlight-card {
-        width: min(100%, 468px);
+        width: min(100%, 440px);
+        order: 1;
         margin: 12px auto 0;
         padding: 8px 12px;
         border: 1px solid #e8e5dc;
         border-radius: 12px;
         background: linear-gradient(180deg, #fcfcfa 0%, #f7f5ef 100%);
         text-align: left;
+      }
+      #welcome-start:has(.install-location[data-warn="true"]) .spotlight-card {
+        margin-top: 8px;
       }
       .spotlight-card[data-recommended="true"] {
         border-color: #e6d2b5;
@@ -712,7 +748,128 @@
         line-height: 1.45;
         font-variant-numeric: tabular-nums;
       }
-      /* What downloads now, under the installing bar. */
+      .plan-actions {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        margin-top: 8px;
+      }
+      /* Flat 440px install-location bar aligned with .choices and .spotlight-card;
+         jumps above the spotlight as a warm-red alert on disk-space or path warnings. */
+      .install-location {
+        width: min(100%, 440px);
+        order: 2;
+        margin: 10px auto 0;
+        padding: 5px 10px 5px 11px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fafaf8;
+        text-align: left;
+        transition:
+          background-color 160ms ease,
+          border-color 160ms ease;
+      }
+      #featured-spotlight:not([hidden]) + .install-location[data-warn="false"] {
+        margin-top: 8px;
+      }
+      section[data-customizing="true"] .install-location {
+        margin-top: 8px;
+      }
+      .install-location .loc-row {
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 6px;
+        min-width: 0;
+        font-size: 11.5px;
+        line-height: 1.4;
+        color: var(--muted);
+      }
+      .install-location .loc-icon {
+        width: 13px;
+        height: 13px;
+        flex: none;
+        color: var(--faint);
+      }
+      .install-location .loc-label {
+        flex: none;
+        color: var(--muted);
+      }
+      .install-location .loc-path {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-family: var(--mono);
+        font-size: 11px;
+        color: #52524b;
+      }
+      .install-location .loc-actions {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        flex: none;
+      }
+      .install-location .loc-btn {
+        height: 22px;
+        padding: 0 8px;
+        border: 1px solid #e4e4de;
+        border-radius: 6px;
+        background: #fff;
+        color: #52524b;
+        font-size: 11.5px;
+        font-weight: 500;
+        text-decoration: none;
+        white-space: nowrap;
+        transition:
+          color 140ms ease,
+          border-color 140ms ease,
+          background-color 140ms ease;
+      }
+      .install-location .loc-btn:hover:not(:disabled) {
+        border-color: #c4c4bc;
+        background: #fafaf8;
+        color: var(--ink);
+      }
+      .install-location[data-warn="true"] {
+        order: 0;
+        margin-top: 10px;
+        padding: 8px 12px;
+        border-color: #f3dfd6;
+        background: #fdf6f3;
+      }
+      .install-location[data-warn="true"] .loc-icon {
+        color: var(--error);
+      }
+      .install-location[data-warn="true"] .loc-label {
+        color: var(--ink);
+        font-weight: 550;
+      }
+      .install-location[data-warn="true"] .loc-btn {
+        height: 24px;
+        padding: 0 9px;
+        border-color: #e6d1c8;
+        color: var(--ink);
+      }
+      .install-location[data-warn="true"] .loc-btn:hover:not(:disabled) {
+        border-color: #d4b6a9;
+        background: #fffaf8;
+      }
+      .install-location .loc-warn {
+        margin: 5px 0 0;
+        color: var(--error);
+        font-size: 11.5px;
+        line-height: 1.45;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        user-select: text;
+        -webkit-user-select: text;
+      }
+      /* What downloads now, or what a long step waits on, under the
+         installing bar. */
       .transfer {
         display: grid;
         gap: 2px;
@@ -783,9 +940,14 @@
       .byok-tip-btn {
         position: relative;
       }
+      .seg button.byok-tip-btn:hover,
+      .seg button.byok-tip-btn:focus-visible {
+        z-index: 30;
+      }
       .byok-tooltip {
         position: absolute;
-        bottom: calc(100% + 8px);
+        top: calc(100% + 8px);
+        bottom: auto;
         right: 0;
         z-index: 30;
         width: 248px;
@@ -801,7 +963,7 @@
         box-shadow: 0 10px 24px -8px rgba(20, 20, 16, 0.45);
         opacity: 0;
         pointer-events: none;
-        transform: translateY(3px);
+        transform: translateY(-3px);
         transition:
           opacity 150ms ease,
           transform 150ms ease;
@@ -814,7 +976,8 @@
       .choice.byok-box {
         flex-direction: column;
         align-items: stretch;
-        gap: 10px;
+        gap: 8px;
+        padding: 9px 0;
       }
       .byok-row {
         display: flex;
@@ -824,23 +987,70 @@
       }
       .byok-row label {
         color: var(--muted);
-        font-size: 12px;
+        font-size: 11.5px;
         font-weight: 500;
       }
-      /* BYOK fields, built once by byokFields() for the setup form and the
-         sign-in dialog: the base URL and two optional comboboxes (path and
-         endpoint) on one row, the key, then the model with List models and
-         Test beside it, and one status line. */
+      /* API Key fields, built once by byokFields() for the setup form and the
+         sign-in dialog: provider preset, API key, model with refresh and Test,
+         and a collapsed Advanced options drawer for engine, path, and endpoint. */
       .byok-fields {
         display: grid;
         gap: 7px;
         font-size: 12px;
         text-align: left;
       }
+      .byok-provider-wrap {
+        position: relative;
+        display: flex;
+        align-items: center;
+        height: 32px;
+        border: 1px solid #e2e2dc;
+        border-radius: 8px;
+        background: #fafaf8;
+        transition:
+          border-color 140ms ease,
+          background-color 140ms ease;
+      }
+      .byok-provider-wrap:focus-within {
+        border-color: var(--ink);
+        background: #fff;
+      }
+      .byok-provider {
+        appearance: none;
+        -webkit-appearance: none;
+        width: 100%;
+        height: 100%;
+        padding: 0 28px 0 10px;
+        border: 0;
+        outline: none;
+        background: transparent;
+        color: var(--ink);
+        font: inherit;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      .byok-provider-wrap svg {
+        position: absolute;
+        right: 9px;
+        width: 10px;
+        height: 10px;
+        color: var(--faint);
+        pointer-events: none;
+      }
+      .byok-custom-base[hidden] {
+        display: none;
+      }
       .byok-fields .ep {
         display: grid;
         grid-template-columns: minmax(0, 1fr) auto auto;
         gap: 6px;
+      }
+      .byok-fields .ep[data-base-outside="true"] {
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      }
+      .byok-fields .ep[data-base-outside="true"] > .cb .cb-input {
+        width: 100%;
+        max-width: none;
       }
       .byok-fields .ep-base-wrap,
       .byok-fields .ep > .cb,
@@ -849,7 +1059,7 @@
         display: flex;
         align-items: center;
         min-width: 0;
-        height: 30px;
+        height: 32px;
         padding: 0 4px 0 10px;
         border: 1px solid #e2e2dc;
         border-radius: 8px;
@@ -857,6 +1067,76 @@
         transition:
           border-color 140ms ease,
           background-color 140ms ease;
+      }
+      .byok-adv {
+        margin-top: 1px;
+      }
+      .byok-adv > summary {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 2px 0;
+        color: var(--muted);
+        font-size: 11.5px;
+        font-weight: 500;
+        list-style: none;
+        cursor: pointer;
+      }
+      .byok-adv > summary::-webkit-details-marker {
+        display: none;
+      }
+      .byok-adv > summary:hover {
+        color: var(--ink);
+      }
+      .byok-adv-title {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        flex: none;
+      }
+      .byok-adv-title svg {
+        width: 10px;
+        height: 10px;
+        color: var(--faint);
+        transform: rotate(-90deg);
+        transition: transform 150ms ease;
+      }
+      .byok-adv[open] .byok-adv-title svg {
+        transform: rotate(0deg);
+      }
+      .byok-adv-meta {
+        min-width: 0;
+        overflow: hidden;
+        color: var(--faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 400;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .byok-adv-body {
+        display: grid;
+        gap: 8px;
+        margin-top: 6px;
+        padding: 9px 10px;
+        border: 1px solid #ecece7;
+        border-radius: 10px;
+        background: #f8f8f5;
+      }
+      .byok-adv-body .ep-base-wrap,
+      .byok-adv-body .ep > .cb {
+        height: 29px;
+        background: #fff;
+      }
+      .byok-adv-url {
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.4;
+        overflow-wrap: anywhere;
+      }
+      .byok-status[hidden] {
+        display: none;
       }
       .byok-fields .byok-key {
         width: 100%;
@@ -1037,12 +1317,12 @@
         flex: 1;
       }
       .model-row > .change {
-        height: 30px;
+        height: 32px;
       }
       .model-row > .list-btn {
         display: grid;
         place-items: center;
-        width: 30px;
+        width: 32px;
         padding: 0;
         color: var(--muted);
       }
@@ -1087,6 +1367,16 @@
         border-radius: 2px;
         background: inherit;
         transform: rotate(45deg);
+      }
+      .byok-toast[data-above="true"]::before {
+        top: auto;
+        bottom: -4px;
+      }
+      #welcome-scroll .cb-menu,
+      #welcome-scroll .byok-toast,
+      #welcome-scroll .byok-tooltip {
+        position: fixed;
+        z-index: 40;
       }
       .byok-toast[data-leaving="true"] {
         animation: toast-out 200ms ease forwards;
@@ -1160,13 +1450,30 @@
       }
       .choice.optional-keys {
         display: block;
+        padding: 7px 0;
       }
       .choice.optional-keys summary {
+        display: flex;
+        align-items: center;
+        gap: 5px;
         cursor: pointer;
         color: var(--muted);
         font-size: 12px;
         font-weight: 500;
         list-style: none;
+      }
+      .choice.optional-keys summary::before {
+        content: "";
+        display: inline-block;
+        width: 5px;
+        height: 5px;
+        border-right: 1.4px solid var(--faint);
+        border-bottom: 1.4px solid var(--faint);
+        transform: rotate(-45deg);
+        transition: transform 150ms ease;
+      }
+      .choice.optional-keys[open] summary::before {
+        transform: rotate(45deg);
       }
       .choice.optional-keys summary::-webkit-details-marker {
         display: none;
@@ -1174,6 +1481,24 @@
       .choice.optional-keys[open] summary {
         margin-bottom: 8px;
         color: var(--ink);
+      }
+      .choice.location-row {
+        padding: 7px 0;
+      }
+      .choice.location-row .text {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+      }
+      .choice.location-row strong {
+        flex: none;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--muted);
+      }
+      .choice.location-row .sub {
+        font-family: var(--mono);
+        font-size: 11.5px;
       }
       .choices,
       .panel {
@@ -1229,6 +1554,10 @@
       .seg button {
         position: relative;
         z-index: 1;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 5px;
         min-width: 56px;
         height: 26px;
         padding: 0 10px;
@@ -1244,7 +1573,8 @@
         color: var(--ink);
       }
       /* The localmodels tool's pick for this computer. */
-      .seg button[data-recommended="true"]::after {
+      .seg button[data-recommended="true"]::after,
+      .harness-btn[data-recommended="true"]::after {
         content: "";
         position: absolute;
         top: 4px;
@@ -1253,6 +1583,86 @@
         height: 5px;
         border-radius: 50%;
         background: #d9822b;
+      }
+      .harness-btn[data-recommended="true"]::after {
+        top: 6px;
+        right: 6px;
+      }
+      .choice.harness {
+        flex-wrap: wrap;
+        row-gap: 8px;
+      }
+      .choice.harness .sub {
+        white-space: normal;
+      }
+      .harness-grid {
+        width: 100%;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 6px;
+      }
+      .harness-btn {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        min-width: 0;
+        height: 32px;
+        padding: 0 10px;
+        border: 1px solid #e6e6e1;
+        border-radius: 9px;
+        background: #fff;
+        color: #52524b;
+        font-size: 12px;
+        font-weight: 500;
+        text-align: left;
+        transition:
+          border-color 140ms ease,
+          background-color 140ms ease,
+          color 140ms ease;
+      }
+      .harness-btn[data-value="recommended"] {
+        grid-column: 1 / -1;
+        justify-content: center;
+      }
+      .harness-btn:hover:not(:disabled) {
+        border-color: #c4c4bc;
+        color: var(--ink);
+      }
+      .harness-btn[aria-checked="true"] {
+        border-color: var(--ink);
+        background: #fff;
+        color: var(--ink);
+        box-shadow: 0 1px 2px rgba(20, 20, 16, 0.08);
+        cursor: default;
+      }
+      .harness-btn[data-detected="true"] {
+        color: var(--ink);
+      }
+      .harness-btn[data-detected="false"]:not([aria-checked="true"]) {
+        color: #8c8b82;
+      }
+      .harness-btn span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .harness-icon {
+        width: 15px;
+        height: 15px;
+        flex: none;
+        object-fit: contain;
+        transition:
+          filter 160ms ease,
+          opacity 160ms ease;
+      }
+      .seg .harness-icon {
+        width: 14px;
+        height: 14px;
+      }
+      [data-detected="false"] .harness-icon {
+        filter: grayscale(1);
+        opacity: 0.38;
       }
       .seg button[aria-checked="true"] {
         color: var(--ink);
@@ -2013,186 +2423,180 @@
         ></span>
         <h1 id="welcome-title" data-t="welcomeTitle"></h1>
         <p class="lead tight" id="welcome-lead"></p>
-        <div class="fold" id="local-options" data-open="false">
-          <div>
-            <div class="choices">
-              <div class="choice">
-                <div class="text">
-                  <strong data-t="modelSource"></strong
-                  ><span
-                    class="sub"
-                    id="source-sub"
-                    data-t="modelSourceHint"
-                  ></span>
-                </div>
-                <div
-                  class="seg"
-                  role="radiogroup"
-                  data-t-aria-label="modelSource"
-                  data-plan="source"
-                >
-                  <span class="knob"></span>
-                  <button
-                    type="button"
-                    role="radio"
-                    data-value="local"
-                    data-t="localModel"
-                  ></button>
-                  <button
-                    type="button"
-                    role="radio"
-                    data-value="subscription"
-                    data-t="subscription"
-                  ></button>
-                  <button
-                    type="button"
-                    role="radio"
-                    data-value="byok"
-                    class="byok-tip-btn"
-                    aria-describedby="byok-tip-text"
-                  >
-                    BYOK
-                    <span
-                      class="byok-tooltip"
-                      id="byok-tip-text"
-                      role="tooltip"
-                      data-t="byokTooltip"
-                    ></span>
-                  </button>
-                </div>
-              </div>
-              <div class="choice local" id="local-row" hidden>
-                <div class="text">
-                  <strong data-t="localModel"></strong
-                  ><span class="sub" id="local-sub"></span>
-                </div>
-                <button
-                  type="button"
-                  class="pick"
-                  id="local-model"
-                  role="checkbox"
-                  data-t-aria-label="localModelToggle"
-                  hidden
-                >
-                  <span class="pick-head"
-                    ><span class="pick-name" id="local-model-name"></span
+        <div class="welcome-scroll" id="welcome-scroll">
+          <div class="fold" id="local-options" data-open="false">
+            <div>
+              <div class="choices">
+                <div class="choice">
+                  <div class="text">
+                    <strong data-t="modelSource"></strong
                     ><span
-                      class="featured-pill"
-                      id="local-model-featured"
-                      hidden
-                      data-t="featuredPartnerBadge"
-                    ></span></span
-                  ><small id="local-model-needs"></small>
-                </button>
-                <div class="local-spotlight" id="local-spotlight">
-                  <span id="local-spotlight-text"></span>
-                  <button
-                    type="button"
-                    class="spotlight-link"
-                    id="local-spotlight-link"
-                    data-t-title="openAnnouncement"
-                  ></button>
-                </div>
-              </div>
-              <div class="choice" id="subscription-row" hidden>
-                <div class="text">
-                  <strong data-t="aiRuntime"></strong
-                  ><span
-                    class="sub"
-                    id="runtime-sub"
-                    data-t="runtimeHint"
-                  ></span>
-                </div>
-                <div
-                  class="seg"
-                  role="radiogroup"
-                  data-t-aria-label="aiRuntime"
-                  data-plan="runtime"
-                >
-                  <span class="knob"></span>
-                  <button
-                    type="button"
-                    role="radio"
-                    data-value="recommended"
-                    data-t="auto"
-                  ></button>
-                  <button type="button" role="radio" data-value="codex">
-                    Codex
-                  </button>
-                  <button type="button" role="radio" data-value="claude">
-                    Claude Code
-                  </button>
-                </div>
-              </div>
-              <div class="choice byok-box" id="byok-row" hidden>
-                <div class="byok-row">
-                  <label id="byok-runtime-label" data-t="aiRuntime"></label>
+                      class="sub"
+                      id="source-sub"
+                      data-t="modelSourceHint"
+                    ></span>
+                  </div>
                   <div
                     class="seg"
                     role="radiogroup"
-                    aria-labelledby="byok-runtime-label"
-                    data-byok="runtime"
+                    data-t-aria-label="modelSource"
+                    data-plan="source"
                   >
                     <span class="knob"></span>
-                    <button type="button" role="radio" data-value="claude">
-                      Claude Code
-                    </button>
-                    <button type="button" role="radio" data-value="codex">
-                      Codex
-                    </button>
-                    <button type="button" role="radio" data-value="pi">
-                      Pi
+                    <button
+                      type="button"
+                      role="radio"
+                      data-value="local"
+                      data-t="localModel"
+                    ></button>
+                    <button
+                      type="button"
+                      role="radio"
+                      data-value="subscription"
+                      data-t="subscription"
+                    ></button>
+                    <button
+                      type="button"
+                      role="radio"
+                      data-value="byok"
+                      class="byok-tip-btn"
+                      aria-describedby="byok-tip-text"
+                    >
+                      <span data-t="apiKeySource"></span>
+                      <span
+                        class="byok-tooltip"
+                        id="byok-tip-text"
+                        role="tooltip"
+                        data-t="byokTooltip"
+                      ></span>
                     </button>
                   </div>
                 </div>
-                <div class="byok-fields" id="byok-fields"></div>
-              </div>
-              <details class="choice optional-keys" id="optional-keys">
-                <summary data-t="appIntegrations"></summary>
-                <div class="text">
-                  <span class="sub" data-t="appIntegrationsHint"></span>
-                </div>
-                <div class="keys">
-                  <label for="key-composio">Composio</label>
-                  <input
-                    id="key-composio"
-                    type="password"
-                    data-key="composio"
-                    autocomplete="off"
-                    spellcheck="false"
-                    data-t-aria-label="composioKey"
-                  />
+                <div class="choice local" id="local-row" hidden>
+                  <div class="text">
+                    <strong data-t="localModel"></strong
+                    ><span class="sub" id="local-sub"></span>
+                  </div>
                   <button
                     type="button"
-                    class="change"
-                    data-reveal="composio"
-                    data-t="show"
-                  ></button>
-                  <button
-                    type="button"
-                    class="change"
-                    data-remove="composio"
-                    data-t="remove"
-                  ></button>
+                    class="pick"
+                    id="local-model"
+                    role="checkbox"
+                    data-t-aria-label="localModelToggle"
+                    hidden
+                  >
+                    <span class="pick-head"
+                      ><span class="pick-name" id="local-model-name"></span
+                      ><span
+                        class="featured-pill"
+                        id="local-model-featured"
+                        hidden
+                        data-t="featuredPartnerBadge"
+                      ></span></span
+                    ><small id="local-model-needs"></small>
+                  </button>
+                  <div class="local-spotlight" id="local-spotlight">
+                    <span id="local-spotlight-text"></span>
+                    <button
+                      type="button"
+                      class="spotlight-link"
+                      id="local-spotlight-link"
+                      data-t-title="openAnnouncement"
+                    ></button>
+                  </div>
                 </div>
-                <p class="keys-note" id="keys-note"></p>
-              </details>
-              <div class="choice">
-                <div class="text">
-                  <strong data-t="installLocation"></strong
-                  ><span class="sub" id="location-sub"></span>
+                <div class="choice harness" id="subscription-row" hidden>
+                  <div class="text">
+                    <strong data-t="accountChoice"></strong
+                    ><span
+                      class="sub"
+                      id="runtime-sub"
+                      data-t="runtimeHint"
+                    ></span>
+                  </div>
+                  <div
+                    class="harness-grid"
+                    role="radiogroup"
+                    data-t-aria-label="aiRuntime"
+                    data-plan="runtime"
+                  >
+                    <button
+                      type="button"
+                      role="radio"
+                      class="harness-btn"
+                      data-value="recommended"
+                      data-t="auto"
+                    ></button>
+                    <button
+                      type="button"
+                      role="radio"
+                      class="harness-btn"
+                      data-value="claude"
+                      data-detected="false"
+                    >
+                      <img
+                        class="harness-icon"
+                        src="/harness-claude.svg"
+                        alt=""
+                        aria-hidden="true"
+                      />
+                      <span>Claude Code</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="radio"
+                      class="harness-btn"
+                      data-value="codex"
+                      data-detected="false"
+                    >
+                      <img
+                        class="harness-icon"
+                        src="/harness-codex.svg"
+                        alt=""
+                        aria-hidden="true"
+                      />
+                      <span>Codex</span>
+                    </button>
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  class="change"
-                  id="location-change"
-                  data-t="changeLocation"
-                ></button>
+                <div class="choice byok-box" id="byok-row" hidden>
+                  <div class="byok-fields" id="byok-fields"></div>
+                </div>
+                <details class="choice optional-keys" id="optional-keys">
+                  <summary data-t="appIntegrations"></summary>
+                  <div class="text">
+                    <span class="sub" data-t="appIntegrationsHint"></span>
+                  </div>
+                  <div class="keys">
+                    <label for="key-composio">Composio</label>
+                    <input
+                      id="key-composio"
+                      type="password"
+                      data-key="composio"
+                      autocomplete="off"
+                      spellcheck="false"
+                      data-t-aria-label="composioKey"
+                    />
+                    <button
+                      type="button"
+                      class="change"
+                      data-reveal="composio"
+                      data-t="show"
+                    ></button>
+                    <button
+                      type="button"
+                      class="change"
+                      data-remove="composio"
+                      data-t="remove"
+                    ></button>
+                  </div>
+                  <p class="keys-note" id="keys-note"></p>
+                </details>
               </div>
             </div>
           </div>
         </div>
-        <div class="start">
+        <div class="start" id="welcome-start">
           <button class="primary large" id="local-install" type="button">
             <span id="local-install-label" data-t="quickInstall"></span
             ><svg viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6" /></svg>
@@ -2223,35 +2627,93 @@
             ></button>
           </p>
           <p class="plan-why" id="plan-why" hidden></p>
-          <button
-            class="link quiet"
-            id="local-recheck"
-            type="button"
-            hidden
-            data-t="checkAgain"
-          ></button>
-        </div>
-        <aside
-          class="spotlight-card"
-          id="featured-spotlight"
-          data-t-aria-label="featuredModelAriaLabel"
-          hidden
-        >
-          <div class="spotlight-head">
-            <span class="spotlight-title"
-              ><strong data-t="featuredModelName"></strong
-              ><span class="featured-pill" data-t="featuredPartnerBadge"></span
-            ></span>
+          <p class="plan-why" id="local-driver-status" hidden></p>
+          <div class="plan-actions" id="local-plan-actions" hidden>
             <button
+              class="secondary"
+              id="local-driver-install"
               type="button"
-              class="spotlight-link"
-              id="featured-spotlight-link"
-              data-t-title="openAnnouncement"
+              hidden
+              data-t="installDriverUpdate"
+            ></button>
+            <button
+              class="secondary"
+              id="local-driver-action"
+              type="button"
+              hidden
+            ></button>
+            <button
+              class="link quiet"
+              id="local-driver-guide"
+              type="button"
+              hidden
+              data-t="driverUpdateGuide"
+            ></button>
+            <button
+              class="link quiet"
+              id="local-recheck"
+              type="button"
+              hidden
+              data-t="checkAgain"
             ></button>
           </div>
-          <p class="spotlight-specs" data-t="featuredModelSpecs"></p>
-          <p class="spotlight-note" id="featured-spotlight-note"></p>
-        </aside>
+          <aside
+            class="spotlight-card"
+            id="featured-spotlight"
+            data-t-aria-label="featuredModelAriaLabel"
+            hidden
+          >
+            <div class="spotlight-head">
+              <span class="spotlight-title"
+                ><strong data-t="featuredModelName"></strong
+                ><span
+                  class="featured-pill"
+                  data-t="featuredPartnerBadge"
+                ></span
+              ></span>
+              <button
+                type="button"
+                class="spotlight-link"
+                id="featured-spotlight-link"
+                data-t-title="openAnnouncement"
+              ></button>
+            </div>
+            <p class="spotlight-specs" data-t="featuredModelSpecs"></p>
+            <p class="spotlight-note" id="featured-spotlight-note"></p>
+          </aside>
+          <div
+            class="install-location"
+            id="install-location"
+            hidden
+            data-warn="false"
+          >
+            <div class="loc-row">
+              <svg class="loc-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"
+                />
+              </svg>
+              <span class="loc-label" data-t="installLocation"></span>
+              <span class="loc-path" id="location-path"></span>
+              <span class="loc-actions">
+                <button
+                  type="button"
+                  class="loc-btn"
+                  id="location-change"
+                  data-t="changeLocation"
+                ></button>
+                <button
+                  type="button"
+                  class="loc-btn"
+                  id="location-reset"
+                  data-t="resetLocation"
+                  hidden
+                ></button>
+              </span>
+            </div>
+            <p class="loc-warn" id="location-sub" role="alert" hidden></p>
+          </div>
+        </div>
         <p class="error" id="local-error" role="alert"></p>
         <p class="team" id="team">
           <span data-t="teamServer"></span>
@@ -2283,6 +2745,7 @@
             <strong id="installing-transfer-label"></strong
             ><span id="installing-transfer-bytes"></span>
           </p>
+          <p class="transfer" id="installing-waiting" hidden></p>
           <ol class="checks" id="installing-checks"></ol>
         </div>
         <div
@@ -2370,14 +2833,47 @@
                 ></button>
               </div>
               <div class="runtimes" id="runtime-signin-runtimes" hidden>
-                <button class="secondary" data-switch="codex" type="button">
-                  Codex
+                <button
+                  class="secondary"
+                  data-switch="claude"
+                  data-detected="false"
+                  type="button"
+                >
+                  <img
+                    class="harness-icon"
+                    src="/harness-claude.svg"
+                    alt=""
+                    aria-hidden="true"
+                  />
+                  <span>Claude Code</span>
                 </button>
-                <button class="secondary" data-switch="claude" type="button">
-                  Claude Code
+                <button
+                  class="secondary"
+                  data-switch="codex"
+                  data-detected="false"
+                  type="button"
+                >
+                  <img
+                    class="harness-icon"
+                    src="/harness-codex.svg"
+                    alt=""
+                    aria-hidden="true"
+                  />
+                  <span>Codex</span>
                 </button>
-                <button class="secondary" data-switch="pi" type="button">
-                  Pi
+                <button
+                  class="secondary"
+                  data-switch="pi"
+                  data-detected="false"
+                  type="button"
+                >
+                  <img
+                    class="harness-icon"
+                    src="/harness-pi.svg"
+                    alt=""
+                    aria-hidden="true"
+                  />
+                  <span>Pi</span>
                 </button>
               </div>
               <form class="signin-byok" id="runtime-signin-byok" hidden>
@@ -2877,20 +3373,14 @@
         value.length <= 46
           ? value
           : value.slice(0, 18) + "…" + value.slice(-27);
-      // Where to install instead, when the installer refused the location
-      // because another account could rename a folder on the way to it; the
-      // message, shown below, says why. A folder directly on the drive is
-      // refused for the drive's own permissions, which choosing the drive
-      // again would not change, so that case gets no hint.
-      const locationHint = (local) => {
-        const [, drive] =
-          /^([A-Za-z]:\\)[^\\]+\\[^\\]/.exec(local.location.path) ?? [];
-        return drive &&
-          local.refusal?.code === "WINDOWS_PRIVATE_PATH_UNSAFE" &&
-          local.refusal.reason === "UNSAFE_PARENT_ACCESS"
-          ? t("locationHint", { folder: drive + "Linger" })
-          : "";
-      };
+      // Why the installation stopped: in the page's words when the main
+      // process names the reason, else the message it passed on.
+      const failureText = (local) =>
+        local.failure === "runtime_lookup_timed_out"
+          ? t("runtimeLookupTimedOut")
+          : local.failure === "runtime_lookup_unreachable"
+            ? t("runtimeLookupUnreachable")
+            : local.message;
       // Quick Install installs what the localmodels tool recommends for this
       // computer once it has checked; until then (or when it cannot check)
       // the installer picks. The tool's local-models pick runs through Pi,
@@ -2934,6 +3424,90 @@
         pi: "openai-chat",
       };
       const DEFAULT_PATH = "/v1";
+      const BYOK_PROVIDERS = [
+        {
+          id: "openrouter",
+          label: "OpenRouter",
+          baseUrl: "https://openrouter.ai/api",
+          path: "/v1",
+          endpoint: "/chat/completions",
+          runtime: "pi",
+          modelPlaceholder: "deepseek/deepseek-v4.1-flash-1017",
+        },
+        {
+          id: "deepseek",
+          label: "DeepSeek",
+          baseUrl: "https://api.deepseek.com",
+          path: "/v1",
+          endpoint: "/chat/completions",
+          runtime: "pi",
+          modelPlaceholder: "deepseek-chat",
+        },
+        {
+          id: "openai",
+          label: "OpenAI",
+          baseUrl: "https://api.openai.com",
+          path: "/v1",
+          endpoint: "/responses",
+          runtime: "codex",
+          modelPlaceholder: "gpt-5.4",
+        },
+        {
+          id: "anthropic",
+          label: "Anthropic",
+          baseUrl: "https://api.anthropic.com",
+          path: "/v1",
+          endpoint: "/messages",
+          runtime: "claude",
+          modelPlaceholder: "claude-sonnet-4-6",
+        },
+        {
+          id: "zhipu",
+          labelKey: "providerZhipu",
+          baseUrl: "https://open.bigmodel.cn",
+          path: "/api/paas/v4",
+          endpoint: "/chat/completions",
+          runtime: "pi",
+          modelPlaceholder: "glm-4.6",
+        },
+        {
+          id: "volcano",
+          labelKey: "providerVolcano",
+          baseUrl: "https://ark.cn-beijing.volces.com",
+          path: "/api/v3",
+          endpoint: "/chat/completions",
+          runtime: "pi",
+          modelPlaceholder: "doubao-seed-1-6",
+        },
+        {
+          id: "gemini",
+          label: "Google Gemini",
+          baseUrl: "https://generativelanguage.googleapis.com",
+          path: "/v1beta/openai",
+          endpoint: "/chat/completions",
+          runtime: "pi",
+          modelPlaceholder: "gemini-2.5-pro",
+        },
+        {
+          id: "custom",
+          labelKey: "providerCustom",
+          baseUrl: "",
+          path: DEFAULT_PATH,
+          endpoint: null,
+          runtime: "pi",
+          modelPlaceholder: "",
+        },
+      ];
+      const byokProviderById = (id) =>
+        BYOK_PROVIDERS.find((item) => item.id === id) ?? BYOK_PROVIDERS[0];
+      const byokProviderName = (item) =>
+        item.labelKey ? t(item.labelKey) : item.label;
+      const defaultProviderForRuntime = (runtime) =>
+        runtime === "claude"
+          ? "anthropic"
+          : runtime === "codex"
+            ? "openai"
+            : "openrouter";
       const PATH_OPTIONS = [
         { value: "/v1", label: t("pathMostProviders") },
         { value: "/api/paas/v4", label: t("pathZhipu") },
@@ -3131,21 +3705,50 @@
         return combo;
       };
 
-      // The BYOK fields, built once for the setup form and once for the
-      // sign-in dialog. runtimeOf() names the runtime the endpoint serves,
-      // which picks the default endpoint and format; changed() runs on every
-      // edit.
+      // The API Key fields, built once for the setup form and once for the
+      // sign-in dialog. Presets hide path/endpoint/engine plumbing inside a
+      // collapsed Advanced options drawer while still sending base + path +
+      // endpoint verbatim.
       const byokForms = [];
-      const byokFields = (root, prefix, runtimeOf, changed) => {
+      const byokFields = (root, prefix, runtimeOf, changed, options = {}) => {
+        const allowRuntime = Boolean(options.allowRuntime);
+        const runtimeControlsHtml = allowRuntime
+          ? `
+            <div class="byok-row">
+              <label id="${prefix}-runtime-label">${esc(t("aiRuntime"))}</label>
+              <div
+                class="seg"
+                role="radiogroup"
+                aria-labelledby="${prefix}-runtime-label"
+                data-byok="runtime"
+              >
+                <span class="knob"></span>
+                <button type="button" role="radio" data-value="pi" data-detected="false">
+                  <img class="harness-icon" src="/harness-pi.svg" alt="" aria-hidden="true" />
+                  <span>Pi</span>
+                </button>
+                <button type="button" role="radio" data-value="claude" data-detected="false">
+                  <img class="harness-icon" src="/harness-claude.svg" alt="" aria-hidden="true" />
+                  <span>Claude Code</span>
+                </button>
+                <button type="button" role="radio" data-value="codex" data-detected="false">
+                  <img class="harness-icon" src="/harness-codex.svg" alt="" aria-hidden="true" />
+                  <span>Codex</span>
+                </button>
+              </div>
+            </div>`
+          : "";
         root.innerHTML = `
-          <div class="ep">
-            <span class="ep-base-wrap"><input class="ep-base" id="${prefix}-url"
-              type="url" autocomplete="off" spellcheck="false"
-              aria-label="${esc(t("baseUrl"))}"
-              placeholder="${esc(t("baseUrlPlaceholder"))}" /></span>
-            <div></div>
-            <div></div>
+          <div class="byok-provider-wrap">
+            <select class="byok-provider" id="${prefix}-provider" aria-label="${esc(t("provider"))}">
+              ${BYOK_PROVIDERS.map(
+                (item) =>
+                  `<option value="${item.id}">${esc(byokProviderName(item))}</option>`,
+              ).join("")}
+            </select>
+            ${ICONS.chevron}
           </div>
+          <div class="byok-custom-base" hidden></div>
           <input class="byok-key" id="${prefix}-key" type="password"
             autocomplete="off" spellcheck="false" aria-label="${esc(t("apiKey"))}"
             placeholder="${esc(t("apiKeyPlaceholder"))}" />
@@ -3157,16 +3760,42 @@
             <div class="byok-toast" id="${prefix}-toast" role="status"
               aria-live="polite" hidden></div>
           </div>
-          <div class="byok-status" id="${prefix}-status" aria-live="polite"></div>`;
-        const blank = () => ({
-          baseUrl: "",
-          path: DEFAULT_PATH,
-          // null follows the runtime's default.
-          endpoint: null,
-          apiKey: "",
-          modelId: "",
-        });
-        let f = blank();
+          <div class="byok-status" id="${prefix}-status" aria-live="polite" hidden></div>
+          <details class="byok-adv" id="${prefix}-advanced">
+            <summary>
+              <span class="byok-adv-title">${ICONS.chevron}<span>${esc(t("advancedOptions"))}</span></span>
+              <span class="byok-adv-meta"></span>
+            </summary>
+            <div class="byok-adv-body">
+              ${runtimeControlsHtml}
+              <div class="ep" data-base-outside="false">
+                <span class="ep-base-wrap"><input class="ep-base" id="${prefix}-url"
+                  type="url" autocomplete="off" spellcheck="false"
+                  aria-label="${esc(t("baseUrl"))}"
+                  placeholder="${esc(t("baseUrlPlaceholder"))}" /></span>
+                <div></div>
+                <div></div>
+              </div>
+              <div class="byok-adv-url" id="${prefix}-adv-url"></div>
+            </div>
+          </details>`;
+        const initialProviderId = () =>
+          options.initialProvider ? options.initialProvider() : "openrouter";
+        const stateFromPreset = (providerId, keepKey = "") => {
+          const preset = byokProviderById(providerId);
+          return {
+            provider: preset.id,
+            baseUrl: preset.baseUrl,
+            path: preset.path,
+            // null follows the runtime's default.
+            endpoint: preset.endpoint,
+            apiKey: keepKey,
+            modelId: "",
+          };
+        };
+        let f = stateFromPreset(initialProviderId());
+        let touched = false;
+        let baseOutside = f.provider === "custom";
         // The latest test and model listing; each sequence number drops an
         // answer to a request the fields have changed since.
         let check = null;
@@ -3177,8 +3806,12 @@
         let toastTimer = 0;
         let toastShown = "";
 
+        const safeRuntime = () => {
+          const rt = runtimeOf();
+          return rt in RUNTIME_FORMATS ? rt : "pi";
+        };
         const defaultEndpoint = () =>
-          BYOK_FORMATS[RUNTIME_FORMATS[runtimeOf()]].suffix;
+          BYOK_FORMATS[RUNTIME_FORMATS[safeRuntime()]].suffix;
         const endpointValue = () => f.endpoint ?? defaultEndpoint();
         const baseUrl = () => f.baseUrl.trim().replace(/\/+$/, "");
         const apiRoot = () => baseUrl() + normalizePath(f.path);
@@ -3188,7 +3821,7 @@
           const url = requestUrl();
           for (const [protocol, { suffix }] of Object.entries(BYOK_FORMATS))
             if (url.endsWith(suffix)) return { protocol, fromUrl: true };
-          return { protocol: RUNTIME_FORMATS[runtimeOf()], fromUrl: false };
+          return { protocol: RUNTIME_FORMATS[safeRuntime()], fromUrl: false };
         };
         const validParts = () =>
           [normalizePath(f.path), normalizePath(endpointValue())].every(
@@ -3236,14 +3869,57 @@
           }
         };
         const edit = (next, all) => {
+          touched = true;
           f = { ...f, ...next };
           resetResults(all);
           changed();
         };
 
+        const providerSelect = root.querySelector(".byok-provider");
+        const customBaseSlot = root.querySelector(".byok-custom-base");
+        const epRow = root.querySelector(".ep");
+        const baseWrap = root.querySelector(".ep-base-wrap");
         const base = root.querySelector(".ep-base");
+        const advDetails = root.querySelector(".byok-adv");
+        const advMeta = root.querySelector(".byok-adv-meta");
+        const advUrl = root.querySelector(".byok-adv-url");
+
+        const placeBaseInput = (outside) => {
+          baseOutside = outside;
+          if (outside) {
+            if (baseWrap.parentElement !== customBaseSlot)
+              customBaseSlot.append(baseWrap);
+          } else if (baseWrap.parentElement !== epRow) {
+            epRow.prepend(baseWrap);
+          }
+          customBaseSlot.hidden = !outside;
+          epRow.dataset.baseOutside = String(outside);
+        };
+        placeBaseInput(baseOutside);
+
+        providerSelect.addEventListener("change", () => {
+          const preset = byokProviderById(providerSelect.value);
+          touched = true;
+          f = {
+            ...f,
+            provider: preset.id,
+            baseUrl: preset.baseUrl,
+            path: preset.path,
+            endpoint: preset.endpoint,
+          };
+          if (options.onPresetRuntime) options.onPresetRuntime(preset.runtime);
+          placeBaseInput(preset.id === "custom");
+          resetResults(true);
+          changed();
+          render();
+          if (preset.id === "custom") base.focus();
+        });
+        advDetails.addEventListener("toggle", () => {
+          if (advDetails.open) requestAnimationFrame(placeKnobs);
+        });
+
         base.addEventListener("input", () => {
-          edit({ baseUrl: base.value }, true);
+          edit({ baseUrl: base.value, provider: "custom" }, true);
           render();
         });
         base.addEventListener("blur", () => {
@@ -3258,7 +3934,7 @@
           heading: esc(t("pathHeading")),
           placeholder: "-",
           get: () => f.path,
-          set: (value) => edit({ path: value }, true),
+          set: (value) => edit({ path: value, provider: "custom" }, true),
           commit: () => {
             f = { ...f, path: normalizePath(f.path) };
           },
@@ -3277,7 +3953,10 @@
           get: endpointValue,
           set: (value) =>
             edit(
-              { endpoint: value === defaultEndpoint() ? null : value },
+              {
+                endpoint: value === defaultEndpoint() ? null : value,
+                provider: "custom",
+              },
               false,
             ),
           commit: () => {
@@ -3294,7 +3973,7 @@
               ...option,
               tag:
                 option.value === defaultEndpoint()
-                  ? t("runtimeDefault", { runtime: RUNTIMES[runtimeOf()] })
+                  ? t("runtimeDefault", { runtime: RUNTIMES[safeRuntime()] })
                   : "",
             })),
         });
@@ -3386,11 +4065,23 @@
           root,
           complete,
           modelId: () => f.modelId.trim(),
+          providerLabel: () => {
+            const preset = byokProviderById(f.provider);
+            return preset.id === "custom" ? "" : byokProviderName(preset);
+          },
           config: () => ({
             ...endpoint(),
             modelId: f.modelId.trim(),
-            runtime: runtimeOf(),
+            runtime: safeRuntime(),
           }),
+          // Keeps an untouched sign-in fallback aligned with the active runtime.
+          syncDefaultPreset: () => {
+            if (touched) return;
+            const target = initialProviderId();
+            if (f.provider === target) return;
+            f = stateFromPreset(target, f.apiKey);
+            placeBaseInput(f.provider === "custom");
+          },
           // The runtime changed: its default endpoint and format may differ.
           runtimeChanged: () => resetResults(false),
           clearKey: () => {
@@ -3398,7 +4089,10 @@
             key.value = "";
           },
           reset: () => {
-            f = blank();
+            touched = false;
+            f = stateFromPreset(initialProviderId());
+            placeBaseInput(f.provider === "custom");
+            advDetails.open = false;
             resetResults(true);
           },
           // A click outside the toast and Test dismisses it.
@@ -3407,8 +4101,14 @@
               hideToast();
           },
           sync: (busy) => {
+            const preset = byokProviderById(f.provider);
+            if (providerSelect.value !== f.provider)
+              providerSelect.value = f.provider;
+            providerSelect.disabled = busy;
             if (base.value !== f.baseUrl) base.value = f.baseUrl;
             if (key.value !== f.apiKey) key.value = f.apiKey;
+            modelCombo.input.placeholder =
+              preset.modelPlaceholder || t("modelPlaceholder");
             path.sync();
             endpointCombo.sync();
             modelCombo.sync();
@@ -3444,28 +4144,52 @@
                 toastShown = html;
               }
             }
-            let line;
+            const resolvedParts = [
+              allowRuntime ? RUNTIMES[safeRuntime()] : "",
+              normalizePath(f.path) + normalizePath(endpointValue()),
+            ]
+              .filter(Boolean)
+              .join(" · ");
+            if (advMeta.textContent !== resolvedParts)
+              advMeta.textContent = resolvedParts;
+            let urlPreviewHtml = "";
+            if (!validParts()) {
+              urlPreviewHtml = esc(t("invalidParts"));
+            } else if (!baseUrl()) {
+              urlPreviewHtml = esc(t("greyDefaults"));
+            } else {
+              const { protocol, fromUrl } = format();
+              const values = {
+                format: BYOK_FORMATS[protocol].label,
+                runtime: RUNTIMES[safeRuntime()],
+                url: requestUrl(),
+              };
+              urlPreviewHtml = tHtml(
+                fromUrl ? "sendsTo" : "sendsToRuntime",
+                values,
+              );
+            }
+            if (advUrl.innerHTML !== urlPreviewHtml)
+              advUrl.innerHTML = urlPreviewHtml;
+
+            let line = null;
             if (!validParts())
               line = { tone: "err", html: esc(t("invalidParts")) };
             else if (models?.state === "failed")
               line = { tone: "err", html: esc(models.message) };
             else if (listing)
               line = { html: tHtml("listingFrom", { url: modelsUrl() }) };
-            else if (!baseUrl()) line = { html: esc(t("greyDefaults")) };
-            else {
-              const { protocol, fromUrl } = format();
-              const values = {
-                format: BYOK_FORMATS[protocol].label,
-                runtime: RUNTIMES[runtimeOf()],
-                url: requestUrl(),
-              };
-              line = {
-                html: tHtml(fromUrl ? "sendsTo" : "sendsToRuntime", values),
-              };
+            else if (baseOutside && baseUrl()) line = { html: urlPreviewHtml };
+
+            status.hidden = !line;
+            if (line) {
+              if (line.tone) status.dataset.tone = line.tone;
+              else delete status.dataset.tone;
+              if (status.innerHTML !== line.html) status.innerHTML = line.html;
+            } else {
+              delete status.dataset.tone;
+              if (status.innerHTML) status.innerHTML = "";
             }
-            if (line.tone) status.dataset.tone = line.tone;
-            else delete status.dataset.tone;
-            if (status.innerHTML !== line.html) status.innerHTML = line.html;
           },
         };
         byokForms.push(form);
@@ -3490,9 +4214,10 @@
         render();
         open.input.focus();
       });
-      // The setup form's runtime; the sign-in dialog's endpoint serves the
-      // runtime signing in.
-      let byokRuntime = "claude";
+      // The setup form's API Key engine (defaults to the active provider's
+      // natural engine unless overridden in Advanced options).
+      let byokRuntime = "pi";
+      let byokRuntimeExplicit = false;
       let signInByokOpen = false;
       const mainByok = byokFields(
         $("byok-fields"),
@@ -3501,21 +4226,30 @@
         () => {
           picked = true;
         },
+        {
+          allowRuntime: true,
+          initialProvider: () => "openrouter",
+          onPresetRuntime: (nextRuntime) => {
+            if (!byokRuntimeExplicit) byokRuntime = nextRuntime;
+          },
+        },
       );
       const signInByok = byokFields(
         $("signin-byok-fields"),
         "signin-byok",
         () => state.localServer.signIn?.runtime ?? "claude",
         () => {},
+        {
+          allowRuntime: false,
+          initialProvider: () =>
+            defaultProviderForRuntime(
+              state?.localServer?.signIn?.runtime ?? "claude",
+            ),
+        },
       );
       // Provider keys typed or removed here ("" removes the saved one); kept
       // only in the inputs and sent once with Install.
       let keys = {};
-      const isDefaultPlan = (local) =>
-        JSON.stringify(plan) === JSON.stringify(defaults()) &&
-        !local.location.custom &&
-        !Object.keys(keys).length;
-
       const host = (url) => {
         try {
           return new URL(url).host;
@@ -3597,11 +4331,131 @@
         requestAnimationFrame(frame);
       };
 
+      const syncCustomizingBody = () => {
+        document.body.dataset.customizing = String(
+          step === "welcome" &&
+            customizing &&
+            Boolean(state?.localServer.available),
+        );
+      };
+
+      const syncWelcomeScroll = () => {
+        const scroller = $("welcome-scroll");
+        const footer = $("welcome-start");
+        if (!scroller || !footer) return;
+        const overflowing =
+          step === "welcome" &&
+          customizing &&
+          Boolean(state?.localServer.available) &&
+          scroller.clientHeight > 0 &&
+          scroller.scrollHeight > scroller.clientHeight + 1;
+        footer.dataset.scrollable = String(overflowing);
+      };
+
+      const placeWelcomeTooltip = () => {
+        const tip = $("byok-tip-text");
+        const btn = tip?.closest(".byok-tip-btn");
+        if (!tip || !btn) return;
+        const rect = btn.getBoundingClientRect();
+        if (!rect.width && !rect.height) return;
+        tip.style.left = "auto";
+        tip.style.right =
+          Math.max(12, Math.round(innerWidth - rect.right)) + "px";
+        if (rect.top >= 100) {
+          tip.style.bottom = Math.round(innerHeight - rect.top + 8) + "px";
+          tip.style.top = "auto";
+        } else {
+          tip.style.top = Math.round(rect.bottom + 8) + "px";
+          tip.style.bottom = "auto";
+        }
+      };
+
+      // Floats popups inside #welcome-scroll with viewport-fixed coordinates so
+      // overflow-y: auto never clips them or inflates scrollHeight.
+      const placeWelcomePopups = () => {
+        const scroller = $("welcome-scroll");
+        if (!scroller) return;
+        const scrollerRect = scroller.getBoundingClientRect();
+        const hasScrollerBox =
+          scrollerRect.width > 0 || scrollerRect.height > 0;
+        let closedCombo = false;
+        for (const combo of combos) {
+          if (!combo.open || !scroller.contains(combo.root)) continue;
+          const menu = combo.root.querySelector(".cb-menu");
+          if (!menu || menu.hidden) continue;
+          const rect = combo.root.getBoundingClientRect();
+          if (!rect.width && !rect.height) continue;
+          if (
+            hasScrollerBox &&
+            (rect.bottom < scrollerRect.top || rect.top > scrollerRect.bottom)
+          ) {
+            combo.open = false;
+            closedCombo = true;
+            continue;
+          }
+          const below = innerHeight - rect.bottom - 17;
+          const above = rect.top - 17;
+          const flipUp = below < 140 && above > below;
+          const maxH = Math.max(
+            88,
+            Math.min(252, Math.floor(flipUp ? above : below)),
+          );
+          menu.style.minWidth = rect.width + 2 + "px";
+          menu.style.maxHeight = maxH + "px";
+          if (combo.root.matches(".ep > .cb")) {
+            menu.style.right =
+              Math.max(12, Math.round(innerWidth - rect.right - 1)) + "px";
+            menu.style.left = "auto";
+          } else {
+            menu.style.left = Math.max(12, Math.round(rect.left - 1)) + "px";
+            menu.style.right = "auto";
+          }
+          if (flipUp) {
+            menu.style.bottom = Math.round(innerHeight - rect.top + 5) + "px";
+            menu.style.top = "auto";
+          } else {
+            menu.style.top = Math.round(rect.bottom + 5) + "px";
+            menu.style.bottom = "auto";
+          }
+        }
+        if (closedCombo) {
+          for (const combo of combos) {
+            if (scroller.contains(combo.root)) combo.sync();
+          }
+        }
+        const toast = $("byok-toast");
+        if (toast && !toast.hidden && scroller.contains(toast)) {
+          const row = toast.closest(".model-row");
+          const rect = row?.getBoundingClientRect();
+          if (rect && (rect.width || rect.height)) {
+            toast.style.width = Math.min(330, Math.round(rect.width)) + "px";
+            toast.style.left = "auto";
+            toast.style.right =
+              Math.max(12, Math.round(innerWidth - rect.right)) + "px";
+            const flipUp =
+              rect.bottom + 9 + toast.offsetHeight > innerHeight - 12 &&
+              rect.top > innerHeight - rect.bottom;
+            if (flipUp) {
+              toast.style.bottom =
+                Math.round(innerHeight - rect.top + 9) + "px";
+              toast.style.top = "auto";
+              toast.dataset.above = "true";
+            } else {
+              toast.style.top = Math.round(rect.bottom + 9) + "px";
+              toast.style.bottom = "auto";
+              delete toast.dataset.above;
+            }
+          }
+        }
+        placeWelcomeTooltip();
+      };
+
       const show = (next) => {
         // Leaving the sign-in step stops waiting for it.
         if (pending === "signin.open") pending = null;
         if (next === "ready" && step !== "ready") setTimeout(celebrate, 320);
         step = next;
+        syncCustomizingBody();
         for (const el of document.querySelectorAll("section"))
           el.classList.toggle("active", el.dataset.step === step);
         if (step === "server") {
@@ -3765,6 +4619,7 @@
         $("runtime-signin-runtimes").hidden = !otherRuntimes && !pi;
         $("runtime-signin-other").hidden = pi;
         $("runtime-signin-byok").hidden = !signInByokOpen;
+        signInByok.syncDefaultPreset();
         signInByok.sync(busy);
         $("runtime-signin-byok-submit").disabled =
           busy || !signInByok.complete();
@@ -3826,13 +4681,25 @@
           case "cuda-driver-update-required": {
             const has = reason.detectedCudaVersion;
             const needs = reason.requiredCudaVersion;
+            const driver = window.lingerSetup.minDriverForCuda?.(needs);
             if (has && needs)
-              return t("reasonCudaUpdate", {
-                has: String(has),
-                needs: String(needs),
-              });
+              return driver
+                ? t("reasonCudaUpdateDriver", {
+                    has: String(has),
+                    needs: String(needs),
+                    driver: String(driver),
+                  })
+                : t("reasonCudaUpdate", {
+                    has: String(has),
+                    needs: String(needs),
+                  });
             if (needs)
-              return t("reasonCudaTooOldNeeds", { needs: String(needs) });
+              return driver
+                ? t("reasonCudaTooOldDriver", {
+                    needs: String(needs),
+                    driver: String(driver),
+                  })
+                : t("reasonCudaTooOldNeeds", { needs: String(needs) });
             return t("reasonCudaTooOld");
           }
           case "cuda-driver-version-unknown":
@@ -3955,9 +4822,11 @@
         const held = models.state === "checked" && !!models.blockedNow;
         const heldModel = held && models.model;
         plan.localModel = plan.source === "local" && !!model;
-        const custom = !isDefaultPlan(local);
         // Quick Install waits for the check, so it installs what it shows.
+        // BYOK uses the user's own endpoint and does not depend on local-model
+        // inspection, so its Install button unblocks once the fields are valid.
         const checking = models.state === "checking";
+        const waitingForCheck = checking && plan.source !== "byok";
         const known =
           recommended.source === "local" ||
           recommended.runtime !== "recommended";
@@ -3966,7 +4835,11 @@
           choice.source === "local"
             ? t("localModelPi")
             : choice.source === "byok"
-              ? ["BYOK", RUNTIMES[byokRuntime], mainByok.modelId()]
+              ? [
+                  t("apiKeySource"),
+                  mainByok.providerLabel(),
+                  mainByok.modelId(),
+                ]
                   .filter(Boolean)
                   .join(" · ")
               : RUNTIMES[choice.runtime];
@@ -3987,20 +4860,45 @@
         // run downloads the localmodels tool, then the check runs. The label
         // changes only when it differs, so the spinner keeps turning.
         const fetching = checking ? models.download : undefined;
-        const label = checking
+        const label = waitingForCheck
           ? '<span class="spinner"></span>' +
             esc(t(fetching ? "downloadingTools" : "checkingComputer"))
-          : esc(t(custom ? "install" : "quickInstall"));
+          : esc(t(customizing ? "install" : "quickInstall"));
         if ($("local-install-label").innerHTML !== label)
           $("local-install-label").innerHTML = label;
         document.querySelector('[data-step="welcome"]').dataset.customizing =
           String(customizing && local.available);
+        syncCustomizingBody();
         const byokIncomplete = plan.source === "byok" && !mainByok.complete();
         const localUnavailable = plan.source === "local" && !model;
+        const location = local.location;
+        const GiB = 1024 ** 3;
+        const baseNeededBytes = location.minFreeBytes ?? 0;
+        const modelDiskBytes =
+          plan.source === "local" && model?.diskBytes != null
+            ? model.diskBytes
+            : 0;
+        const neededBytes = baseNeededBytes + modelDiskBytes;
+        const spaceLow =
+          !location.error &&
+          location.freeBytes != null &&
+          neededBytes > 0 &&
+          location.freeBytes < neededBytes;
+        const locationWarning = location.error
+          ? location.error
+          : spaceLow
+            ? t("locationSpaceLow", {
+                needed: String(Math.ceil(neededBytes / GiB)),
+                free: String(Math.floor(location.freeBytes / GiB)),
+              })
+            : "";
         $("local-install").disabled ||=
-          checking || byokIncomplete || localUnavailable;
-        $("local-install").dataset.busy = String(checking);
-        $("local-install").setAttribute("aria-busy", String(checking));
+          waitingForCheck ||
+          byokIncomplete ||
+          localUnavailable ||
+          !!locationWarning;
+        $("local-install").dataset.busy = String(waitingForCheck);
+        $("local-install").setAttribute("aria-busy", String(waitingForCheck));
         $("plan-summary").textContent = checking
           ? t("findingSetup")
           : following && known
@@ -4031,20 +4929,7 @@
                   .filter(Boolean)
                   .join(" · ")
               : held
-                ? cudaDriverHeld(models)
-                  ? t("heldWhyCudaDriver", {
-                      reasons: reasonsText(models, true),
-                      plan: named(plan),
-                    })
-                  : memoryHeld(models)
-                    ? t("heldWhy", {
-                        reasons: reasonsText(models, true),
-                        plan: named(plan),
-                      })
-                    : t("heldWhyGeneric", {
-                        reasons: reasonsText(models, true),
-                        plan: named(plan),
-                      })
+                ? t("heldWhy", { reasons: reasonsText(models, true) })
                 : (models.state === "checked" && !models.eligible) ||
                     models.state === "unavailable"
                   ? unavailableText
@@ -4053,11 +4938,19 @@
           !local.available || customizing || !$("plan-why").textContent;
         $("plan-line").hidden = !local.available;
         $("welcome-eyebrow").hidden = !local.available;
-        const location = local.location;
-        $("location-sub").textContent =
-          location.error || shortPath(location.path);
-        $("location-sub").title = location.error ? "" : location.path;
-        $("location-sub").dataset.warn = String(!!location.error);
+        const shownLocationPath =
+          location.error && location.rejectedPath
+            ? location.rejectedPath
+            : location.path;
+        $("install-location").hidden = !local.available;
+        $("install-location").dataset.warn = String(!!locationWarning);
+        $("location-path").textContent = shortPath(shownLocationPath);
+        $("location-path").title = shownLocationPath;
+        $("location-sub").textContent = locationWarning;
+        $("location-sub").title = locationWarning;
+        $("location-sub").hidden = !locationWarning;
+        $("location-sub").dataset.warn = String(!!locationWarning);
+        $("location-reset").hidden = !location.custom && !location.error;
         for (const input of document.querySelectorAll("[data-key]")) {
           const provider = input.dataset.key;
           const saved = local.keys[provider];
@@ -4083,17 +4976,12 @@
           checking ||
           !following ||
           !inklingRecommended;
-        $("featured-spotlight").hidden = !local.available || customizing;
+        $("featured-spotlight").hidden =
+          !local.available || customizing || !inklingRecommended;
         $("featured-spotlight").dataset.recommended =
           String(inklingRecommended);
-        $("featured-spotlight-note").textContent = t(
-          inklingRecommended
-            ? "featuredModelSelected"
-            : "featuredModelLibraryNote",
-        );
-        $("featured-spotlight-link").textContent = t(
-          inklingRecommended ? "learnMoreLink" : "thinkingMachinesLink",
-        );
+        $("featured-spotlight-note").textContent = t("featuredModelSelected");
+        $("featured-spotlight-link").textContent = t("learnMoreLink");
         $("local-model-featured").hidden = !shownIsInkling;
         $("local-spotlight").dataset.recommended = String(shownIsInkling);
         $("local-spotlight-text").textContent = t(
@@ -4124,9 +5012,84 @@
             !!models.reasons?.some((reason) =>
               RECHECKABLE_REASONS.has(reason.code),
             ));
+        const showDriverActions =
+          models.state === "checked" &&
+          !models.eligible &&
+          cudaDriverHeld(models) &&
+          local.available;
+        const nvidiaApp =
+          state.platform === "win32"
+            ? (state.driverUpdate?.nvidiaApp ?? "none")
+            : "none";
+        const directDriverInstall =
+          state.platform === "win32" &&
+          Boolean(state.driverUpdate?.directInstallSupported);
+        const driverInstallState = state.driverUpdate?.installState ?? {
+          phase: "idle",
+        };
+        const driverInstalling =
+          driverInstallState.phase === "downloading" ||
+          driverInstallState.phase === "verifying" ||
+          driverInstallState.phase === "installing";
+        let driverStatusText = "";
+        if (driverInstallState.phase === "downloading") {
+          driverStatusText =
+            driverInstallState.totalBytes != null
+              ? t("driverDownloadingSize", {
+                  version: driverInstallState.version,
+                  done: size(driverInstallState.completedBytes),
+                  total: size(driverInstallState.totalBytes),
+                })
+              : t("driverDownloading", { version: driverInstallState.version });
+        } else if (driverInstallState.phase === "verifying") {
+          driverStatusText = t("driverVerifying", {
+            version: driverInstallState.version,
+          });
+        } else if (driverInstallState.phase === "installing") {
+          driverStatusText = t("driverInstalling", {
+            version: driverInstallState.version,
+          });
+        } else if (driverInstallState.phase === "reboot_required") {
+          driverStatusText = t("driverRebootRequired", {
+            version: driverInstallState.version,
+          });
+        } else if (driverInstallState.phase === "completed") {
+          driverStatusText = t("driverInstallComplete", {
+            version: driverInstallState.version,
+          });
+        } else if (driverInstallState.phase === "failed") {
+          driverStatusText = t(
+            driverInstallState.code === "UAC_CANCELLED"
+              ? "driverUacCancelled"
+              : driverInstallState.code === "SIGNATURE_INVALID"
+                ? "driverSignatureInvalid"
+                : driverInstallState.code === "UNSUPPORTED_GPU"
+                  ? "driverUnsupportedGpu"
+                  : "driverInstallFailed",
+          );
+        }
         $("local-model").hidden = !shown && !settled;
+        $("local-driver-status").hidden =
+          !showDriverActions || !driverStatusText;
+        $("local-driver-status").textContent = driverStatusText;
+        $("local-driver-install").hidden =
+          !showDriverActions || !directDriverInstall;
+        $("local-driver-install").disabled = busy || driverInstalling;
+        $("local-driver-action").hidden = !showDriverActions;
+        $("local-driver-action").disabled = busy || driverInstalling;
+        $("local-driver-action").textContent = t(
+          nvidiaApp === "nvidia_app"
+            ? "openNvidiaApp"
+            : nvidiaApp === "geforce_experience"
+              ? "openGeForceExperience"
+              : "downloadNvidiaDriver",
+        );
+        $("local-driver-guide").hidden = !showDriverActions;
+        $("local-driver-guide").disabled = busy;
         $("local-recheck").hidden = !canRecheck || !local.available;
-        $("local-recheck").disabled = busy;
+        $("local-recheck").disabled = busy || driverInstalling;
+        $("local-plan-actions").hidden =
+          $("local-recheck").hidden && !showDriverActions;
         if (shown) {
           $("local-sub").textContent = held
             ? heldLine(models)
@@ -4169,8 +5132,25 @@
         const subKnown =
           recommended.source === "subscription" &&
           recommended.runtime !== "recommended";
+        const detectedRuntimes = new Set(
+          models.state === "checked" && Array.isArray(models.runtimes)
+            ? models.runtimes
+                .filter((entry) => entry.installed)
+                .map((entry) => entry.runtime)
+            : [],
+        );
+        const detectedSubNames = ["claude", "codex"]
+          .filter((name) => detectedRuntimes.has(name))
+          .map((name) => RUNTIMES[name]);
         $("runtime-sub").textContent = subKnown
-          ? t("recommendedRuntime", { runtime: RUNTIMES[recommended.runtime] })
+          ? detectedSubNames.length > 0
+            ? t("detectedAndRecommendedRuntime", {
+                detected: detectedSubNames.join(t("listSep")),
+                runtime: RUNTIMES[recommended.runtime],
+              })
+            : t("recommendedRuntime", {
+                runtime: RUNTIMES[recommended.runtime],
+              })
           : t("subscriptionHint");
         for (const seg of document.querySelectorAll("[data-plan]"))
           for (const option of seg.querySelectorAll("button")) {
@@ -4197,6 +5177,8 @@
               option.dataset.recommended = String(
                 subKnown && value === recommended.runtime,
               );
+              if (value !== "recommended")
+                option.dataset.detected = String(detectedRuntimes.has(value));
               option.disabled = busy;
             }
           }
@@ -4207,7 +5189,15 @@
             "aria-checked",
             String(byokRuntime === option.dataset.value),
           );
+          option.dataset.detected = String(
+            detectedRuntimes.has(option.dataset.value),
+          );
           option.disabled = busy;
+        }
+        for (const option of document.querySelectorAll("[data-switch]")) {
+          option.dataset.detected = String(
+            detectedRuntimes.has(option.dataset.switch),
+          );
         }
         mainByok.sync(busy);
         requestAnimationFrame(placeKnobs);
@@ -4223,7 +5213,7 @@
               : "installingTitle",
         );
         $("installing-plan").textContent = failed
-          ? locationHint(local) || t("dataKept")
+          ? t("dataKept")
           : t("takesMinutes");
         const section = document.querySelector('[data-step="installing"]');
         const steps = ALL_STEPS.filter(([id]) => local.steps.includes(id));
@@ -4262,6 +5252,14 @@
             return i ? [" · ", part] : [part];
           }),
         );
+        // A step that runs a while with the bar standing still says what
+        // it is waiting on.
+        const waiting =
+          !failed && !starting && !transfer && local.waiting === "runtime";
+        $("installing-waiting").hidden = !waiting;
+        $("installing-waiting").textContent = waiting
+          ? t("waitingRuntime")
+          : "";
         $("installing-checks").hidden = starting;
         const checks = $("installing-checks");
         if (checks.children.length !== steps.length)
@@ -4289,7 +5287,7 @@
           item.lastChild.textContent = stepTime(index, item.dataset.state);
         });
         const problem = $("installing-error");
-        const message = failed ? local.message : "";
+        const message = failed ? failureText(local) : "";
         if (problem.textContent !== message) {
           problem.textContent = message;
           detailsOpen = false;
@@ -4421,6 +5419,12 @@
             return chip;
           }),
         );
+        syncWelcomeScroll();
+        placeWelcomePopups();
+        requestAnimationFrame(() => {
+          syncWelcomeScroll();
+          placeWelcomePopups();
+        });
       };
 
       // Send Diagnostics, while a diagnostics server is set up.
@@ -4727,12 +5731,10 @@
         if (!customizing) {
           picked = false;
           pickedAutoBeforeCheck = false;
-          byokRuntime = "claude";
+          byokRuntime = "pi";
+          byokRuntimeExplicit = false;
           mainByok.reset();
           clearKeys();
-          const location = state.localServer.location;
-          if (location.custom || location.error)
-            run({ op: "local.location.reset" });
         }
         render();
       });
@@ -4777,14 +5779,64 @@
         option.addEventListener("click", () => {
           picked = true;
           byokRuntime = option.dataset.value;
+          byokRuntimeExplicit = true;
           mainByok.runtimeChanged();
           render();
         });
       $("location-change").addEventListener("click", () =>
         run({ op: "local.location.pick" }),
       );
+      $("location-reset").addEventListener("click", () =>
+        run({ op: "local.location.reset" }),
+      );
       $("local-recheck").addEventListener("click", () =>
         run({ op: "local.recheck" }, "local-error"),
+      );
+      $("local-driver-install").addEventListener("click", () => {
+        const models = state?.localServer?.localModels;
+        const reason =
+          models?.state === "checked"
+            ? models.reasons?.find(
+                (entry) =>
+                  entry.code === "cuda-driver-update-required" ||
+                  entry.code === "cuda-driver-version-unknown",
+              )
+            : undefined;
+        void run(
+          {
+            op: "driver.start-install",
+            ...(reason?.requiredCudaVersion
+              ? { requiredCuda: reason.requiredCudaVersion }
+              : {}),
+          },
+          "local-error",
+        );
+      });
+      $("local-driver-action").addEventListener("click", () => {
+        const nvidiaApp =
+          state?.platform === "win32"
+            ? (state.driverUpdate?.nvidiaApp ?? "none")
+            : "none";
+        if (nvidiaApp !== "none") {
+          void run({ op: "driver.open-nvidia-app" }, "local-error");
+        } else {
+          void run(
+            {
+              op: "external.open",
+              url: window.lingerSetup.nvidiaDriverDownloadUrl,
+            },
+            "local-error",
+          );
+        }
+      });
+      $("local-driver-guide").addEventListener("click", () =>
+        run(
+          {
+            op: "external.open",
+            url: window.lingerSetup.nvidiaDriverGuideUrl,
+          },
+          "local-error",
+        ),
       );
       const openFeaturedAnnouncement = () =>
         run(
@@ -4898,7 +5950,38 @@
                 : "welcome",
         );
       });
-      addEventListener("resize", placeKnobs);
+      $("byok-tip-text")
+        ?.closest(".byok-tip-btn")
+        ?.addEventListener("mouseenter", placeWelcomeTooltip);
+      $("byok-tip-text")
+        ?.closest(".byok-tip-btn")
+        ?.addEventListener("focus", placeWelcomeTooltip);
+      $("welcome-scroll").addEventListener("scroll", placeWelcomePopups, {
+        passive: true,
+      });
+      $("optional-keys").addEventListener("toggle", () => {
+        syncWelcomeScroll();
+        placeWelcomePopups();
+        requestAnimationFrame(() => {
+          syncWelcomeScroll();
+          placeWelcomePopups();
+        });
+      });
+      $("local-options").addEventListener("transitionend", () => {
+        syncWelcomeScroll();
+        placeWelcomePopups();
+      });
+      document
+        .querySelector(".scene")
+        ?.addEventListener("transitionend", () => {
+          syncWelcomeScroll();
+          placeWelcomePopups();
+        });
+      addEventListener("resize", () => {
+        placeKnobs();
+        syncWelcomeScroll();
+        placeWelcomePopups();
+      });
     </script>
   </body>
 </html>

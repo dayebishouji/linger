@@ -35,6 +35,7 @@ func TestAgentReadsAndSendsFeishuMailAfterConfirmation(t *testing.T) {
 
 	// Feishu Mail has no setup page: asked for it before it is connected, the
 	// Agent gets a card in the chat, and its Connect starts a lark-cli login.
+	runAliceAnotherMeOnAComputer(t, env)
 	asked := agent("/api/agent/v1/apps/account", map[string]any{"app_key": externalsource.FeishuMailAppKey})
 	cardID, _ := asked["interaction_id"].(string)
 	if asked["status"] != "authorization_required" || cardID == "" {
@@ -184,5 +185,74 @@ func assertFeishuMailSyncsOnlyNewMail(t *testing.T, env *testEnv, connectionID s
 	slices.Sort(want)
 	if !waitForExternalSource(func() bool { return slices.Equal(sources(), want) }) {
 		t.Fatalf("synced Wiki sources = %v, want %v", sources(), want)
+	}
+}
+
+// TestFeishuMailSetupKeepsTheConnectionCardPending covers an Agent asking for
+// a card before setup, and the owner's read-only checks on that same card.
+func TestFeishuMailSetupKeepsTheConnectionCardPending(t *testing.T) {
+	allowParallelIntegrationTest(t)
+	fake := newFakeFeishu(t)
+	env, alice, issued, roomID := newAgentCLIIdentity(t, starting(app.JobQueue), withAgentManagement(&recordingAgentManagement{}), withFeishuComputer(fake))
+	const setupPath = "/v0/external-apps/feishu-mail/setup"
+
+	status, body := postAgentInRoom(t, env, issued.AccessToken, roomID, "/api/agent/v1/apps/account", map[string]any{"app_key": externalsource.FeishuMailAppKey})
+	var result struct {
+		Status string `json:"status"`
+	}
+	decode(t, body, &result)
+	if status != http.StatusOK || result.Status != "authorization_required" {
+		t.Fatalf("connect with no Computer = %d %s", status, body)
+	}
+	check := func(wantCode string, wantCommands ...string) {
+		t.Helper()
+		status, _, body := env.request(alice, http.MethodGet, setupPath, nil, "")
+		var decoded struct {
+			Error struct {
+				Code    string `json:"code"`
+				Details []struct {
+					Field, Reason string
+				} `json:"details"`
+			} `json:"error"`
+		}
+		decode(t, body, &decoded)
+		var commands []string
+		for _, detail := range decoded.Error.Details {
+			if detail.Field == "command" {
+				commands = append(commands, detail.Reason)
+			}
+		}
+		if status != http.StatusConflict || decoded.Error.Code != wantCode || !slices.Equal(commands, wantCommands) {
+			t.Fatalf("setup = %d %s, want %s with commands %v", status, body, wantCode, wantCommands)
+		}
+	}
+
+	check("FEISHU_COMPUTER_OFFLINE")
+	runAliceAnotherMeOnAComputer(t, env)
+	fake.setNotInstalled(true)
+	check("LARK_CLI_NOT_INSTALLED", feishu.InstallCommand)
+	fake.setNotInstalled(false)
+	fake.setNotConfigured(true)
+	check("LARK_CLI_NOT_CONFIGURED", feishu.SetupCommand)
+	fake.setNotConfigured(false)
+	fake.setLoggedIn(true)
+	fake.setNotEnabled("mail:user_mailbox:readonly")
+	check("FEISHU_SCOPES_NOT_ENABLED")
+	fake.setNotEnabled()
+	fake.setLoggedIn(false)
+	if status, _, body := env.request(alice, http.MethodGet, setupPath, nil, ""); status != http.StatusNoContent {
+		t.Fatalf("setup while logged out = %d %s", status, body)
+	}
+	var cards int
+	if err := env.pool.QueryRow(t.Context(), `SELECT count(*) FROM decisions WHERE room_id=$1 AND status='pending'`, roomID).Scan(&cards); err != nil || cards != 1 {
+		t.Fatalf("pending cards after setup checks = %d, %v", cards, err)
+	}
+	var connections int
+	if err := env.pool.QueryRow(t.Context(), `SELECT count(*) FROM external_connections WHERE provider='feishu_mail'`).Scan(&connections); err != nil || connections != 0 {
+		t.Fatalf("connections created by setup checks = %d, %v", connections, err)
+	}
+	_, connectURL := createFeishuMailConnection(t, env, alice, "feishu-from-setup")
+	if connectURL == "" {
+		t.Fatal("explicit Connect did not start Feishu authorization")
 	}
 }

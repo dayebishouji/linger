@@ -4,12 +4,16 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"os"
 	"reflect"
+	"runtime"
+	"slices"
 	"time"
 
 	localworkspace "github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/workspace"
 )
 
+// RuntimeMonitorOptions configures periodic Runtime diagnostic monitoring.
 type RuntimeMonitorOptions struct {
 	Initial   DiscoveryResult
 	Discovery DiscoveryOptions
@@ -21,6 +25,9 @@ type RuntimeMonitorOptions struct {
 	OnChanged             func(DiscoveryResult) error
 	OnError               func(error)
 	Discover              func(context.Context, DiscoveryOptions) (DiscoveryResult, error)
+	// TerminalEnvironment caches the login-shell PATH across full discovery
+	// ticks when Discover is nil. When nil, the monitor creates its own cache.
+	TerminalEnvironment *TerminalEnvironmentCache
 	// Shape projects each DiscoveryResult after full discovery or
 	// authentication refresh (for example applying a persisted BYOK catalog
 	// overlay) before diffing against current diagnostics or publishing.
@@ -39,10 +46,16 @@ type RuntimeMonitorOptions struct {
 	// InitialPublished is what the caller already published for Initial,
 	// such as the hello's diagnostics; nil publishes Shape(Initial).
 	InitialPublished *DiscoveryResult
+	// BackfillRuntimes names Runtime types deferred from startup discovery so the
+	// monitor probes and merges them immediately after startup without waiting
+	// for the first periodic refresh tick.
+	BackfillRuntimes []string
 }
 
 const transientRuntimeFailureThreshold = 2
 
+// MonitorRuntimeDiagnostics periodically refreshes Runtime authentication and
+// full discovery state until ctx ends or OnChanged/OnError aborts.
 func MonitorRuntimeDiagnostics(ctx context.Context, options RuntimeMonitorOptions) error {
 	if options.RefreshInterval <= 0 || options.FullRefreshEveryTicks < 1 || options.OnChanged == nil {
 		return errors.New("Runtime diagnostic monitor options are invalid")
@@ -75,15 +88,61 @@ func MonitorRuntimeDiagnostics(ctx context.Context, options RuntimeMonitorOption
 	activeDiscovery := resolveDiscovery()
 	prevEnv := maps.Clone(activeDiscovery.Environment)
 	prevPaths := maps.Clone(activeDiscovery.ConfiguredPaths)
+	prevManaged := maps.Clone(activeDiscovery.ManagedPaths)
+	prevBundled := maps.Clone(activeDiscovery.BundledPaths)
 	transientFailures := make(map[string]int)
 	authenticationFailures := make(map[string]int)
-	discover := options.Discover
-	if discover == nil {
-		discover = Discover
+	termCache := options.TerminalEnvironment
+	if termCache == nil && options.Discover == nil {
+		termCache = NewTerminalEnvironmentCache()
+	}
+	discover := func(ctx context.Context, discoverOptions DiscoveryOptions, forceTerminalCapture bool) (DiscoveryResult, error) {
+		if options.Discover != nil {
+			return options.Discover(ctx, discoverOptions)
+		}
+		resolved := discoverOptions
+		resolved.Environment = termCache.Resolve(ctx, discoverOptions.Environment, forceTerminalCapture)
+		return discoverResolved(ctx, resolved), nil
+	}
+	requested := false
+	if len(options.BackfillRuntimes) > 0 {
+		if err := ctx.Err(); err != nil {
+			return context.Cause(ctx)
+		}
+		if options.RefreshAllowed == nil || options.RefreshAllowed() {
+			targeted := activeDiscovery
+			targeted.Runtimes = slices.Clone(options.BackfillRuntimes)
+			found, err := discover(ctx, targeted, false)
+			if err != nil {
+				if ctx.Err() != nil {
+					return context.Cause(ctx)
+				}
+				if options.OnError != nil {
+					options.OnError(err)
+					requested = true
+				} else {
+					return err
+				}
+			} else {
+				merged := MergeRuntimeDiagnostics(current.Diagnostics, found.Diagnostics)
+				shaped := shape(merged)
+				if err := options.OnChanged(shaped); err != nil {
+					if options.OnError != nil {
+						options.OnError(err)
+						requested = true
+					} else {
+						return err
+					}
+				} else {
+					current, published = merged, shaped
+				}
+			}
+		} else {
+			requested = true
+		}
 	}
 	ticker := time.NewTicker(options.RefreshInterval)
 	defer ticker.Stop()
-	requested := false
 	for tick := 0; ; {
 		select {
 		case <-ctx.Done():
@@ -97,16 +156,22 @@ func MonitorRuntimeDiagnostics(ctx context.Context, options RuntimeMonitorOption
 			continue
 		}
 		activeDiscovery = resolveDiscovery()
-		envChanged := !maps.Equal(prevEnv, activeDiscovery.Environment) || !maps.Equal(prevPaths, activeDiscovery.ConfiguredPaths)
+		envChanged := !maps.Equal(prevEnv, activeDiscovery.Environment) ||
+			!maps.Equal(prevPaths, activeDiscovery.ConfiguredPaths) ||
+			!maps.Equal(prevManaged, activeDiscovery.ManagedPaths) ||
+			!maps.Equal(prevBundled, activeDiscovery.BundledPaths)
+		executablesChanged := runtimeExecutablesChanged(current.Diagnostics)
 		var next DiscoveryResult
 		var err error
-		if (requested || envChanged || tick%options.FullRefreshEveryTicks == 0 || runtimeExecutablesChanged(current.Diagnostics)) &&
+		if (requested || envChanged || tick%options.FullRefreshEveryTicks == 0 || executablesChanged) &&
 			(options.FullRefreshAllowed == nil || options.FullRefreshAllowed()) {
-			next, err = discover(ctx, activeDiscovery)
+			next, err = discover(ctx, activeDiscovery, executablesChanged)
 			if err == nil {
 				requested = false
 				prevEnv = maps.Clone(activeDiscovery.Environment)
 				prevPaths = maps.Clone(activeDiscovery.ConfiguredPaths)
+				prevManaged = maps.Clone(activeDiscovery.ManagedPaths)
+				prevBundled = maps.Clone(activeDiscovery.BundledPaths)
 				for _, diagnostic := range next.Diagnostics {
 					if diagnostic.Status == "ready" {
 						delete(authenticationFailures, diagnostic.Type)
@@ -121,6 +186,19 @@ func MonitorRuntimeDiagnostics(ctx context.Context, options RuntimeMonitorOption
 					next = retainReadyRuntimesDuringInconclusiveProbes(current, published, next)
 				}
 				next = retainReadyRuntimesDuringTransientFailures(current, published, next, authenticationFailures)
+			}
+			// No Operation runs on a Runtime that is not installed or too old,
+			// so its rediscovery waits neither for the full cadence nor for
+			// active Operations to finish.
+			if err == nil {
+				if changed := changedInstallations(ctx, next.Diagnostics, activeDiscovery, termCache); len(changed) > 0 {
+					targeted := activeDiscovery
+					targeted.Runtimes = changed
+					var found DiscoveryResult
+					if found, err = discover(ctx, targeted, false); err == nil {
+						next = withRuntimeDiagnostics(next, found.Diagnostics, changed)
+					}
+				}
 			}
 		}
 		if err != nil {
@@ -169,9 +247,20 @@ func retainReadyRuntimesDuringTransientFailures(current, published, next Discove
 		if previous == nil {
 			continue
 		}
-		if publishedReady(current, published, diagnostics[index].Type) && !runtimeExecutableChanged(*previous) && previous.ExecutablePath == diagnostics[index].ExecutablePath &&
-			(diagnostics[index].Status == "incompatible" || diagnostics[index].Status == "error") &&
-			(diagnostics[index].Type != "codex" || diagnostics[index].ModelCatalogError == "") {
+		transient := false
+		if publishedReady(current, published, diagnostics[index].Type) {
+			switch diagnostics[index].Status {
+			case "not_installed":
+				// A CLI self-update can briefly unlink the executable; wait for
+				// consecutive misses before publishing not_installed.
+				transient = true
+			case "incompatible", "error":
+				transient = !runtimeExecutableChanged(*previous) &&
+					previous.ExecutablePath == diagnostics[index].ExecutablePath &&
+					(diagnostics[index].Type != "codex" || diagnostics[index].ModelCatalogError == "")
+			}
+		}
+		if transient {
 			failures[diagnostics[index].Type]++
 			if failures[diagnostics[index].Type] < transientRuntimeFailureThreshold {
 				diagnostics[index] = *previous
@@ -262,7 +351,7 @@ func refreshRuntimeAuthentication(ctx context.Context, current DiscoveryResult, 
 		if (diagnostic.Type == "pi" || diagnostic.Type == "antigravity") && diagnostic.Status == "ready" {
 			previousModels := diagnostic.Models
 			catalogCtx, cancel := context.WithTimeout(ctx, boundedAuthTimeout(options.Timeout))
-			diagnostic.Models, diagnostic.ModelCatalogError = probedRuntimeModels(catalogCtx, diagnostic.Type, diagnostic.ExecutablePath, environment, outcome)
+			diagnostic.Models, diagnostic.ModelCatalogError = probedRuntimeModels(catalogCtx, diagnostic.Type, diagnostic.ExecutablePath, environment, outcome, options.TempBase)
 			if diagnostic.ModelCatalogError == "" {
 				carryOrResolveModelLinks(catalogCtx, diagnostic.Type, environment, previousModels, diagnostic.Models)
 			}
@@ -307,18 +396,98 @@ func carryOrResolveModelLinks(ctx context.Context, kind string, environment map[
 
 func refreshAuthenticationProbe(ctx context.Context, diagnostic RuntimeDiagnostic, environment map[string]string, options DiscoveryOptions) runtimeProbeOutcome {
 	budget := boundedAuthTimeout(options.Timeout)
+	probeOpts := probeOptions{runtimeHomeRoot: options.RuntimeHomeRoot, tempBase: options.TempBase}
 	if diagnostic.Type != "codex" {
-		return probeRuntimeAuthentication(ctx, diagnostic.Type, diagnostic.ExecutablePath, environment, budget, diagnostic.Version, options.RuntimeHomeRoot)
+		return probeRuntimeAuthentication(ctx, diagnostic.Type, diagnostic.ExecutablePath, environment, budget, probeOpts)
 	}
 	probe, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	// An authentication probe lists no models, so its home needs no cache.
-	prepared, release, err := localworkspace.CodexProbeEnvironment(probe, environment, diagnostic.Version, nil)
+	prepared, release, err := localworkspace.CodexProbeEnvironment(probe, environment, diagnostic.Version, nil, options.TempBase)
 	if err != nil {
 		return runtimeProbeOutcome{Status: "error", Code: "RUNTIME_DIAGNOSTIC_FAILED", Message: "Codex diagnostic home could not be prepared"}
 	}
 	defer release()
-	return probeRuntimeAuthentication(probe, diagnostic.Type, diagnostic.ExecutablePath, prepared, budget, diagnostic.Version, options.RuntimeHomeRoot)
+	return probeRuntimeAuthentication(probe, diagnostic.Type, diagnostic.ExecutablePath, prepared, budget, probeOpts)
+}
+
+// changedInstallations names the Runtimes discovery found not installed or
+// too old whose executable has since appeared or been replaced, by searching
+// the PATH that discovery searched. It only stats files, so it runs on every
+// tick; the rediscovery it asks for runs the probes.
+func changedInstallations(ctx context.Context, diagnostics []RuntimeDiagnostic, options DiscoveryOptions, termCache *TerminalEnvironmentCache) []string {
+	environment := platformEnvironment(maps.Clone(options.Environment))
+	if runtime.GOOS == "windows" && termCache != nil {
+		environment = termCache.Resolve(ctx, environment, false)
+	}
+	if environment == nil {
+		environment = make(map[string]string)
+	}
+	refreshedWindowsPath := environment["PATH"]
+	var changed []string
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Status != "not_installed" && diagnostic.Status != "incompatible" {
+			continue
+		}
+		searchPath := diagnostic.searchPath
+		if runtime.GOOS == "windows" && refreshedWindowsPath != "" {
+			searchPath = mergeWindowsSearchPath(refreshedWindowsPath, "", diagnostic.searchPath)
+		}
+		if searchPath == "" {
+			continue
+		}
+		definition := slices.IndexFunc(runtimeDefinitions, func(definition runtimeDefinition) bool { return definition.Type == diagnostic.Type })
+		if definition < 0 {
+			continue
+		}
+		diagnosticEnv := maps.Clone(environment)
+		diagnosticEnv["PATH"] = searchPath
+		entry, err := resolveExecutableEntry(ctx, diagnostic.Type, runtimeDefinitions[definition].Command,
+			DiscoveryOptions{
+				ConfiguredPaths: options.ConfiguredPaths,
+				ManagedPaths:    options.ManagedPaths,
+				BundledPaths:    options.BundledPaths,
+				Environment:     diagnosticEnv,
+			})
+		canonical := ""
+		if err == nil {
+			canonical, err = canonicalExecutable(entry)
+		}
+		if err != nil {
+			// A removed executable turns a Runtime that was too old into one
+			// that is not installed.
+			if diagnostic.Status == "incompatible" {
+				changed = append(changed, diagnostic.Type)
+			}
+			continue
+		}
+		if diagnostic.Status == "not_installed" || canonical != diagnostic.ExecutablePath {
+			changed = append(changed, diagnostic.Type)
+			continue
+		}
+		// An upgrade in place (npm replaces the package, an installer rewrites
+		// the binary) keeps the path but not the file.
+		info, err := os.Stat(canonical)
+		if previous := diagnostic.executable; err == nil && previous != nil &&
+			(!os.SameFile(info, previous) || !info.ModTime().Equal(previous.ModTime()) || info.Size() != previous.Size()) {
+			changed = append(changed, diagnostic.Type)
+		}
+	}
+	return changed
+}
+
+// withRuntimeDiagnostics replaces the diagnostics of types with those found.
+func withRuntimeDiagnostics(result DiscoveryResult, found []RuntimeDiagnostic, types []string) DiscoveryResult {
+	diagnostics := slices.Clone(result.Diagnostics)
+	for _, replacement := range found {
+		if !slices.Contains(types, replacement.Type) {
+			continue
+		}
+		if index := slices.IndexFunc(diagnostics, func(diagnostic RuntimeDiagnostic) bool { return diagnostic.Type == replacement.Type }); index >= 0 {
+			diagnostics[index] = replacement
+		}
+	}
+	return DiscoveryResult{Diagnostics: diagnostics, Installations: InstallationsFromDiagnostics(diagnostics)}
 }
 
 func runtimeExecutableChanged(diagnostic RuntimeDiagnostic) bool {

@@ -296,3 +296,11 @@ func TestInboxSinceNamesThePageToReadOnFrom(t *testing.T) {
 		t.Fatalf("found %d, next %q, err %v, calls %d", len(found), next, err, len(caughtUp.calls))
 	}
 }
+
+func TestUnconfiguredLarkCLIIsNotAnAuthorizationFailure(t *testing.T) {
+	err := statusError("status check", map[string]any{"status": StatusNotConfigured, "detail": "not configured"})
+	var computer *ComputerError
+	if !errors.As(err, &computer) || computer.Status != StatusNotConfigured || IsAuthFailure(err) {
+		t.Fatalf("err = %#v", err)
+	}
+}

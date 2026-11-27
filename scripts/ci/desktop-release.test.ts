@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, generateKeyPairSync, verify } from "node:crypto";
 import {
   chmodSync,
@@ -8,12 +8,16 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
+import { gunzipSync } from "node:zlib";
 
 import { afterEach, describe, expect, it } from "vitest";
+
+import { SOURCE_SKELETON_FILES } from "../prepare-source-archive.mjs";
 
 const script = join(process.cwd(), "scripts/ci/desktop-release.sh");
 const temporary: string[] = [];
@@ -213,6 +217,18 @@ describe("desktop-release.sh manifest", () => {
     expect(existsSync(join(dir, "manifest.json"))).toBe(false);
   });
 
+  it("refuses a missing key when DESKTOP_REQUIRE_UPDATE_KEY=true", () => {
+    const dir = release();
+
+    const result = run(["manifest", dir, version], {
+      DESKTOP_REQUIRE_UPDATE_KEY: "true",
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("DESKTOP_UPDATE_KEY_PEM is required");
+    expect(existsSync(join(dir, "manifest.json"))).toBe(false);
+  });
+
   it("refuses a key installed apps would not accept", () => {
     const dir = release();
     // The throwaway key against this checkout's UPDATE_PUBLIC_KEY.
@@ -274,6 +290,348 @@ describe("desktop-release.sh build", () => {
     expect(result.stderr).toContain("cannot download");
     expect(result.stdout + result.stderr).not.toContain("private-deps-folder");
   });
+
+  it("refuses unsigned darwin-arm64 packaging when DESKTOP_REQUIRE_MACOS_SIGNING=true", () => {
+    const root = folder();
+    mkdirSync(join(root, "scripts/ci"), { recursive: true });
+    mkdirSync(join(root, "apps/desktop/dist/installer"), { recursive: true });
+    copyFileSync(script, join(root, "scripts/ci/desktop-release.sh"));
+    writeFileSync(
+      join(root, "apps/desktop/package.json"),
+      `${JSON.stringify({ name: "@linger/desktop", version: "0.0.0" }, null, 2)}\n`,
+    );
+
+    const result = run(
+      ["package", "darwin-arm64"],
+      {
+        DESKTOP_VERSION: "1.0.0",
+        DESKTOP_REQUIRE_MACOS_SIGNING: "true",
+        RELEASE_OUT: folder(),
+      },
+      join(root, "scripts/ci/desktop-release.sh"),
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("DESKTOP_REQUIRE_MACOS_SIGNING");
+  });
+
+  it("prepares minimal shipped and full build archives from one commit for compile", () => {
+    const root = folder();
+    const out = folder();
+    const record = join(root, "build-env.json");
+    mkdirSync(join(root, "scripts/ci"), { recursive: true });
+    mkdirSync(join(root, "apps/desktop"), { recursive: true });
+    copyFileSync(script, join(root, "scripts/ci/desktop-release.sh"));
+    copyFileSync(
+      join(process.cwd(), "scripts/prepare-source-archive.mjs"),
+      join(root, "scripts/prepare-source-archive.mjs"),
+    );
+    for (const relativePath of SOURCE_SKELETON_FILES) {
+      const target = join(root, relativePath);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(
+        target,
+        relativePath === "package.json"
+          ? '{"name":"linger"}\n'
+          : `${relativePath}\n`,
+      );
+    }
+    writeFileSync(join(root, "README.md"), "full-only\n");
+    writeFileSync(
+      join(root, "apps/desktop/package.json"),
+      `${JSON.stringify({ name: "@linger/desktop", version: "0.0.0" }, null, 2)}\n`,
+    );
+    writeFileSync(
+      join(root, "apps/desktop/build.mjs"),
+      [
+        'import { readFileSync, writeFileSync } from "node:fs";',
+        'const pkg = JSON.parse(readFileSync("package.json", "utf8"));',
+        "writeFileSync(process.env.RECORD_FILE, JSON.stringify({",
+        "  shipped: process.env.LINGER_SOURCE_ARCHIVE_FILE,",
+        "  full: process.env.LINGER_BUILD_SOURCE_ARCHIVE_FILE,",
+        "  target: process.env.LINGER_DESKTOP_DAEMON_TARGETS,",
+        "  version: pkg.version,",
+        "}));",
+        "",
+      ].join("\n"),
+    );
+    const git = (...args: string[]) =>
+      execFileSync(
+        "git",
+        ["-C", root, "-c", "user.name=t", "-c", "user.email=t@t", ...args],
+        { encoding: "utf8" },
+      ).trim();
+    git("init", "-q");
+    git("add", ".");
+    git("commit", "-q", "-m", "init");
+    const head = git("rev-parse", "HEAD");
+
+    const result = run(
+      ["compile", "linux-x64"],
+      {
+        DESKTOP_VERSION: "1.2.3",
+        RELEASE_OUT: out,
+        RECORD_FILE: record,
+      },
+      join(root, "scripts/ci/desktop-release.sh"),
+    );
+
+    expect(result.status).toBe(0);
+    const recorded = JSON.parse(readFileSync(record, "utf8")) as {
+      shipped: string;
+      full: string;
+      target: string;
+      version: string;
+    };
+    expect(recorded.target).toBe("linux-x64");
+    expect(recorded.version).toBe("1.2.3");
+    expect(recorded.shipped.startsWith(join(out, "source/shipped/"))).toBe(
+      true,
+    );
+    expect(recorded.full.startsWith(join(out, "source/full/"))).toBe(true);
+
+    const paxCommit = (archive: string) => {
+      const tar = gunzipSync(readFileSync(archive));
+      return /comment=([0-9a-f]{40})\n/.exec(
+        tar.subarray(512, 1024).toString(),
+      )?.[1];
+    };
+    expect(paxCommit(recorded.shipped)).toBe(head);
+    expect(paxCommit(recorded.full)).toBe(head);
+
+    const listEntries = (archive: string) =>
+      execFileSync("tar", ["-tzf", archive], { encoding: "utf8" })
+        .trim()
+        .split("\n");
+    const shippedFiles = listEntries(recorded.shipped).filter(
+      (entry) => !entry.endsWith("/"),
+    );
+    const fullEntries = listEntries(recorded.full);
+    expect(shippedFiles).toHaveLength(SOURCE_SKELETON_FILES.length);
+    expect(shippedFiles.some((entry) => entry.endsWith("/README.md"))).toBe(
+      false,
+    );
+    expect(fullEntries.some((entry) => entry.endsWith("/README.md"))).toBe(
+      true,
+    );
+    expect(
+      JSON.parse(readFileSync(join(root, "apps/desktop/package.json"), "utf8"))
+        .version,
+    ).toBe("0.0.0");
+  });
+
+  function setupCompileFixture(options: {
+    target?: string;
+    kitBytes?: Buffer;
+    writeStaleBundledKit?: boolean;
+  }) {
+    const target = options.target ?? "linux-x64";
+    const [platform, arch] = target.split("-");
+    const kitBytes = options.kitBytes ?? Buffer.from("bundled-localmodels-kit");
+    const kitSha = createHash("sha256").update(kitBytes).digest("hex");
+    const root = folder();
+    const out = folder();
+    const kitDir = folder();
+    const record = join(root, "build-env.json");
+    mkdirSync(join(root, "scripts/ci"), { recursive: true });
+    mkdirSync(join(root, "apps/desktop/distribution"), { recursive: true });
+    copyFileSync(script, join(root, "scripts/ci/desktop-release.sh"));
+    copyFileSync(
+      join(process.cwd(), "scripts/prepare-source-archive.mjs"),
+      join(root, "scripts/prepare-source-archive.mjs"),
+    );
+    for (const relativePath of SOURCE_SKELETON_FILES) {
+      const targetFile = join(root, relativePath);
+      mkdirSync(dirname(targetFile), { recursive: true });
+      writeFileSync(
+        targetFile,
+        relativePath === "package.json"
+          ? '{"name":"linger"}\n'
+          : `${relativePath}\n`,
+      );
+    }
+    writeFileSync(
+      join(root, "apps/desktop/package.json"),
+      `${JSON.stringify({ name: "@linger/desktop", version: "0.0.0" }, null, 2)}\n`,
+    );
+    writeFileSync(
+      join(root, `apps/desktop/distribution/${target}.json`),
+      `${JSON.stringify(
+        {
+          platform,
+          arch,
+          localmodelsTool: {
+            url: `https://example.com/${target}.tgz`,
+            sha256: kitSha,
+            bytes: kitBytes.length,
+            sourceCommit: "a".repeat(40),
+            manifestSha256: "b".repeat(64),
+          },
+          nativeSources: [],
+          voiceTools: [],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    writeFileSync(
+      join(root, "apps/desktop/build.mjs"),
+      [
+        'import { mkdirSync, writeFileSync } from "node:fs";',
+        'mkdirSync("dist/installer", { recursive: true });',
+        'writeFileSync("dist/installer/distribution.json", "{}");',
+        ...(options.writeStaleBundledKit
+          ? [
+              'writeFileSync("dist/installer/bundled-localmodels-kit.tgz", "stale");',
+            ]
+          : []),
+        "writeFileSync(process.env.RECORD_FILE, JSON.stringify({",
+        "  kitDir: process.env.LINGER_BUNDLED_LOCALMODELS_KIT_DIR ?? '',",
+        "}));",
+        "",
+      ].join("\n"),
+    );
+    const git = (...args: string[]) =>
+      execFileSync(
+        "git",
+        ["-C", root, "-c", "user.name=t", "-c", "user.email=t@t", ...args],
+        { encoding: "utf8" },
+      ).trim();
+    git("init", "-q");
+    git("add", ".");
+    git("commit", "-q", "-m", "init");
+    return {
+      root,
+      out,
+      kitDir,
+      record,
+      kitBytes,
+      script: join(root, "scripts/ci/desktop-release.sh"),
+    };
+  }
+
+  it("stages matching <target>.tgz as bundled-localmodels-kit.tgz when LINGER_BUNDLED_LOCALMODELS_KIT_DIR is set", () => {
+    const fixture = setupCompileFixture({});
+    writeFileSync(join(fixture.kitDir, "linux-x64.tgz"), fixture.kitBytes);
+
+    const result = run(
+      ["compile", "linux-x64"],
+      {
+        DESKTOP_VERSION: "1.2.3",
+        RELEASE_OUT: fixture.out,
+        RECORD_FILE: fixture.record,
+        LINGER_BUNDLED_LOCALMODELS_KIT_DIR: fixture.kitDir,
+      },
+      fixture.script,
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(readFileSync(fixture.record, "utf8"))).toEqual({
+      kitDir: fixture.kitDir,
+    });
+    const staged = join(
+      fixture.root,
+      "apps/desktop/dist/installer/bundled-localmodels-kit.tgz",
+    );
+    expect(existsSync(staged)).toBe(true);
+    expect(readFileSync(staged)).toEqual(fixture.kitBytes);
+  });
+
+  it("fails closed when LINGER_BUNDLED_LOCALMODELS_KIT_DIR has a missing, symlink, or mismatched archive", () => {
+    const fixture = setupCompileFixture({});
+
+    // Missing file.
+    const missing = run(
+      ["compile", "linux-x64"],
+      {
+        DESKTOP_VERSION: "1.2.3",
+        RELEASE_OUT: fixture.out,
+        RECORD_FILE: fixture.record,
+        LINGER_BUNDLED_LOCALMODELS_KIT_DIR: fixture.kitDir,
+      },
+      fixture.script,
+    );
+    expect(missing.status).toBe(1);
+    expect(missing.stderr).toContain("regular non-symlink file");
+    expect(existsSync(fixture.record)).toBe(false);
+
+    // Wrong size.
+    writeFileSync(join(fixture.kitDir, "linux-x64.tgz"), "wrong");
+    const wrongSize = run(
+      ["compile", "linux-x64"],
+      {
+        DESKTOP_VERSION: "1.2.3",
+        RELEASE_OUT: fixture.out,
+        RECORD_FILE: fixture.record,
+        LINGER_BUNDLED_LOCALMODELS_KIT_DIR: fixture.kitDir,
+      },
+      fixture.script,
+    );
+    expect(wrongSize.status).toBe(1);
+    expect(wrongSize.stderr).toContain("size mismatch");
+    expect(existsSync(fixture.record)).toBe(false);
+
+    // Same size, wrong sha256.
+    const tampered = Buffer.from(fixture.kitBytes);
+    tampered[0] = (tampered[0] ?? 0) ^ 0xff;
+    writeFileSync(join(fixture.kitDir, "linux-x64.tgz"), tampered);
+    const wrongSha = run(
+      ["compile", "linux-x64"],
+      {
+        DESKTOP_VERSION: "1.2.3",
+        RELEASE_OUT: fixture.out,
+        RECORD_FILE: fixture.record,
+        LINGER_BUNDLED_LOCALMODELS_KIT_DIR: fixture.kitDir,
+      },
+      fixture.script,
+    );
+    expect(wrongSha.status).toBe(1);
+    expect(wrongSha.stderr).toContain("sha256 mismatch");
+    expect(existsSync(fixture.record)).toBe(false);
+
+    // Symlink to valid file.
+    const realFile = join(folder(), "real.tgz");
+    writeFileSync(realFile, fixture.kitBytes);
+    rmSync(join(fixture.kitDir, "linux-x64.tgz"));
+    symlinkSync(realFile, join(fixture.kitDir, "linux-x64.tgz"));
+    const linked = run(
+      ["compile", "linux-x64"],
+      {
+        DESKTOP_VERSION: "1.2.3",
+        RELEASE_OUT: fixture.out,
+        RECORD_FILE: fixture.record,
+        LINGER_BUNDLED_LOCALMODELS_KIT_DIR: fixture.kitDir,
+      },
+      fixture.script,
+    );
+    expect(linked.status).toBe(1);
+    expect(linked.stderr).toContain("regular non-symlink file");
+    expect(existsSync(fixture.record)).toBe(false);
+  });
+
+  it("removes any stale bundled-localmodels-kit.tgz when LINGER_BUNDLED_LOCALMODELS_KIT_DIR is unset", () => {
+    const fixture = setupCompileFixture({ writeStaleBundledKit: true });
+
+    const result = run(
+      ["compile", "linux-x64"],
+      {
+        DESKTOP_VERSION: "1.2.3",
+        RELEASE_OUT: fixture.out,
+        RECORD_FILE: fixture.record,
+      },
+      fixture.script,
+    );
+
+    expect(result.status).toBe(0);
+    expect(
+      existsSync(
+        join(
+          fixture.root,
+          "apps/desktop/dist/installer/bundled-localmodels-kit.tgz",
+        ),
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("desktop-release.sh gitlab-upload", () => {
@@ -308,7 +666,7 @@ describe("desktop-release.sh github-release", () => {
     chmodSync(join(bin, "gh"), 0o755);
     writeFileSync(join(dir, "SHA256SUMS.txt"), "");
     const result = run(["github-release", dir, tag, version], {
-      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
       ...env,
     });
     let calls = "";
@@ -359,13 +717,14 @@ describe("desktop-release.sh github-release", () => {
     writeFileSync(join(dir, "SHA256SUMS.txt"), "");
 
     const result = run(["github-release", dir, "desktop-v1.0.0", "1.0.0"], {
-      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
       GITHUB_REPOSITORY: "simplexai-labs/linger",
       GH_TOKEN: "token",
     });
 
     expect(result.status).toBe(0);
     const calls = readFileSync(log, "utf8");
+    expect(calls).toContain("--title Linger Desktop 1.0.0 (Beta)");
     expect(calls).toContain("--draft");
     expect(calls).not.toContain("--latest");
     expect(calls).not.toContain("--prerelease");
@@ -435,7 +794,7 @@ describe("desktop-release.sh publish", () => {
     );
 
     const result = run(["publish", "desktop-v1.0.0", "--notes-file", notes], {
-      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
     });
 
     expect(result.status).toBe(0);
@@ -465,7 +824,7 @@ describe("desktop-release.sh publish", () => {
     ]);
 
     const result = run(["publish", "desktop-v1.0.0", "--notes-file", notes], {
-      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
     });
 
     expect(result.status).toBe(1);
@@ -479,7 +838,7 @@ describe("desktop-release.sh publish", () => {
     writeFileSync(emptyNotes, "   \n");
 
     const pre = run(["publish", "desktop-v1.0.0-rc.1", "--notes-file", notes], {
-      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
     });
     expect(pre.status).toBe(1);
     expect(pre.stderr).toContain("not prereleases");
@@ -487,7 +846,7 @@ describe("desktop-release.sh publish", () => {
     const empty = run(
       ["publish", "desktop-v1.0.0", "--notes-file", emptyNotes],
       {
-        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
       },
     );
     expect(empty.status).toBe(1);
@@ -554,7 +913,7 @@ describe("desktop-release.sh package Docker images", () => {
     const result = run(
       ["package", "darwin-arm64"],
       {
-        PATH: `${fixture.bin}:${process.env.PATH ?? ""}`,
+        PATH: `${fixture.bin}${delimiter}${process.env.PATH ?? ""}`,
         DESKTOP_VERSION: version,
         RELEASE_OUT: fixture.out,
         DESKTOP_PACKAGING_IMAGE_PREFIX: "ghcr.io/simplexai-labs/linger/desktop",
@@ -582,7 +941,7 @@ describe("desktop-release.sh package Docker images", () => {
     const result = run(
       ["package", "darwin-arm64"],
       {
-        PATH: `${fixture.bin}:${process.env.PATH ?? ""}`,
+        PATH: `${fixture.bin}${delimiter}${process.env.PATH ?? ""}`,
         DESKTOP_VERSION: version,
         RELEASE_OUT: fixture.out,
         DESKTOP_PACKAGING_IMAGE_PREFIX:
@@ -611,7 +970,7 @@ describe("desktop-release.sh package Docker images", () => {
     const result = run(
       ["package", "darwin-arm64"],
       {
-        PATH: `${fixture.bin}:${process.env.PATH ?? ""}`,
+        PATH: `${fixture.bin}${delimiter}${process.env.PATH ?? ""}`,
         DESKTOP_VERSION: version,
         RELEASE_OUT: fixture.out,
         DESKTOP_PACKAGING_IMAGE_PREFIX: "ghcr.io/simplexai-labs/linger/desktop",

@@ -8,25 +8,28 @@ import { renderAgentInstructions } from "../../prompt/agent-instructions.js";
 import { renderBehaviorPattern } from "../../prompt/behavior-pattern.js";
 import { renderCompactMetaInstructions } from "../../prompt/compact-meta-instructions.js";
 import {
-  renderCompactEnvironmentKnowledge,
-  renderEnvironmentKnowledge,
+  renderAlterEgoTaskContext,
+  renderEnvironmentKnowledgeStatic,
 } from "../../prompt/environment-knowledge.js";
+import { renderMetaInstructions } from "../../prompt/meta-instructions.js";
 import {
   PERSONALITY_SPEC,
   PERSONALITY_SPEC_COMPACT,
 } from "../../prompt/personality-spec.js";
-import { renderPersonalContextMethod } from "../../prompt/personal-context-method.js";
+import {
+  PERSONAL_CONTEXT_METHOD_STATIC,
+  renderConnectedAppContextSources,
+} from "../../prompt/personal-context-method.js";
 import {
   PERSONAL_KNOWLEDGE_POLICY,
   PERSONAL_KNOWLEDGE_POLICY_COMPACT,
 } from "../../prompt/personal-knowledge-policy.js";
-import { renderMetaInstructions } from "../../prompt/meta-instructions.js";
+import type { SplitInstructions } from "../../prompt/prefix-boundary.js";
 
 interface ExecutionContextDeveloperInstructionsCommonInput {
   readonly agentName: string;
   readonly agentActorId: string;
   readonly agentType: AgentType;
-  readonly developerInstructions: string | undefined;
   readonly representedHuman?: AgentRepresentedHuman;
   readonly sponsor: AgentSponsorIdentity;
   /** TeamHub has a Composio API key, so the connected app commands work. */
@@ -62,9 +65,13 @@ export type ExecutionContextDeveloperInstructionsInput =
         }
     );
 
-export const assembleExecutionContextDeveloperInstructions = (
+/**
+ * Renders developer instructions split into a cacheable static prefix and a
+ * per-Agent / per-Context dynamic tail.
+ */
+export function assembleExecutionContextDeveloperInstructions(
   input: ExecutionContextDeveloperInstructionsInput,
-): string => {
+): SplitInstructions {
   const representedHuman = input.representedHuman ?? input.sponsor;
   const compact = input.compactInstructions;
   if (input.contextKind === "meta")
@@ -73,43 +80,47 @@ export const assembleExecutionContextDeveloperInstructions = (
       agentActorId: input.agentActorId,
       agentType: input.agentType,
       representedHuman,
-      ...(input.developerInstructions
-        ? { configuredInstructions: input.developerInstructions }
-        : {}),
       roomId: input.roomId,
       roomKind: input.roomKind,
       connectedApps: input.connectedApps,
       connectedAppKeys: input.connectedAppKeys,
       connectableAppKeys: input.connectableAppKeys,
     });
-  const fragments: string[] = [
-    renderAgentInstructions({
-      agentName: input.agentName,
-      agentActorId: input.agentActorId,
-      agentType: input.agentType,
-      developerInstructions: input.developerInstructions,
-      representedHuman,
-    }),
+  const staticParts: string[] = [
     compact ? PERSONALITY_SPEC_COMPACT : PERSONALITY_SPEC,
     renderTeamHubCommands(input),
   ];
   if (input.contextKind !== "document") {
-    fragments.push(
-      renderPersonalContextMethod(input.connectedApps, input.connectedAppKeys),
+    staticParts.push(
+      PERSONAL_CONTEXT_METHOD_STATIC,
       compact ? PERSONAL_KNOWLEDGE_POLICY_COMPACT : PERSONAL_KNOWLEDGE_POLICY,
     );
   }
-  fragments.push(
-    (compact ? renderCompactEnvironmentKnowledge : renderEnvironmentKnowledge)(
-      input.contextKind,
-      input.contextKind === "alter_ego" ? input.taskId : undefined,
-    ),
-  );
-  fragments.push(
+  staticParts.push(
+    renderEnvironmentKnowledgeStatic(input.contextKind, compact),
     renderBehaviorPattern({ contextKind: input.contextKind, compact }),
   );
-  return fragments.join("\n\n");
-};
+  const dynamicParts: string[] = [
+    renderAgentInstructions({
+      agentName: input.agentName,
+      agentActorId: input.agentActorId,
+      agentType: input.agentType,
+      representedHuman,
+    }),
+  ];
+  if (input.contextKind === "alter_ego") {
+    dynamicParts.push(renderAlterEgoTaskContext(input.taskId, compact));
+    const appSources = renderConnectedAppContextSources(
+      input.connectedApps,
+      input.connectedAppKeys,
+    );
+    if (appSources) dynamicParts.push(appSources);
+  }
+  return {
+    static: staticParts.join("\n\n"),
+    dynamic: dynamicParts.join("\n\n"),
+  };
+}
 
 const CONNECTED_APP_WRITES = ` Connected app writes are an exception: when an external write's outcome is unknown, do not rerun it blindly. Rerunning submits the write again whatever its operation ID; only a confirmation-card command with the same operation ID returns the same card. Check the result in the external application first, and submit again only after confirming the write did not take effect.`;
 
@@ -121,13 +132,13 @@ function renderCompactTeamHubCommands(
     { readonly contextKind: "meta" }
   >,
 ): string {
-  const common = `teamhub is a command-line program, not a tool: run it with your shell tool (exec_command, Bash, or bash), passing the whole command line as its cmd or command argument, and never call a tool named teamhub. teamhub <domain> <action> --help explains each command, and TeamHub checks your authority on every call. Use --file - for a body from stdin and --json for structured results. Credentials are installed; never read or print them. With --operation-id, use a unique id per write; after an unknown outcome, rerun the same command with the id the error printed.${input.connectedApps ? COMPACT_CONNECTED_APP_WRITES : ""}`;
+  const common = `teamhub is a command-line program, not a tool: run it with your shell tool (exec_command, Bash, bash, or powershell), passing the whole command line as its cmd or command argument, and never call a tool named teamhub. teamhub <domain> <action> --help explains each command, and TeamHub checks your authority on every call. Use --file - for a body from stdin and --json for structured results. Credentials are installed; never read or print them. With --operation-id, use a unique id per write; after an unknown outcome, rerun the same command with the id the error printed.${input.connectedApps ? COMPACT_CONNECTED_APP_WRITES : ""}`;
   if (input.contextKind === "document")
     return `<teamhub-commands>\n${common}
 Use the thread ID from this input: teamhub docs comment get <thread-id> reads it, teamhub docs comment reply <thread-id> --content "..." replies, and teamhub docs comment replace <thread-id> --content "..." applies an explicitly requested text change. Don't send Room messages.
 </teamhub-commands>`;
   return `<teamhub-commands>\n${common}
-In a Task you can't send messages or create Documents, Rooms, or Tasks. Read with teamhub message read, teamhub docs get, and teamhub docs list; edit an existing Document only when the Task asks. Write outputs under ./playground/<current-task-id>/ and describe them in your final reply.
+In a Task you can't send messages or create Documents, Rooms, or Tasks, though authorization and connection cards are allowed. Read with teamhub message read, teamhub docs get, and teamhub docs list; edit an existing Document only when the Task asks. Write outputs under ./playground/<current-task-id>/ and describe them in your final reply.
 </teamhub-commands>`;
 }
 
@@ -146,6 +157,6 @@ Use the exact thread ID supplied in this input. Read with teamhub docs comment g
 teamhub docs comment reply <current-thread-id> --operation-id <unique-reply-id> --content "Your reply" --json
 </teamhub-commands>`;
   return `<teamhub-commands>\n${common}
-In a Task you don't send messages or create Documents, Rooms, or Tasks; TeamHub refuses them. Read with teamhub message read, teamhub docs get, and teamhub docs list; edit an existing Document only when the Task asks for it. Write outputs under ./playground/<current-task-id>/ and describe them in your final reply.
+In a Task you don't send messages or create Documents, Rooms, or Tasks; TeamHub refuses them. Posting authorization or connection cards (such as teamhub browser connect or teamhub computer permissions request) is allowed and is separate from sending chat messages. Read with teamhub message read, teamhub docs get, and teamhub docs list; edit an existing Document only when the Task asks for it. Write outputs under ./playground/<current-task-id>/ and describe them in your final reply.
 </teamhub-commands>`;
 }

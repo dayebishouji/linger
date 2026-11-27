@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 
 import type { JobContext } from "@livekit/agents";
 import { AutoSubscribe, log } from "@livekit/agents";
@@ -15,12 +16,14 @@ import {
 import {
   TeamHubVoiceRuntimeError,
   type TeamHubVoiceRuntimeClient,
+  type VoiceLiveAudioStats,
   type VoiceLiveClientEvent,
   type VoiceLiveRuntimeEvent,
 } from "./live-client.js";
 
 import {
   alertNote,
+  roomReportNote,
   browserNote,
   taskNote,
   updateCue,
@@ -52,6 +55,8 @@ import { liveInputRate, xaiSpeedTool } from "./xai-live.js";
 
 export const liveDataTopic = "linger.voice.live";
 export const liveReplyTrackName = "linger-live-reply";
+/** "1" while the provider session is open, "0" while it opens or reconnects. */
+export const providerReadyAttribute = "linger.voice_provider_ready";
 const replySampleRate = 24_000;
 const replyChunkSamples = 480;
 /** Local speech this long means the user is talking (16 kHz samples). */
@@ -102,9 +107,11 @@ const preRollSamples = liveInputRate * 0.3;
  * Local speech this long pauses the reply at once. Server VAD noticed a user
  * talking over the reply about 1 s after they began, local VAD in about
  * 0.2 s (2026-11-10, 75 barge-ins), but local VAD also hears the reply's own
- * echo; the pause becomes a barge-in only when server VAD confirms it.
+ * echo. Continued speech after playout stops provides independent evidence.
  */
 const pauseSpeechSamples = 16_000 * 0.2;
+/** Count voice after silencing playback so its initial echo alone cannot cancel a reply. */
+const confirmPausedSpeechSamples = 16_000 * 0.32;
 /**
  * Speech this far below the user's own level is someone else in the room:
  * Silero hears any voice, near or far. A speaker 15 dB below the user
@@ -112,7 +119,7 @@ const pauseSpeechSamples = 16_000 * 0.2;
  * windows and this gate in none.
  */
 const otherSpeakerDb = 10;
-/** Playback's minimum speech level before the user's level is known. */
+/** Minimum speech level before this microphone's foreground level is known. */
 const faintestSpeechDb = -50;
 /** An open gate stays open this much below its threshold, for word tails. */
 const levelHysteresisDb = 6;
@@ -126,10 +133,17 @@ const userLevelRise = 0.5;
 const userLevelFall = 0.01;
 /** A pause server VAD has not confirmed resumes after this much local quiet. */
 const resumeQuietSamples = 16_000 * 0.4;
-/** A pause never lasts longer than this. */
-const maximumPauseMs = 2_500;
+/** After playback resumes, wait for a fresh onset beyond its immediate echo. */
+const rearmQuietWindows = 3;
+/** Short utterances close to the learned voice level can reach the provider before a local pause. */
+const nearVoiceMarginDb = 6;
+const shortSpeechSamples = 16_000 * 0.192;
+/** Release a tentative pause if the microphone stops delivering evidence. */
+const pauseIdleTimeoutMs = 2_500;
 /** Reply audio kept after it reaches the track: more than AudioSource's 1 s queue. */
 const heardBackSamples = 24_000 * 1.2;
+/** The track running dry this long while the next frame waited here is a stall. */
+const playbackStallMs = 10;
 /** The local VAD's window, in its 16 kHz samples. */
 const detectorWindowSamples = 512;
 /** Queued reports wait this long for the user to speak first. */
@@ -137,6 +151,8 @@ const userFirstMs = 15_000;
 /** A turn server VAD ended with no reply after this long gets one asked for. */
 const swallowedTurnMs = 2_500;
 const maximumClientPacketBytes = 64 * 1024;
+/** The browser reports every 10 s; this leaves room for timer jitter. */
+const minimumAudioStatsGapMs = 5_000;
 const noteChunkChars = 3_000;
 /**
  * TeamHub hints the moment a task or an app event changes; the tasks are
@@ -175,6 +191,8 @@ interface InputMetrics {
   speechStartedAt?: number;
   firstPartialAt?: number;
   maxInputQueueWaitMs: number;
+  /** Microphone audio the bounded input buffer discarded unsent. */
+  droppedInputMs: number;
   maxVadMs: number;
   maxPublishQueueWaitMs: number;
   maxPublishMs: number;
@@ -182,6 +200,7 @@ interface InputMetrics {
 
 const newInputMetrics = (): InputMetrics => ({
   maxInputQueueWaitMs: 0,
+  droppedInputMs: 0,
   maxVadMs: 0,
   maxPublishQueueWaitMs: 0,
   maxPublishMs: 0,
@@ -227,24 +246,38 @@ interface Reply {
   /** The words of an update as actually spoken. */
   spokenText?: string;
   finished?: boolean;
+  /** Forced termination ends the reply without completing its report. */
+  generationCompleted?: boolean;
   outputStarted?: boolean;
+  /** Further audio chunks may arrive even when the playout queue temporarily drains. */
+  streamingAudio?: boolean;
   endRequested?: boolean;
   /** Tool results not yet returned; the reply continues after them. */
   toolsPending: number;
   /** A tool was called; the next words start a new sentence after it. */
   called?: boolean;
   interrupted: boolean;
-  /** A pause of it ended unconfirmed; only server VAD stops it now. */
-  pauseDeclined?: boolean;
+  /** Quiet windows still needed after resuming before another local pause. */
+  quietWindowsToRearm?: number;
+  /** The provider may hear the rest of this microphone utterance during playback. */
+  inputAdmitted?: boolean;
+  /** Speech measured during this reply, never carried over from its input turn. */
+  interruptionSamples?: number;
+  /** Retained for delayed provider confirmation of an admitted short utterance. */
+  interruptionAdmitted?: boolean;
+  /** This onset has reached the user's near-voice level in at least one window. */
+  nearVoiceOnset?: boolean;
 }
 
 interface Queued {
   reply: Reply;
   pcm: Int16Array;
+  queuedAt: number;
 }
 
 interface Pause {
   reply: Reply;
+  speechSamples: number;
   since: number;
   /** Frames put back at the front of the queue. */
   requeued: number;
@@ -257,7 +290,7 @@ export const browserTools: LiveTool[] = [
   {
     name: "end_voice_mode",
     description:
-      "End this voice conversation and leave voice mode. Call it when the user wants to end the call, says goodbye, is done talking, or asks you to close or quit voice, judged by meaning in any language; interpret misheard words from context. After calling it, say a very short goodbye in the user's language; before calling it, never say you are closing or leaving. Do not call it when the user only wants to close a page, dialog or panel.",
+      "End this voice conversation and leave voice mode. Call it when the user wants to end the call, says goodbye, is done talking, or asks you to close or quit voice, judged by meaning in any language; interpret misheard words from context. After calling it, say a very short goodbye in the user's language; before calling it, never say you are closing or leaving. Do not call it when the user only wants to close a page, dialog or panel, or for a goodbye in messages from before this call.",
     parameters: { type: "object", properties: {} },
   },
   {
@@ -432,6 +465,45 @@ export function parseLiveClientEvent(
     return { type, call_id, text };
   if (type === "context" && typeof text === "string" && text.trim())
     return { type, text: text.slice(0, 4_000) };
+  if (type === "audio_stats") {
+    const audio = parseAudioStats((event as VoiceLiveClientEvent).audio);
+    if (audio) return { type, audio };
+  }
+}
+
+/** Upper bounds of the audio_stats fields the contract declares. */
+const audioStatsBounds = {
+  interval_ms: 3_600_000,
+  samples_received: 1e9,
+  concealed_samples: 1e9,
+  silent_concealed_samples: 1e9,
+  concealment_events: 1e9,
+  inserted_samples_for_deceleration: 1e9,
+  removed_samples_for_acceleration: 1e9,
+  jitter_buffer_delay_ms: 60_000,
+  packets_lost: 1e9,
+  packets_sent: 1e9,
+} satisfies Record<keyof VoiceLiveAudioStats, number>;
+
+/**
+ * Keeps only the declared, in-range audio_stats fields so a browser can
+ * never put free text or unbounded values into the logs.
+ */
+function parseAudioStats(value: unknown): VoiceLiveAudioStats | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  const stats: Record<string, number> = {};
+  for (const [key, maximum] of Object.entries(audioStatsBounds)) {
+    const field = (value as Record<string, unknown>)[key];
+    if (
+      typeof field === "number" &&
+      field >= 0 &&
+      field <= maximum &&
+      (key === "jitter_buffer_delay_ms" || Number.isInteger(field))
+    )
+      stats[key] = field;
+  }
+  if (stats.interval_ms === undefined) return;
+  return stats as unknown as VoiceLiveAudioStats;
 }
 
 /** Splits text into bounded notes without cutting a surrogate pair. */
@@ -456,6 +528,7 @@ export function sentenceEnded(text: string) {
 
 export class LiveVoiceWorker {
   private voiceSessionId = "";
+  private audioStatsLoggedAt = -Infinity;
   private publisherIdentity = "";
   private sessionCreatedAtMs = 0;
   private ctx!: JobContext;
@@ -485,11 +558,15 @@ export class LiveVoiceWorker {
   /** Local quiet since the user last spoke, in the detector's samples. */
   private quietRunSamples = 0;
   /** The microphone is sent as silence; see quietGateSamples. */
-  private gated = false;
+  private gated = true;
   /** The user's speech level on this track, in dBFS; see otherSpeakerDb. */
   private userLevelDb?: number;
+  private lastInputLevelDb?: number;
+  private lastSpeechThresholdDb?: number;
   /** The last window was the user's speech. */
   private userSpeaking = false;
+  /** Speech below the level gate must not return through the onset buffer. */
+  private rejectedSpeech = false;
   /** Microphone frames held while gated, newest last. */
   private preRoll: Int16Array[] = [];
   private preRollHeld = 0;
@@ -518,6 +595,11 @@ export class LiveVoiceWorker {
   /** Audio that reached the track, newest last; a pause puts back the unheard part. */
   private handedOver: Queued[] = [];
   private handedOverSamples = 0;
+  /** When the track plays out what it was handed; unset while it holds nothing. */
+  private playoutEndsAt?: number;
+  private stalls = { count: 0, totalMs: 0, maxMs: 0 };
+  /** A starved CPU shows here before it shows as late audio. */
+  private readonly loopDelay = monitorEventLoopDelay({ resolution: 10 });
   /** Playback held for local speech that server VAD has not confirmed. */
   private paused?: Pause;
   private pauses = 0;
@@ -566,6 +648,23 @@ export class LiveVoiceWorker {
     });
   }
 
+  /**
+   * Tells the browser whether the provider session is open. The call already
+   * listens before then (speech waits in the input buffer), so this only lets
+   * the browser say it is still waking up; it never gates audio.
+   */
+  private announceProviderReady() {
+    const local = this.ctx?.room.localParticipant;
+    if (!local) return;
+    void withTimeout(
+      local.setAttributes({
+        [providerReadyAttribute]: this.session ? "1" : "0",
+      }),
+      1_000,
+      "Voice provider readiness timed out",
+    ).catch(() => undefined);
+  }
+
   /** Logs one connect stage once, in ms since the job entry began. */
   private timing(stage: string) {
     if (this.timed.has(stage)) return;
@@ -582,6 +681,7 @@ export class LiveVoiceWorker {
 
   async run(ctx: JobContext): Promise<void> {
     this.ctx = ctx;
+    this.loopDelay.enable();
     this.startedAt = this.options.startedAt ?? Date.now();
     const roomName = ctx.job.room?.name;
     if (!roomName) throw new Error("Voice Runtime job is missing a Room name");
@@ -650,6 +750,7 @@ export class LiveVoiceWorker {
       this.timing("room_connected");
       const local = room.localParticipant;
       if (!local) throw new Error("Voice Runtime participant is unavailable");
+      this.announceProviderReady();
       this.source = new AudioSource(replySampleRate, 1);
       await local.publishTrack(
         LocalAudioTrack.createAudioTrack(liveReplyTrackName, this.source),
@@ -659,6 +760,7 @@ export class LiveVoiceWorker {
       this.session = await opening;
       if (this.muted) this.session.mute();
       this.markSessionReady();
+      this.announceProviderReady();
       this.timing("session_ready");
       // The call opens with the user, as a person lets the caller start.
       this.userFirstUntil =
@@ -765,6 +867,7 @@ export class LiveVoiceWorker {
           this.queuedUpdates.unshift(...this.pendingSpeech.updates);
         this.clearPendingSpeech();
         this.session = undefined;
+        this.announceProviderReady();
         await new Promise((resolve) =>
           setTimeout(
             resolve,
@@ -773,6 +876,7 @@ export class LiveVoiceWorker {
         );
         try {
           this.session = await this.connectSession();
+          this.announceProviderReady();
           this.flushNotes();
           this.flushUpdates();
         } catch (reconnectError) {
@@ -785,7 +889,7 @@ export class LiveVoiceWorker {
 
   private onProviderEvent(event: LiveEvent) {
     switch (event.type) {
-      case "speech_started":
+      case "speech_started": {
         this.hearing = true;
         this.heardSince ??= Date.now();
         this.repliedSinceSpeech = false;
@@ -794,9 +898,22 @@ export class LiveVoiceWorker {
         // final; what it says and calls then belongs to this new turn, so a
         // yes said here confirms what an earlier turn asked.
         if (event.itemId) this.ensureTurn(event.itemId);
-        if (this.isPlaying() || this.pendingSpeech)
+        const playback = this.activePlayback();
+        if (playback && this.detector && !playback.interruptionAdmitted) {
+          log().info(
+            {
+              voice_session_id: this.voiceSessionId,
+              last_input_level_db: this.lastInputLevelDb,
+              speech_threshold_db: this.lastSpeechThresholdDb,
+              reference_level_db: this.userLevelDb,
+              speech_duration_ms: (playback.interruptionSamples ?? 0) / 16,
+            },
+            "voice.live.barge_in_unconfirmed",
+          );
+        } else if (playback || this.pendingSpeech)
           this.interrupt(false, "provider");
         return;
+      }
       case "transcript_delta":
         this.publish({
           type: "user_partial",
@@ -814,6 +931,15 @@ export class LiveVoiceWorker {
       case "response_started":
         this.repliedSinceSpeech = true;
         this.saidSinceReply = [];
+        // A new response after the user spoke again answers their latest turn,
+        // even when the earlier turn's reply stayed open across tool rounds.
+        if (
+          this.reply &&
+          !this.reply.speech &&
+          this.latestTurn &&
+          this.reply.turn !== this.latestTurn
+        )
+          this.finishReply(true);
         if (this.latestTurn) {
           this.latestTurn.answered = true;
           clearTimeout(this.latestTurn.swallowTimer);
@@ -861,6 +987,7 @@ export class LiveVoiceWorker {
         this.onReplyAudio(event.pcm);
         return;
       case "audio_done":
+        if (this.reply) this.reply.streamingAudio = false;
         // A reply's tool calls can follow the end of its audio; the reply
         // ends with the provider's response.
         return;
@@ -1066,7 +1193,7 @@ export class LiveVoiceWorker {
       return this.reply;
     }
     const turn = this.latestTurn;
-    if (!turn) return undefined;
+    if (!turn || turn.interrupted) return undefined;
     turn.answered = true;
     clearTimeout(turn.swallowTimer);
     turn.replyDone = false;
@@ -1088,6 +1215,7 @@ export class LiveVoiceWorker {
     }
     this.reply = undefined;
     reply.finished = true;
+    reply.generationCompleted = !force;
     this.requeueUnheardUpdates(reply);
     this.reportSpokenText(reply);
     if (!reply.speech) {
@@ -1111,13 +1239,40 @@ export class LiveVoiceWorker {
   }
 
   private reportSpokenText(reply: Reply) {
-    if (reply.speech && reply.speechStarted)
+    if (reply.speech && reply.speechStarted) {
+      const messageIds = reply.speech.updates.flatMap((update) =>
+        update.roomReport ? [update.roomReport.message_id] : [],
+      );
+      if (
+        reply.generationCompleted &&
+        !reply.interrupted &&
+        messageIds.length &&
+        reply.spokenText?.trim()
+      ) {
+        this.track(
+          this.client
+            .executeLiveToolCall({
+              voice_session_id: this.voiceSessionId,
+              turn_id: reply.speech.turnId,
+              call_id: `ack_${reply.speech.speechId}`,
+              name: "ack_room_reports",
+              arguments: JSON.stringify({ message_ids: messageIds }),
+            })
+            .catch(() => {
+              log().warn(
+                { voiceSessionId: this.voiceSessionId },
+                "Room report speech acknowledgement failed",
+              );
+            }),
+        );
+      }
       this.publish({
         type: "reply_done",
         turn_id: reply.speech.turnId,
         speech_id: reply.speech.speechId,
         text: reply.spokenText ?? "",
       });
+    }
   }
 
   private cancelReply(reply: Reply) {
@@ -1135,15 +1290,18 @@ export class LiveVoiceWorker {
     }
     const turn = reply.turn;
     if (!reply.speech) turn.firstAudioAt ??= Date.now();
+    reply.streamingAudio = true;
     this.enqueuePlayback(reply, pcm);
     // A pending update may be waiting for a pause in this audio.
     if (this.queuedUpdates.length) this.flushUpdates();
   }
 
   private enqueuePlayback(reply: Reply, pcm: Int16Array) {
+    const queuedAt = Date.now();
     for (let offset = 0; offset < pcm.length; offset += replyChunkSamples)
       this.playQueue.push({
         reply,
+        queuedAt,
         // AudioFrame hands rtc-node its whole backing buffer and ignores the
         // view offset, so each frame needs its own buffer.
         pcm: pcm.slice(offset, offset + replyChunkSamples),
@@ -1174,15 +1332,21 @@ export class LiveVoiceWorker {
         }
         const turn = next.reply.turn;
         const pauses = this.pauses;
+        this.notePlayout(next);
         await this.source.captureFrame(
           new AudioFrame(next.pcm, replySampleRate, 1, next.pcm.length),
         );
+        // captureFrame may finish enqueueing after an interruption cleared the track.
+        if (next.reply.interrupted) {
+          this.clearTrack();
+          continue;
+        }
         // The await may have let a pause in.
         const paused = this.paused as Pause | undefined;
         if (paused && this.pauses !== pauses) {
           // The pause cleared the track while this frame was on its way:
           // clear it again and keep the frame right after the ones put back.
-          this.source.clearQueue();
+          this.clearTrack();
           this.playQueue.splice(paused.requeued, 0, next);
           continue;
         }
@@ -1210,6 +1374,8 @@ export class LiveVoiceWorker {
       );
     } finally {
       this.playing = false;
+      this.playoutEndsAt = undefined;
+      this.logStalls();
       const reply = this.playingReply;
       if (!this.playQueue.length) this.lastSpokeAt = Date.now();
       if (!this.stopped) {
@@ -1221,6 +1387,46 @@ export class LiveVoiceWorker {
         this.flushUpdates();
       }
     }
+  }
+
+  /** Counts the times the track ran dry while its next frame already waited here. */
+  private notePlayout(frame: Queued) {
+    const now = Date.now();
+    const endsAt = this.playoutEndsAt;
+    if (
+      endsAt !== undefined &&
+      frame.queuedAt < endsAt &&
+      now - endsAt >= playbackStallMs
+    ) {
+      const gapMs = now - endsAt;
+      this.stalls.count++;
+      this.stalls.totalMs += gapMs;
+      this.stalls.maxMs = Math.max(this.stalls.maxMs, gapMs);
+    }
+    this.playoutEndsAt =
+      Math.max(now, endsAt ?? now) +
+      (frame.pcm.length / replySampleRate) * 1_000;
+  }
+
+  private logStalls() {
+    const { count, totalMs, maxMs } = this.stalls;
+    if (!count) return;
+    this.stalls = { count: 0, totalMs: 0, maxMs: 0 };
+    log().warn(
+      {
+        voiceSessionId: this.voiceSessionId,
+        stalls: count,
+        stalledMs: totalMs,
+        maxStallMs: maxMs,
+      },
+      "Voice live reply playback stalled",
+    );
+  }
+
+  /** Drops the audio the track has not played yet. */
+  private clearTrack() {
+    this.source?.clearQueue();
+    this.playoutEndsAt = undefined;
   }
 
   private handOver(frame: Queued) {
@@ -1239,14 +1445,13 @@ export class LiveVoiceWorker {
    * does not confirm resumes where the listener stopped hearing.
    */
   private pausePlayback() {
-    const reply = this.playingReply;
+    const reply = this.activePlayback();
     if (
       this.paused ||
       !this.source ||
       !reply ||
       reply.interrupted ||
-      reply.pauseDeclined ||
-      !this.isPlaying()
+      reply.quietWindowsToRearm !== undefined
     )
       return;
     let unheard = Math.round(
@@ -1261,8 +1466,7 @@ export class LiveVoiceWorker {
         this.playedSamples = Math.max(0, this.playedSamples - frame.pcm.length);
       back.unshift(frame);
     }
-    if (!back.length && !this.playQueue.length) return;
-    this.source.clearQueue();
+    this.clearTrack();
     this.playQueue.unshift(...back);
     this.pauses++;
     let resume!: () => void;
@@ -1271,15 +1475,20 @@ export class LiveVoiceWorker {
     });
     this.paused = {
       reply,
+      speechSamples: 0,
       since: Date.now(),
       requeued: back.length,
       resumed,
       resume,
-      timer: setTimeout(() => this.resumePlayback("limit"), maximumPauseMs),
+      timer: setTimeout(() => this.resumePlayback("limit"), pauseIdleTimeoutMs),
     };
     log().info(
       {
         voiceSessionId: this.voiceSessionId,
+        last_input_level_db: this.lastInputLevelDb,
+        speech_threshold_db: this.lastSpeechThresholdDb,
+        reference_level_db: this.userLevelDb,
+        speech_duration_ms: (reply.interruptionSamples ?? 0) / 16,
         heldMs: Math.round(
           (back.reduce((total, frame) => total + frame.pcm.length, 0) /
             replySampleRate) *
@@ -1294,9 +1503,9 @@ export class LiveVoiceWorker {
   private resumePlayback(reason: "quiet" | "limit") {
     const paused = this.paused;
     if (!paused) return;
-    // The rest of this reply pauses only for server VAD, so its own echo
-    // cannot keep stopping it.
-    paused.reply.pauseDeclined = true;
+    // Quiet from before resumption cannot distinguish a fresh onset from
+    // the echo of the first frames we replay.
+    paused.reply.quietWindowsToRearm = rearmQuietWindows;
     this.endPause();
     if (!this.playing && this.playQueue.length) this.track(this.playback());
     log().info(
@@ -1325,9 +1534,17 @@ export class LiveVoiceWorker {
     );
   }
 
+  private activePlayback() {
+    if (this.paused) return this.paused.reply;
+    if (this.isPlaying()) return this.playingReply;
+    return this.reply?.streamingAudio && !this.reply.interrupted
+      ? this.reply
+      : undefined;
+  }
+
   // Stops local playback immediately; the provider is told to stop the reply
   // and the browser to freeze its subtitle. Old audio is never replayed.
-  private interrupt(force = false, source?: "provider") {
+  private interrupt(force = false, source?: "provider" | "local") {
     const playing = this.isPlaying();
     if (!force && !playing && !this.pendingSpeech && !this.reply) return;
     if (
@@ -1339,12 +1556,17 @@ export class LiveVoiceWorker {
     )
       return;
     const pausedSince = this.paused?.since;
+    const playback = this.activePlayback();
     this.endPause();
     if (source)
       log().info(
         {
           voiceSessionId: this.voiceSessionId,
           bargeIn: source,
+          last_input_level_db: this.lastInputLevelDb,
+          speech_threshold_db: this.lastSpeechThresholdDb,
+          reference_level_db: this.userLevelDb,
+          speech_duration_ms: (playback?.interruptionSamples ?? 0) / 16,
           ...(pausedSince === undefined
             ? {}
             : { pausedMs: Date.now() - pausedSince }),
@@ -1354,23 +1576,28 @@ export class LiveVoiceWorker {
     this.playQueue = [];
     this.handedOver = [];
     this.handedOverSamples = 0;
-    this.source?.clearQueue();
-    if (this.pendingSpeech && !this.pendingSpeechInterrupted) {
-      this.pendingSpeechInterrupted = true;
-      this.session?.cancel();
-    }
+    // Audio still in the track was never heard, so history keeps none of it.
+    const unheardMs = this.source?.queuedDuration ?? 0;
+    this.clearTrack();
     const turns = new Set<Turn>();
     const playingReply = playing ? this.playingReply : undefined;
     if (playingReply && !playingReply.speech) turns.add(playingReply.turn);
-    if (this.reply) {
-      if (!this.reply.speech) turns.add(this.reply.turn);
-      this.cancelReply(this.reply);
-    } else if (playing) {
-      // The provider keeps a finished reply open until its own playout ends.
-      this.session?.cancel();
-    }
+    if (this.reply && !this.reply.speech) turns.add(this.reply.turn);
+    if (
+      (this.pendingSpeech && !this.pendingSpeechInterrupted) ||
+      (this.reply && !this.reply.interrupted) ||
+      playingReply
+    )
+      this.session?.cancel({
+        playedMs: playingReply
+          ? Math.max(0, this.playedMs() - unheardMs)
+          : undefined,
+        localSpeech: source === "local",
+      });
+    if (this.pendingSpeech) this.pendingSpeechInterrupted = true;
+    if (this.reply) this.reply.interrupted = true;
+    if (playingReply) playingReply.interrupted = true;
     if (playingReply?.speech) {
-      playingReply.interrupted = true;
       this.requeueUnheardUpdates(playingReply);
       if (playingReply.speechStarted)
         this.publish({
@@ -1379,7 +1606,6 @@ export class LiveVoiceWorker {
           speech_id: playingReply.speech.speechId,
         });
     }
-    if (playingReply) this.session?.truncate(this.playedMs());
     this.playingReply = undefined;
     for (const turn of turns) {
       if (turn.interrupted) continue;
@@ -1508,13 +1734,16 @@ export class LiveVoiceWorker {
     // A line cut off before the tool (a sentence ending in a comma) is finished
     // first, or the user is left with half a sentence.
     const quiet =
-      reply.outputStarted === true &&
-      sentenceEnded(
-        reply.speech ? (reply.spokenText ?? "") : reply.turn.text,
-      ) &&
-      calls.every((_call, index) => settled(index));
-    if (!this.stopped)
+      reply.interrupted ||
+      reply.finished === true ||
+      (reply.outputStarted === true &&
+        sentenceEnded(
+          reply.speech ? (reply.spokenText ?? "") : reply.turn.text,
+        ) &&
+        calls.every((_call, index) => settled(index)));
+    if (!this.stopped) {
       this.session?.sendToolResults(results, { reply: !quiet });
+    }
     return !quiet;
   }
 
@@ -1721,6 +1950,33 @@ export class LiveVoiceWorker {
       return;
     }
     if (event.type === "context") this.note(event.text!);
+    if (event.type === "audio_stats") this.logAudioStats(event.audio!);
+  }
+
+  /**
+   * Logs the browser's view of the reply audio. Reports closer together than
+   * the browser's own cadence are dropped so a client cannot flood the log.
+   */
+  private logAudioStats(audio: VoiceLiveAudioStats) {
+    const now = Date.now();
+    if (now - this.audioStatsLoggedAt < minimumAudioStatsGapMs) return;
+    this.audioStatsLoggedAt = now;
+    log().info(
+      {
+        voiceSessionId: this.voiceSessionId,
+        intervalMs: audio.interval_ms,
+        samplesReceived: audio.samples_received,
+        concealedSamples: audio.concealed_samples,
+        silentConcealedSamples: audio.silent_concealed_samples,
+        concealmentEvents: audio.concealment_events,
+        insertedSamplesForDeceleration: audio.inserted_samples_for_deceleration,
+        removedSamplesForAcceleration: audio.removed_samples_for_acceleration,
+        jitterBufferDelayMs: audio.jitter_buffer_delay_ms,
+        packetsLost: audio.packets_lost,
+        micPacketsSent: audio.packets_sent,
+      },
+      "Voice live client audio stats",
+    );
   }
 
   /**
@@ -1845,8 +2101,16 @@ export class LiveVoiceWorker {
       this.voiceSessionId,
       AbortSignal.timeout(5_000),
     );
-    const { notes, updates } = this.tasks.apply(list.tasks, list.alerts);
+    const { notes, updates } = this.tasks.apply(
+      list.tasks,
+      list.alerts,
+      list.room_reports,
+    );
     for (const note of notes) {
+      if (note.roomReport) {
+        this.note(roomReportNote(note.roomReport));
+        continue;
+      }
       const chunks = note.replies.flatMap((reply) => noteChunks(reply));
       for (const [index, chunk] of chunks.entries())
         this.note(
@@ -2084,6 +2348,19 @@ export class LiveVoiceWorker {
     // Another microphone has a level of its own.
     this.userLevelDb = undefined;
     this.userSpeaking = false;
+    this.rejectedSpeech = false;
+    this.gated = true;
+    this.quietRunSamples = 0;
+    this.speechRunSamples = 0;
+    this.preRoll = [];
+    this.preRollHeld = 0;
+    const playback = this.activePlayback();
+    if (playback) {
+      playback.interruptionSamples = 0;
+      playback.interruptionAdmitted = false;
+      playback.inputAdmitted = false;
+      playback.nearVoiceOnset = false;
+    }
     const epoch = this.nextEpoch++;
     const generation = Number(
       participant.attributes?.["linger.voice_generation"] ?? 0,
@@ -2118,6 +2395,7 @@ export class LiveVoiceWorker {
               "linger.voice_ready_track": trackSid,
               "linger.voice_ready_at": String(Date.now()),
               "linger.voice_purpose": "chat_live",
+              [providerReadyAttribute]: this.session ? "1" : "0",
             }),
             1_000,
             "Voice input readiness timed out",
@@ -2139,6 +2417,9 @@ export class LiveVoiceWorker {
       for (;;) {
         const queuedAt = input.oldestRetainedAtMs();
         const frame = await input.next(signal);
+        const dropped = input.takeDroppedSamples();
+        if (dropped)
+          this.inputMetrics.droppedInputMs += (dropped / liveInputRate) * 1_000;
         if (!frame || this.stopped || this.failed) break;
         if (queuedAt !== undefined)
           this.inputMetrics.maxInputQueueWaitMs = Math.max(
@@ -2189,21 +2470,25 @@ export class LiveVoiceWorker {
       await session.appendAudio(frame);
       return;
     }
-    this.preRoll.push(frame);
-    this.preRollHeld += frame.length;
-    while (this.preRollHeld - this.preRoll[0]!.length >= preRollSamples)
-      this.preRollHeld -= this.preRoll.shift()!.length;
+    if (!this.rejectedSpeech) {
+      this.preRoll.push(frame);
+      this.preRollHeld += frame.length;
+      while (this.preRollHeld - this.preRoll[0]!.length >= preRollSamples)
+        this.preRollHeld -= this.preRoll.shift()!.length;
+    }
     await session.appendAudio(new Int16Array(frame.length));
   }
 
   /**
    * Local VAD gates the microphone, tells whether the user is talking and
-   * pauses the reply when they start. Barge-in and turn ends stay the
-   * server's: the live voice's own echo set local VAD off about 27 times a
-   * minute, server VAD about once.
+   * pauses the reply at speech onset. Both provider speech and sustained voice
+   * while playback is paused can retire the reply. The provider owns turn ends.
    */
   private async detectSpeech(frame: Int16Array, signal?: AbortSignal) {
-    if (!this.detector) return;
+    if (!this.detector) {
+      this.gated = false;
+      return;
+    }
     const session = this.session;
     const inputMetrics = this.inputMetrics;
     const receivedAt = Date.now();
@@ -2229,8 +2514,23 @@ export class LiveVoiceWorker {
       this.session !== session
     )
       return;
+    const playback = this.activePlayback();
+    if (playback && !playback.inputAdmitted) this.gated = true;
     for (const window of activity) {
-      const speech = this.isUserSpeech(window);
+      const speech = this.isUserSpeech(window, playback);
+      this.rejectedSpeech = window.speech && !speech;
+      if (this.rejectedSpeech) {
+        // Do not send a rejected voice during the silence grace period, or
+        // replay its buffered lead-in when foreground speech next opens the gate.
+        this.gated = true;
+        this.preRoll = [];
+        this.preRollHeld = 0;
+      }
+      if (playback?.quietWindowsToRearm !== undefined) {
+        if (speech) playback.quietWindowsToRearm = rearmQuietWindows;
+        else if (--playback.quietWindowsToRearm === 0)
+          playback.quietWindowsToRearm = undefined;
+      }
       if (speech) inputMetrics.speechStartedAt ??= receivedAt;
       if (!speech && this.speechRunSamples > 0) this.speechEndedAt = Date.now();
       if (speech && this.quietSince !== undefined) {
@@ -2244,17 +2544,45 @@ export class LiveVoiceWorker {
       this.speechRunSamples = speech
         ? this.speechRunSamples + detectorWindowSamples
         : 0;
+      if (playback)
+        playback.interruptionSamples = speech
+          ? (playback.interruptionSamples ?? 0) + detectorWindowSamples
+          : 0;
+      if (playback && !playback.inputAdmitted) {
+        playback.nearVoiceOnset =
+          speech &&
+          (playback.nearVoiceOnset === true ||
+            (this.userLevelDb !== undefined &&
+              window.levelDb >= this.userLevelDb - nearVoiceMarginDb));
+        playback.inputAdmitted =
+          (playback.interruptionSamples ?? 0) >=
+          (playback.nearVoiceOnset ? shortSpeechSamples : pauseSpeechSamples);
+        if (playback.inputAdmitted) playback.interruptionAdmitted = true;
+      }
       if (speech) {
         this.quietRunSamples = 0;
-        this.gated = false;
+        if (!playback || playback.inputAdmitted) this.gated = false;
       } else {
         this.quietRunSamples += detectorWindowSamples;
-        if (this.quietRunSamples >= quietGateSamples) this.gated = true;
+        if (this.quietRunSamples >= quietGateSamples) {
+          this.gated = true;
+          if (playback) {
+            playback.inputAdmitted = false;
+            playback.nearVoiceOnset = false;
+          }
+        }
       }
-      if (
+      if (this.paused && speech) {
+        this.paused.timer.refresh();
+        this.paused.speechSamples += detectorWindowSamples;
+        if (this.paused.speechSamples >= confirmPausedSpeechSamples)
+          this.interrupt(false, "local");
+      } else if (
         speech &&
-        this.speechRunSamples >= pauseSpeechSamples &&
-        this.speechRunSamples - detectorWindowSamples < pauseSpeechSamples
+        playback &&
+        (playback.interruptionSamples ?? 0) >= pauseSpeechSamples &&
+        (playback.interruptionSamples ?? 0) - detectorWindowSamples <
+          pauseSpeechSamples
       )
         this.pausePlayback();
       else if (!speech && this.quietRunSamples >= resumeQuietSamples)
@@ -2263,18 +2591,28 @@ export class LiveVoiceWorker {
   }
 
   /**
-   * During playback, quieter speech counts as quiet and pauses nothing.
-   * Otherwise Silero alone gates input, so a stale level cannot mute a turn.
+   * Apply the same level margin while listening and during playback. Silero
+   * detects speech, not who is speaking; volume is only a foreground heuristic.
    */
-  private isUserSpeech({ speech, levelDb }: SpeechActivity) {
+  private isUserSpeech({ speech, levelDb }: SpeechActivity, playback?: Reply) {
     const learned = this.userLevelDb;
+    // Keep the tails of established speech or a short near-level word. A
+    // borderline onset must sustain its level before its tail can pass.
+    const followTail =
+      this.userSpeaking &&
+      (!playback || playback.inputAdmitted || playback.nearVoiceOnset);
     const threshold =
       Math.max(
         faintestSpeechDb,
         learned === undefined ? faintestSpeechDb : learned - otherSpeakerDb,
-      ) - (this.userSpeaking ? levelHysteresisDb : 0);
-    this.userSpeaking = speech && (!this.isPlaying() || levelDb >= threshold);
-    if (this.userSpeaking)
+      ) - (followTail ? levelHysteresisDb : 0);
+    this.lastInputLevelDb = levelDb;
+    this.lastSpeechThresholdDb = threshold;
+    this.userSpeaking = speech && levelDb >= threshold;
+    if (
+      this.userSpeaking &&
+      (!playback || playback.inputAdmitted || learned === undefined)
+    )
       this.userLevelDb =
         learned === undefined
           ? levelDb
@@ -2376,12 +2714,17 @@ export class LiveVoiceWorker {
             : turn.completedAt - turn.speechEndedAt,
         completedToFirstFrameMs: since(turn.firstFrameAt),
         maxInputQueueWaitMs: turn.inputMetrics.maxInputQueueWaitMs,
+        droppedInputMs: Math.round(turn.inputMetrics.droppedInputMs),
         maxVadMs: turn.inputMetrics.maxVadMs,
         maxPublishQueueWaitMs: turn.inputMetrics.maxPublishQueueWaitMs,
         maxPublishMs: turn.inputMetrics.maxPublishMs,
+        // Since the previous turn's metrics, in milliseconds.
+        maxEventLoopDelayMs: Math.round(this.loopDelay.max / 1e6),
+        p99EventLoopDelayMs: Math.round(this.loopDelay.percentile(99) / 1e6),
       },
       "Voice live turn metrics",
     );
+    this.loopDelay.reset();
   }
 
   private async fail(error: unknown) {
@@ -2425,7 +2768,8 @@ export class LiveVoiceWorker {
       finish(JSON.stringify({ error: "session_closed" }));
     this.endPause();
     this.playQueue = [];
-    this.source?.clearQueue();
+    this.clearTrack();
+    this.loopDelay.disable();
     this.playingReply = undefined;
     for (const turn of this.turns.values()) this.maybeReport(turn);
     // Closing the provider ends its event loop; session.close has a deadline.

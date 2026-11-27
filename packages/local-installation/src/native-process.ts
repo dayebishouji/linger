@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile, rm } from "node:fs/promises";
+import { readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,7 @@ import {
   linuxProcessStates,
   nativeProcessIdentity as observed,
   nativeLeaseProcesses,
+  posixLivePids,
   windowsLeaseTree,
   windowsProcesses,
   windowsSnapshot,
@@ -47,12 +48,45 @@ export interface NativeProcessState {
   pid?: number;
 }
 const leaseKey = "LINGER_NATIVE_PROCESS_LEASE";
+/**
+ * How the supervisor restarts a service that exits without being asked to:
+ * after `delaysMs[n - 1]` for the n-th exit within `windowMs` (the last
+ * delay repeats), giving up at the `limit`-th. A service that exits before
+ * it has run for `armAfterMs` is not restarted: that is a startup failure,
+ * which the installer reports.
+ */
+export interface NativeRestartPolicy {
+  delaysMs: number[];
+  windowMs: number;
+  limit: number;
+  armAfterMs: number;
+}
+export const SERVICE_RESTART_POLICY: NativeRestartPolicy = {
+  delaysMs: [1_000, 2_000, 5_000],
+  windowMs: 60_000,
+  limit: 5,
+  armAfterMs: 10_000,
+};
 function paths(root: string, name: NativeService) {
   if (!services.has(name)) throw new Error("Invalid native service");
   return {
     record: path.join(root, "native", "processes", `${name}.json`),
     log: path.join(root, "native", "logs", `${name}.log`),
   };
+}
+/**
+ * Written before every intended stop signals a supervisor, which reads it
+ * before each restart; the name derives from its job file
+ * (`<name>.<lease>.job`), which the supervisor knows.
+ */
+function stopRequest(root: string, name: NativeService, lease: string) {
+  return path.join(root, "native", "processes", `${name}.${lease}.stop`);
+}
+// Only its presence counts, so appending nothing inside the private processes
+// directory is enough: it changes no file a link could point at, and skips
+// the ACL check a private write costs on Windows.
+async function requestStop(file: string) {
+  await writeFile(file, "", { flag: "a", mode: 0o600 });
 }
 async function stored(
   root: string,
@@ -104,8 +138,8 @@ async function stillLive(pid: number): Promise<boolean> {
     if (process.platform === "win32") {
       // Windows has no zombies; an exited PID is gone.
     } else if (process.platform === "linux") {
-      const stat = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => "");
-      if (stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z")) return false;
+      const info = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => "");
+      if (info.slice(info.lastIndexOf(")") + 2).startsWith("Z")) return false;
     } else {
       const state = await runProcess(
         "/bin/ps",
@@ -117,7 +151,21 @@ async function stillLive(pid: number): Promise<boolean> {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") {
+      // A PID owned by another user cannot be a native service this user
+      // started; ignoring a foreign-UID reused PID avoids locking out resume
+      // or stop while never signalling it.
+      if (process.platform === "linux") {
+        const owner = await stat(`/proc/${pid}`).then(
+          (entry) => entry.uid,
+          () => undefined,
+        );
+        if (owner === undefined || owner !== process.getuid?.()) return false;
+      }
+      return true;
+    }
     throw error;
   }
 }
@@ -125,7 +173,7 @@ async function groupLive(group: number): Promise<boolean> {
   // Windows has no process groups; the leader is the whole group.
   if (process.platform === "win32") return stillLive(group);
   if (process.platform === "linux")
-    return (await linuxProcessStates()).some(
+    return (await linuxProcessStates(true)).some(
       (process) => process.group === group && process.state !== "Z",
     );
   const result = await runProcess("/bin/ps", ["-axo", "pid=,pgid=,stat="], {
@@ -173,6 +221,30 @@ export async function inspectNativeProcess(
   const record = await stored(root, name);
   if (!record) return { running: false };
   return { running: await serving(record), pid: record.pid };
+}
+/**
+ * Inspects multiple native services together. On Windows this reuses one
+ * process snapshot across all recorded services and skips enumeration when no
+ * service has a saved record.
+ */
+export async function inspectNativeProcesses(
+  root: string,
+  names: readonly NativeService[],
+): Promise<NativeProcessState[]> {
+  if (process.platform !== "win32")
+    return Promise.all(names.map((name) => inspectNativeProcess(root, name)));
+  const records = await Promise.all(names.map((name) => stored(root, name)));
+  if (records.every((record) => !record))
+    return names.map(() => ({ running: false }));
+  const snapshot = await windowsProcesses();
+  return records.map((record) =>
+    record
+      ? {
+          running: recordedTree(snapshot, record).length > 1,
+          pid: record.pid,
+        }
+      : { running: false },
+  );
 }
 export interface NativeListener {
   name: NativeService;
@@ -259,6 +331,11 @@ export async function startNativeProcess(
      * part of the configuration.
      */
     withoutAdministrators?: boolean;
+    /**
+     * Restart the service when it exits unasked. How it is supervised is not
+     * part of the configuration, so a running service keeps its supervisor.
+     */
+    restartOnExit?: NativeRestartPolicy;
   },
 ): Promise<NativeProcessState> {
   options.signal?.throwIfAborted();
@@ -298,6 +375,9 @@ export async function startNativeProcess(
         `Native ${options.name} process identity cannot be verified; refusing to replace it.`,
       );
     await rm(location.record, { force: true });
+    await rm(stopRequest(options.root, options.name, existing.lease), {
+      force: true,
+    });
   }
   await privateDirectory(path.dirname(location.record));
   await privateDirectory(path.dirname(location.log));
@@ -310,11 +390,13 @@ export async function startNativeProcess(
   await atomicPrivate(
     job,
     JSON.stringify({
+      name: options.name,
       executable: options.executable,
       args: options.args,
       cwd: options.cwd,
       env: { ...options.env, [leaseKey]: lease },
       ...(options.withoutAdministrators ? { withoutAdministrators: true } : {}),
+      ...(options.restartOnExit ? { restart: options.restartOnExit } : {}),
       log: location.log,
       redactions: [
         ...new Set(
@@ -422,14 +504,7 @@ export async function startNativeProcess(
         (candidate) => candidate.pid !== child.pid,
       );
       for (const candidate of descendants.length ? descendants : owned) {
-        if ((await observed(candidate.pid, lease, false)) !== candidate.birth)
-          continue;
-        try {
-          process.kill(candidate.pid, "SIGKILL");
-        } catch (failure) {
-          if ((failure as NodeJS.ErrnoException).code !== "ESRCH")
-            throw failure;
-        }
+        await signalLeasedProcess(options.name, candidate, lease, "SIGKILL");
       }
       await delay(20);
       if (Date.now() >= deadline)
@@ -463,7 +538,8 @@ async function endUnreapedGroup(child: ChildProcess): Promise<void> {
     try {
       process.kill(-child.pid, "SIGKILL");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ESRCH" && code !== "EPERM") throw error;
     }
     await Promise.race([exited, delay(5_000)]);
   }
@@ -472,7 +548,9 @@ async function endUnreapedGroup(child: ChildProcess): Promise<void> {
     try {
       process.kill(-child.pid, "SIGKILL");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EPERM") return;
+      if (code !== "ESRCH") throw error;
     }
     await delay(100);
   }
@@ -485,19 +563,123 @@ async function endUnreapedGroup(child: ChildProcess): Promise<void> {
 export const NATIVE_PROCESS_REPLACED = "NATIVE_PROCESS_REPLACED";
 export const NATIVE_PROCESS_IDENTITY_UNVERIFIED =
   "NATIVE_PROCESS_IDENTITY_UNVERIFIED";
+export const NATIVE_PROCESS_SIGNAL_DENIED = "NATIVE_PROCESS_SIGNAL_DENIED";
+
+async function signalLeasedProcess(
+  name: NativeService,
+  candidate: { pid: number; birth: string },
+  lease: string,
+  signal: NodeJS.Signals,
+  record?: Pick<Lease, "pid" | "birth">,
+): Promise<void> {
+  // Revalidate the birth and unguessable lease immediately before signalling.
+  if (
+    record &&
+    candidate.pid === record.pid &&
+    candidate.birth !== record.birth
+  )
+    return;
+  if ((await observed(candidate.pid, lease, false)) !== candidate.birth) return;
+  try {
+    process.kill(candidate.pid, signal);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return;
+    if (code === "EPERM") {
+      // If the process exited and its PID was reused between verification and
+      // kill, it is already gone; otherwise report the service and PID clearly.
+      if ((await observed(candidate.pid, lease, false)) !== candidate.birth)
+        return;
+      throw Object.assign(
+        new Error(
+          `Native ${name} process (PID ${candidate.pid}) could not be signalled with ${signal} (EPERM); stop it manually and retry.`,
+        ),
+        {
+          code: NATIVE_PROCESS_SIGNAL_DENIED,
+          pid: candidate.pid,
+          cause: error,
+        },
+      );
+    }
+    throw error;
+  }
+}
 export async function stopNativeProcess(
   root: string,
   name: NativeService,
-  /** How long descendants get to exit on SIGINT before SIGKILL; tests shorten it. */
+  /** How long POSIX descendants get to exit on SIGINT before SIGKILL; tests shorten it. */
   interruptMs = 12_000,
 ): Promise<void> {
+  if (process.platform === "win32") {
+    await stopWindowsBatch(root, [name], {});
+    return;
+  }
   const record = await stored(root, name);
   if (!record) return;
-  if (process.platform === "win32")
-    await stopWindowsTree(name, record.lease, record);
-  else await stopLease(name, record, interruptMs);
+  // Before any signal, so the supervisor never restarts what this ends.
+  const request = stopRequest(root, name, record.lease);
+  await requestStop(request);
+  await stopLease(name, record, interruptMs);
   await rm(paths(root, name).record, { force: true });
+  await rm(request, { force: true });
 }
+export interface StopNativeProcessesOptions {
+  signal?: AbortSignal;
+  /** How long POSIX descendants get to exit on SIGINT before SIGKILL; tests shorten it. */
+  interruptMs?: number;
+  /**
+   * Invoked in `names` order as each service finishes or fails. On POSIX,
+   * `durationMs` is each service's isolated stop time; on Windows batch
+   * shutdown (where services stop concurrently across shared snapshots),
+   * `durationMs` is cumulative elapsed time from the start of the batch.
+   */
+  onServiceDone?: (
+    name: NativeService,
+    durationMs: number,
+    error?: unknown,
+  ) => void;
+}
+/**
+ * Stops multiple native services in dependency order. POSIX stops services
+ * sequentially so each gets its own graceful SIGINT drain. Windows batches
+ * snapshot enumeration across all services: record-load failures, Pass 1
+ * identity-verification failures, and `.stop` write failures stop before
+ * signalling downstream services so they stay untouched; once Pass 1 begins
+ * terminating verified services' children in dependency order, a later failure
+ * (such as a 12-second deadline timeout or record cleanup error on an earlier
+ * service) still surfaces at that earlier service while verified downstream
+ * services may already have been terminated.
+ */
+export async function stopNativeProcesses(
+  root: string,
+  names: readonly NativeService[],
+  options: StopNativeProcessesOptions = {},
+): Promise<void> {
+  if (process.platform !== "win32") {
+    for (const name of names) {
+      options.signal?.throwIfAborted();
+      const startedAt = Date.now();
+      try {
+        await stopNativeProcess(root, name, options.interruptMs);
+      } catch (error) {
+        options.onServiceDone?.(name, Date.now() - startedAt, error);
+        throw error;
+      }
+      options.onServiceDone?.(name, Date.now() - startedAt);
+    }
+    return;
+  }
+  await stopWindowsBatch(root, names, options);
+}
+const STOP_POLL_MS = [20, 40, 80, 100] as const;
+const POSIX_LEASE_REFRESH_MS = 500;
+const WINDOWS_EXIT_WAIT_MS = 500;
+const WINDOWS_SUPERVISOR_SELF_EXIT_WAIT_MS = 150;
+
+function pollDelay(attempt: number): Promise<void> {
+  return delay(STOP_POLL_MS[Math.min(attempt, STOP_POLL_MS.length - 1)]);
+}
+
 /**
  * macOS and Linux: ends the supervisor holding the lease and everything
  * under it, SIGINT first and SIGKILL for what outlives `interruptMs`.
@@ -519,49 +701,70 @@ async function stopLease(
       );
     return;
   }
-  const signalOwned = async (
+  const signalOwned = (
     candidate: { pid: number; birth: string },
     signal: NodeJS.Signals,
-  ) => {
-    // Revalidate the birth and unguessable lease immediately before signalling.
-    if (candidate.pid === record.pid && candidate.birth !== record.birth)
-      return;
-    if (
-      (await observed(candidate.pid, record.lease, false)) !== candidate.birth
-    )
-      return;
-    try {
-      process.kill(candidate.pid, signal);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-    }
-  };
+  ) => signalLeasedProcess(name, candidate, record.lease, signal, record);
   const interrupted = new Map<number, string>();
   const deadline = Date.now() + interruptMs;
-  for (;;) {
-    for (const candidate of owned) {
-      if (
-        candidate.pid === record.pid ||
-        interrupted.get(candidate.pid) === candidate.birth
-      )
-        continue;
-      await signalOwned(candidate, "SIGINT");
-      interrupted.set(candidate.pid, candidate.birth);
+  let lastRefreshAt = Date.now();
+  let tracked: number[] = [];
+  let ownedFresh = true;
+  for (let attempt = 0; ; attempt++) {
+    if (ownedFresh) {
+      for (const candidate of owned) {
+        if (
+          candidate.pid === record.pid ||
+          interrupted.get(candidate.pid) === candidate.birth
+        )
+          continue;
+        await signalOwned(candidate, "SIGINT");
+        interrupted.set(candidate.pid, candidate.birth);
+      }
+      tracked = owned
+        .filter((candidate) => candidate.pid !== record.pid)
+        .map((candidate) => candidate.pid);
+      ownedFresh = false;
     }
+    if (!tracked.length || Date.now() >= deadline) break;
+    await pollDelay(attempt);
+    const remaining = await posixLivePids(tracked);
+    const now = Date.now();
+    // Refresh the full lease list once tracked PIDs exit (to catch newly
+    // spawned descendants before concluding drain) or periodically (to catch
+    // new descendants and avoid stalling on a reused PID).
     if (
-      !owned.some((candidate) => candidate.pid !== record.pid) ||
-      Date.now() >= deadline
-    )
-      break;
-    await delay(100);
-    owned = await nativeLeaseProcesses(record.lease);
+      remaining.size === 0 ||
+      now - lastRefreshAt >= POSIX_LEASE_REFRESH_MS ||
+      now >= deadline
+    ) {
+      owned = await nativeLeaseProcesses(record.lease);
+      lastRefreshAt = Date.now();
+      ownedFresh = true;
+    } else {
+      tracked = [...remaining];
+    }
   }
   // Keep the supervisor alive until separate-group descendants are reclaimed.
   const forceDeadline = Date.now() + 5_000;
   while (owned.some((candidate) => candidate.pid !== record.pid)) {
-    for (const candidate of owned)
-      if (candidate.pid !== record.pid) await signalOwned(candidate, "SIGKILL");
-    await delay(100);
+    const forced: number[] = [];
+    for (const candidate of owned) {
+      if (candidate.pid === record.pid) continue;
+      await signalOwned(candidate, "SIGKILL");
+      forced.push(candidate.pid);
+    }
+    const waitDeadline = Math.min(
+      forceDeadline,
+      Date.now() + POSIX_LEASE_REFRESH_MS,
+    );
+    let active = forced;
+    for (let poll = 0; ; poll++) {
+      await pollDelay(poll);
+      const remaining = await posixLivePids(active);
+      if (remaining.size === 0 || Date.now() >= waitDeadline) break;
+      active = [...remaining];
+    }
     owned = await nativeLeaseProcesses(record.lease);
     if (
       Date.now() >= forceDeadline &&
@@ -572,14 +775,41 @@ async function stopLease(
       );
   }
   const owner = owned.find((candidate) => candidate.pid === record.pid);
-  if (owner) await signalOwned(owner, "SIGKILL");
-  for (let count = 0; count < 30 && (await groupLive(record.pid)); count++)
-    await delay(100);
-  if (
-    (await groupLive(record.pid)) ||
-    (await nativeLeaseProcesses(record.lease)).length
-  )
-    throw new Error(`Native ${name} did not stop; identity record retained.`);
+  if (owner) {
+    await signalOwned(owner, "SIGKILL");
+    // Wait briefly for the supervisor itself to exit before the full lease and
+    // process-group check so the first confirmation scan settles immediately.
+    const ownerDeadline = Date.now() + POSIX_LEASE_REFRESH_MS;
+    for (let poll = 0; Date.now() < ownerDeadline; poll++) {
+      if (!(await stillLive(record.pid))) break;
+      await pollDelay(poll);
+    }
+  }
+  // A supervisor that checked for the stop request just before it was
+  // written may have restarted its service since the last listing; with the
+  // supervisor gone nothing restarts it again.
+  let settled = false;
+  for (let count = 0; count < 30; count++) {
+    let liveInGroup: boolean;
+    [owned, liveInGroup] = await Promise.all([
+      nativeLeaseProcesses(record.lease),
+      groupLive(record.pid),
+    ]);
+    if (!owned.length && !liveInGroup) {
+      settled = true;
+      break;
+    }
+    for (const candidate of owned) await signalOwned(candidate, "SIGKILL");
+    await pollDelay(count);
+  }
+  if (!settled) {
+    const [liveInGroup, remainingOwned] = await Promise.all([
+      groupLive(record.pid),
+      nativeLeaseProcesses(record.lease),
+    ]);
+    if (liveInGroup || remainingOwned.length)
+      throw new Error(`Native ${name} did not stop; identity record retained.`);
+  }
 }
 
 function terminate(pid: number) {
@@ -590,32 +820,85 @@ function terminate(pid: number) {
     if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
   }
 }
+function terminateBestEffort(pids: readonly number[]) {
+  for (const pid of pids) {
+    try {
+      terminate(pid);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+    }
+  }
+}
+/**
+ * Polls Windows PID liveness with `process.kill(pid, 0)` until every PID exits
+ * or the bounded wait window / overall deadline expires. Tight bounding ensures
+ * an immediately reused PID never stalls shutdown.
+ */
+async function waitWindowsPidsExited(
+  pids: readonly number[],
+  maxWaitMs: number,
+  deadline: number,
+): Promise<boolean> {
+  let pending = [...new Set(pids)];
+  if (!pending.length) return true;
+  const waitUntil = Math.min(deadline, Date.now() + maxWaitMs);
+  for (let attempt = 0; ; attempt++) {
+    const alive: number[] = [];
+    for (const pid of pending) {
+      if (await stillLive(pid)) alive.push(pid);
+    }
+    if (!alive.length) return true;
+    const remaining = waitUntil - Date.now();
+    if (remaining <= 0) return false;
+    pending = alive;
+    await delay(
+      Math.min(
+        STOP_POLL_MS[Math.min(attempt, STOP_POLL_MS.length - 1)]!,
+        remaining,
+      ),
+    );
+  }
+}
 /** Deepest first, so that no process loses the parent that links it here. */
 export function windowsTerminationOrder(tree: WindowsProcess[]): number[] {
   return tree.map((candidate) => candidate.pid).reverse();
 }
+function inspectWindowsStopEntry(
+  snapshot: WindowsProcess[],
+  lease: string,
+  record: Pick<Lease, "pid" | "birth">,
+) {
+  const tree = windowsLeaseTree(snapshot, lease);
+  const unverified =
+    tree[0]?.pid !== record.pid
+      ? snapshot.find(
+          ({ pid, created }) =>
+            pid === record.pid && `win32:${pid}:${created}` === record.birth,
+        )
+      : undefined;
+  return { snapshot, tree, unverified };
+}
+function toError(error: unknown): Error {
+  return error instanceof Error
+    ? error
+    : new Error(String(error), { cause: error });
+}
+
 async function windowsStopSnapshot(
   name: NativeService,
   lease: string,
-  record?: Pick<Lease, "pid" | "birth">,
+  record: Pick<Lease, "pid" | "birth">,
 ): Promise<{ snapshot: WindowsProcess[]; tree: WindowsProcess[] }> {
-  const read = async () => {
-    const snapshot = await windowsProcesses();
-    const tree = windowsLeaseTree(snapshot, lease);
-    const unverified =
-      record && tree[0]?.pid !== record.pid
-        ? snapshot.find(
-            ({ pid, created }) =>
-              pid === record.pid && `win32:${pid}:${created}` === record.birth,
-          )
-        : undefined;
-    return { snapshot, tree, unverified };
-  };
-  let current = await read();
+  let current = inspectWindowsStopEntry(
+    await windowsProcesses(),
+    lease,
+    record,
+  );
   // If a process exits during CIM enumeration, its PID and birth can still
   // appear in that snapshot even though its command line could not be read.
   // A fresh snapshot distinguishes that from a live, unverifiable process.
-  if (current.unverified?.command === "") current = await read();
+  if (current.unverified?.command === "")
+    current = inspectWindowsStopEntry(await windowsProcesses(), lease, record);
   if (current.unverified) {
     throw Object.assign(
       new Error(
@@ -628,32 +911,363 @@ async function windowsStopSnapshot(
 }
 
 /**
- * Ends the supervisor holding the lease and everything under it. Windows
- * links a child only through its parent's PID, so ending a parent first
- * (as the signal loop for process groups does) cut its children off the
- * tree: TeamHub, web and node-services outlived every stop and kept their
- * ports. Each pass ends one snapshot's processes leaves first; the
- * supervisor, whose command line carries the lease that finds the tree, goes
- * only once nothing is left under it.
+ * Ends an unrecorded supervisor holding `lease` and everything under it
+ * (startup rollback after failed identity persistence). Windows links a child
+ * only through its parent's PID, so each pass ends one snapshot's processes
+ * leaves first; the supervisor, whose command line carries the lease that
+ * finds the tree, goes only once nothing is left under it.
  */
-async function stopWindowsTree(
-  name: NativeService,
-  lease: string,
-  record?: Pick<Lease, "pid" | "birth" | "lease">,
-) {
+async function stopWindowsTree(name: NativeService, lease: string) {
   const deadline = Date.now() + 12_000;
   for (;;) {
-    const { snapshot, tree } = await windowsStopSnapshot(name, lease, record);
+    const tree = windowsLeaseTree(await windowsProcesses(), lease);
     if (!tree.length) return;
-    if (Date.now() >= deadline) {
-      if (record && (await endRecordedTree(name, record, snapshot))) return;
-      throw new Error(`Native ${name} did not stop; identity record retained.`);
-    }
+    if (Date.now() >= deadline) throw new Error(`Native ${name} did not stop.`);
     const order = windowsTerminationOrder(tree);
-    for (const pid of tree.length > 1 ? order.slice(0, -1) : order)
-      terminate(pid);
-    await delay(100);
+    if (tree.length > 1) {
+      const children = order.slice(0, -1);
+      terminateBestEffort(children);
+      const childrenExited = await waitWindowsPidsExited(
+        children,
+        WINDOWS_EXIT_WAIT_MS,
+        deadline,
+      );
+      if (childrenExited) {
+        await waitWindowsPidsExited(
+          [tree[0]!.pid],
+          WINDOWS_SUPERVISOR_SELF_EXIT_WAIT_MS,
+          deadline,
+        );
+      }
+    } else {
+      terminateBestEffort(order);
+      await waitWindowsPidsExited(order, WINDOWS_EXIT_WAIT_MS, deadline);
+    }
   }
+}
+
+interface WindowsBatchEntry {
+  name: NativeService;
+  record?: Lease;
+  request?: string;
+  stopWritten: boolean;
+  done: boolean;
+  error?: Error;
+  finishedAt?: number;
+}
+
+async function readWindowsBatchSnapshot(
+  active: readonly (WindowsBatchEntry & { record: Lease })[],
+): Promise<{
+  snapshot: WindowsProcess[];
+  inspected: Map<WindowsBatchEntry, ReturnType<typeof inspectWindowsStopEntry>>;
+}> {
+  const retriedEmpty = new Set<WindowsBatchEntry>();
+  for (;;) {
+    const snapshot = await windowsProcesses();
+    const inspected = new Map(
+      active.map((entry) => [
+        entry,
+        inspectWindowsStopEntry(snapshot, entry.record.lease, entry.record),
+      ]),
+    );
+    // If any recorded process exited mid-CIM enumeration, its PID and birth
+    // can appear once without a command line; give each entry its own retry
+    // so staggered exits across services never starve one another.
+    const needsRetry = active.filter(
+      (entry) =>
+        inspected.get(entry)!.unverified?.command === "" &&
+        !retriedEmpty.has(entry),
+    );
+    if (!needsRetry.length) return { snapshot, inspected };
+    for (const entry of needsRetry) retriedEmpty.add(entry);
+  }
+}
+
+async function stopWindowsBatch(
+  root: string,
+  names: readonly NativeService[],
+  options: StopNativeProcessesOptions,
+): Promise<void> {
+  options.signal?.throwIfAborted();
+  if (!names.length) return;
+  const batchStartedAt = Date.now();
+  const entries: WindowsBatchEntry[] = await Promise.all(
+    names.map(async (name): Promise<WindowsBatchEntry> => {
+      try {
+        const record = await stored(root, name);
+        return {
+          name,
+          record,
+          request: record ? stopRequest(root, name, record.lease) : undefined,
+          stopWritten: false,
+          done: !record,
+          ...(record ? {} : { finishedAt: Date.now() }),
+        };
+      } catch (error) {
+        return {
+          name,
+          stopWritten: false,
+          done: false,
+          error: toError(error),
+          finishedAt: Date.now(),
+        };
+      }
+    }),
+  );
+
+  let reportedIndex = 0;
+  let reportedFailure = false;
+  const flushReported = () => {
+    while (reportedIndex < entries.length) {
+      const entry = entries[reportedIndex]!;
+      if (entry.error !== undefined) {
+        const elapsed = Math.max(
+          0,
+          (entry.finishedAt ?? Date.now()) - batchStartedAt,
+        );
+        reportedIndex += 1;
+        reportedFailure = true;
+        options.onServiceDone?.(entry.name, elapsed, entry.error);
+        throw entry.error;
+      }
+      if (!entry.done) break;
+      const elapsed = Math.max(
+        0,
+        (entry.finishedAt ?? Date.now()) - batchStartedAt,
+      );
+      reportedIndex += 1;
+      options.onServiceDone?.(entry.name, elapsed);
+    }
+  };
+
+  // Stop before the first record that failed to load so downstream services
+  // stay untouched until earlier ones finish and the failure surfaces.
+  const firstLoadErrorIndex = entries.findIndex(
+    (entry) => entry.error !== undefined,
+  );
+  let limit = firstLoadErrorIndex >= 0 ? firstLoadErrorIndex : entries.length;
+
+  const removeEntryFiles = async (
+    entry: WindowsBatchEntry & { record: Lease },
+  ) => {
+    try {
+      await rm(paths(root, entry.name).record, { force: true });
+      await rm(entry.request!, { force: true });
+      entry.done = true;
+      entry.finishedAt = Date.now();
+    } catch (error) {
+      entry.error = toError(error);
+      entry.finishedAt = Date.now();
+      limit = Math.min(limit, entries.indexOf(entry));
+    }
+  };
+
+  flushReported();
+
+  const hasPendingRecords = () =>
+    entries
+      .slice(0, limit)
+      .some((entry) => !entry.done && entry.record !== undefined);
+
+  if (!hasPendingRecords()) {
+    flushReported();
+    return;
+  }
+
+  const deadline = batchStartedAt + 12_000;
+  try {
+    for (;;) {
+      options.signal?.throwIfAborted();
+      const active = entries
+        .slice(0, limit)
+        .filter(
+          (entry): entry is WindowsBatchEntry & { record: Lease } =>
+            !entry.done && entry.record !== undefined,
+        );
+      if (!active.length) break;
+
+      const { snapshot, inspected } = await readWindowsBatchSnapshot(active);
+
+      // Truncate at the first service that fails identity verification so
+      // earlier services finish and the error surfaces at that service; on
+      // Pass 1 this leaves it and all downstream services untouched.
+      for (let index = 0; index < limit; index++) {
+        const entry = entries[index]!;
+        if (entry.done || !entry.record) continue;
+        const result = inspected.get(entry)!;
+        if (result.unverified) {
+          entry.error = Object.assign(
+            new Error(
+              `Native ${entry.name} process identity cannot be verified; identity record retained.`,
+            ),
+            { code: NATIVE_PROCESS_IDENTITY_UNVERIFIED },
+          );
+          entry.finishedAt = Date.now();
+          limit = index;
+          break;
+        }
+      }
+
+      const cleared: Array<WindowsBatchEntry & { record: Lease }> = [];
+      for (const entry of entries.slice(0, limit)) {
+        if (entry.done || !entry.record) continue;
+        const result = inspected.get(entry)!;
+        if (!result.tree.length)
+          cleared.push(entry as WindowsBatchEntry & { record: Lease });
+      }
+
+      if (cleared.length) {
+        await Promise.all(cleared.map(removeEntryFiles));
+      }
+
+      flushReported();
+      let remaining = entries
+        .slice(0, limit)
+        .filter(
+          (entry): entry is WindowsBatchEntry & { record: Lease } =>
+            !entry.done && entry.record !== undefined,
+        );
+      if (!remaining.length) break;
+
+      // Write `.stop` request files before terminating any process (including
+      // deadline `taskkill`) so no supervisor can restart its service during
+      // batch shutdown. Sequential writes stop before downstream services if a
+      // `.stop` write fails.
+      const freshlyStopped = new Set<WindowsBatchEntry>();
+      for (const entry of remaining) {
+        if (entry.stopWritten) continue;
+        try {
+          await requestStop(entry.request!);
+          entry.stopWritten = true;
+          freshlyStopped.add(entry);
+        } catch (error) {
+          entry.error = toError(error);
+          entry.finishedAt = Date.now();
+          limit = Math.min(limit, entries.indexOf(entry));
+          break;
+        }
+      }
+      flushReported();
+      remaining = remaining.filter((entry) => entries.indexOf(entry) < limit);
+      if (!remaining.length) break;
+
+      if (Date.now() >= deadline) {
+        for (const [index, entry] of remaining.entries()) {
+          options.signal?.throwIfAborted();
+          let targetSnapshot: WindowsProcess[];
+          if (index === 0 && !freshlyStopped.has(entry)) {
+            targetSnapshot = snapshot;
+          } else {
+            // Re-read a fresh snapshot before targeting any subsequent service
+            // (a prior `endRecordedTree` can take up to 18s, during which PIDs
+            // can exit and be reused) or any entry whose `.stop` file was just
+            // written after `snapshot` was captured.
+            let fresh: { snapshot: WindowsProcess[]; tree: WindowsProcess[] };
+            try {
+              fresh = await windowsStopSnapshot(
+                entry.name,
+                entry.record.lease,
+                entry.record,
+              );
+            } catch (error) {
+              entry.error = toError(error);
+              entry.finishedAt = Date.now();
+              limit = Math.min(limit, entries.indexOf(entry));
+              break;
+            }
+            if (!fresh.tree.length) {
+              await removeEntryFiles(entry);
+              flushReported();
+              if (entry.error !== undefined) break;
+              continue;
+            }
+            targetSnapshot = fresh.snapshot;
+          }
+          let stopped: boolean;
+          try {
+            stopped = await endRecordedTree(
+              entry.name,
+              entry.record,
+              targetSnapshot,
+            );
+          } catch (error) {
+            entry.error = toError(error);
+            entry.finishedAt = Date.now();
+            limit = Math.min(limit, entries.indexOf(entry));
+            break;
+          }
+          if (stopped) {
+            await removeEntryFiles(entry);
+            flushReported();
+            if (entry.error !== undefined) break;
+          } else {
+            entry.error = new Error(
+              `Native ${entry.name} did not stop; identity record retained.`,
+            );
+            entry.finishedAt = Date.now();
+            limit = Math.min(limit, entries.indexOf(entry));
+            break;
+          }
+        }
+        break;
+      }
+
+      const terminatedChildren: number[] = [];
+      const supervisorsToWait: number[] = [];
+      const terminatedSupervisors: number[] = [];
+      for (const entry of remaining) {
+        const tree = inspected.get(entry)!.tree;
+        const order = windowsTerminationOrder(tree);
+        try {
+          if (tree.length > 1) {
+            const children = order.slice(0, -1);
+            terminateBestEffort(children);
+            terminatedChildren.push(...children);
+            supervisorsToWait.push(tree[0]!.pid);
+          } else if (!freshlyStopped.has(entry)) {
+            // Only terminate a supervisor-only tree after a post-`.stop`
+            // snapshot confirms no child was spawned before `.stop` existed.
+            terminateBestEffort(order);
+            terminatedSupervisors.push(...order);
+          }
+        } catch (error) {
+          entry.error = toError(error);
+          entry.finishedAt = Date.now();
+          limit = Math.min(limit, entries.indexOf(entry));
+          break;
+        }
+      }
+
+      const terminatedAll = [...terminatedChildren, ...terminatedSupervisors];
+      if (terminatedAll.length) {
+        const allTerminatedExited = await waitWindowsPidsExited(
+          terminatedAll,
+          WINDOWS_EXIT_WAIT_MS,
+          deadline,
+        );
+        if (supervisorsToWait.length > 0 && allTerminatedExited) {
+          await waitWindowsPidsExited(
+            supervisorsToWait,
+            WINDOWS_SUPERVISOR_SELF_EXIT_WAIT_MS,
+            deadline,
+          );
+        }
+      }
+    }
+  } catch (error) {
+    if (reportedFailure || options.signal?.aborted) throw error;
+    flushReported();
+    const failed = entries[reportedIndex];
+    if (failed) {
+      failed.error = toError(error);
+      failed.finishedAt = Date.now();
+      flushReported();
+    }
+    throw error;
+  }
+
+  flushReported();
 }
 
 /**
@@ -829,6 +1443,34 @@ export async function reclaimNativeOrphans(
   }
 }
 
+/**
+ * The ones of `folders` that a running process of this user starts from: its
+ * command line names a path inside one. When processes cannot be listed,
+ * every folder counts as in use, so nothing a service needs is removed.
+ */
+export async function foldersInUse(
+  folders: readonly string[],
+): Promise<Set<string>> {
+  let commands: string[];
+  try {
+    commands =
+      process.platform === "win32"
+        ? (await windowsProcesses()).map((entry) => entry.command)
+        : (await ownCommands()).map((entry) => entry.command);
+  } catch {
+    return new Set(folders);
+  }
+  const used = await Promise.all(
+    folders.map(async (folder) => {
+      // A service may run from the resolved path of a linked folder.
+      const names = [folder, await realpath(folder).catch(() => folder)];
+      return commands.some((command) =>
+        names.some((name) => command.includes(name + path.sep)),
+      );
+    }),
+  );
+  return new Set(folders.filter((_, index) => used[index]));
+}
 /** Each process of this user with its command line (macOS and Linux). */
 async function ownCommands(): Promise<Array<{ pid: number; command: string }>> {
   if (process.platform === "linux") {
@@ -883,7 +1525,10 @@ async function reclaimUnrecordedLeases(
     const [, name, lease] = job as unknown as [string, NativeService, string];
     const birth = await observed(pid, lease);
     if (!birth) continue;
+    const request = stopRequest(root, name, lease);
+    await requestStop(request);
     await stopLease(name, { pid, birth, lease }, 12_000);
+    await rm(request, { force: true });
     ended.push(pid);
   }
   return ended;

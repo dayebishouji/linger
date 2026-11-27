@@ -391,8 +391,8 @@ func TestVoiceLiveCreateRoomRunsAsTheHumanAfterConfirmation(t *testing.T) {
 	if again := call("room-4", "lt_room", `{"name":"Room made by voice","members":["bob"],"confirmed":true}`); !strings.Contains(again, result.RoomID) || rooms() != 1 {
 		t.Fatalf("retried create=%s rooms=%d", again, rooms())
 	}
-	if countRows(t, env, `SELECT count(*) FROM active_room_members WHERE room_id=$1 AND actor_id IN ('actor_acme_alice','actor_acme_bob')`, result.RoomID) != 2 {
-		t.Fatal("creator and spoken member were not both admitted")
+	if countRows(t, env, `SELECT count(*) FROM active_room_members WHERE room_id=$1 AND actor_id IN ('actor_acme_alice','actor_acme_bob','actor_acme_official')`, result.RoomID) != 3 {
+		t.Fatal("creator, AnotherMe and spoken member were not all admitted")
 	}
 	call("room-5a", "lt_room_ask_again", `{"name":"Room made by voice"}`)
 	if output := call("room-5", "lt_room_again", `{"name":"Room made by voice","confirmed":true}`); !strings.Contains(output, "room_name_taken") || rooms() != 1 {
@@ -603,7 +603,9 @@ func TestVoiceLiveTasksReportResultsAndWhatTheyWaitFor(t *testing.T) {
 	}
 	// Irreversible work starts only from a confirmation given in a later turn,
 	// once, and does exactly what was confirmed.
-	pending := tool("lt_x", "x1", "start_task", map[string]any{"goal": "Delete the old hiring document", "surface": "workspace", "irreversible": true})
+	// The work room prefix leaves 113 characters: truncation lands on a space.
+	goal := strings.Repeat("a", 112) + " after approval"
+	pending := tool("lt_x", "x1", "start_task", map[string]any{"goal": goal, "surface": "workspace", "irreversible": true})
 	confirmationID, _ := pending["confirmation_id"].(string)
 	if pending["status"] != "needs_confirmation" || confirmationID == "" ||
 		countRows(t, env, `SELECT count(*) FROM voice_live_tasks WHERE voice_session_id=$1`, sessionID) != 0 {
@@ -613,7 +615,7 @@ func TestVoiceLiveTasksReportResultsAndWhatTheyWaitFor(t *testing.T) {
 		t.Fatalf("same-turn confirmation=%v", early)
 	}
 	if confirmed := tool("lt_y", "y1", "start_task", map[string]any{"goal": "Delete all documents", "surface": "workspace", "irreversible": true, "confirmation_id": confirmationID}); confirmed["status"] != "started" ||
-		countRows(t, env, `SELECT count(*) FROM voice_live_tasks WHERE voice_session_id=$1 AND goal='Delete the old hiring document'`, sessionID) != 1 {
+		countRows(t, env, `SELECT count(*) FROM voice_live_tasks WHERE voice_session_id=$1 AND goal=$2`, sessionID, goal) != 1 {
 		t.Fatalf("confirmed task=%v", confirmed)
 	}
 	if again := tool("lt_z", "z1", "start_task", map[string]any{"goal": "Delete the old hiring document", "surface": "workspace", "irreversible": true, "confirmation_id": confirmationID}); again["error"] != "confirmation_invalid" {

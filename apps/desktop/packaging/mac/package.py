@@ -15,9 +15,12 @@ Without --developer-id the app gets an ad-hoc signature and macOS asks the
 user to confirm the first launch. --developer-id signs the app, its helpers
 and the DMG with that Developer ID Application certificate, with the hardened
 runtime and entitlements.plist. --notary-key, the App Store Connect
-API key from `rcodesign encode-app-store-connect-api-key`, then notarizes the
-app and the DMG and staples both tickets, so Gatekeeper opens the DMG
-directly. Key and password files are only passed to rcodesign.
+API key from `rcodesign encode-app-store-connect-api-key`, notarizes and
+staples Linger.app (`Contents/CodeResources`) before building the DMG, then
+signs, notarizes, and staples the DMG in a second Apple submission so both the
+DMG and the nested app work offline (`syspolicy_check distribution`, no
+CloudKit lookup dependency). Key and password files are only passed to
+rcodesign.
 
 The Go daemon goes to Contents/Resources/computer/ and is signed with the
 app like every other Mach-O file. The browser and computer-control tools it
@@ -50,6 +53,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 import zipfile
 
@@ -88,8 +92,45 @@ CUA_APP = f"{CUA}/CuaDriver.app"
 CUA_VENDOR_SIGNED = ["cua/cua-driver"]
 
 
+SUBMISSION_ID_RE = re.compile(r"created submission ID:\s*([0-9a-fA-F-]{36})")
+
+
 def run(*args, **kwargs):
     subprocess.run(args, check=True, **kwargs)
+
+
+def run_capture(*args, merge_stderr=False, stream=False):
+    """Runs a command and returns stdout, or combined output when merge_stderr is True."""
+    stderr = subprocess.STDOUT if merge_stderr else None
+    errors = "replace" if (stream or merge_stderr) else "strict"
+    if not stream:
+        completed = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            encoding="utf-8",
+            errors=errors,
+            check=True,
+        )
+        return completed.stdout
+    chunks = []
+    with subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=stderr,
+        encoding="utf-8",
+        errors=errors,
+    ) as process:
+        assert process.stdout is not None
+        for line in process.stdout:
+            chunks.append(line)
+            sys.stderr.write(line)
+            sys.stderr.flush()
+        returncode = process.wait()
+    output = "".join(chunks)
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, args, output=output)
+    return output
 
 
 def dmgtool(workdir, *args):
@@ -233,7 +274,7 @@ MACHO_MAGIC = {b"\xcf\xfa\xed\xfe", FAT_MAGIC}
 
 
 def macho_files(app):
-    """Bundle-relative paths of the Mach-O files in app, sorted."""
+    """Bundle-relative POSIX paths of the Mach-O files in app, sorted."""
     found = []
     for root, _, files in os.walk(app):
         for name in files:
@@ -242,7 +283,7 @@ def macho_files(app):
                 continue
             with open(path, "rb") as source:
                 if source.read(4) in MACHO_MAGIC:
-                    found.append(os.path.relpath(path, app))
+                    found.append(os.path.relpath(path, app).replace(os.sep, "/"))
     return sorted(found)
 
 
@@ -377,7 +418,7 @@ class Signing:
         # Mach-O file, so the vendor-signed driver put back stays as it is.
         native = os.path.join(app, NATIVE)
         if os.path.isdir(native):
-            refresh(native, target)
+            refresh(native, target, shared_node=os.path.join(app, TOOLS_NODE))
         resources = os.path.join(app, RESOURCES)
         staged = os.path.join(computer_tools.STAGED, target, computer_tools.TOOLS)
         for relative in CUA_VENDOR_SIGNED:
@@ -392,11 +433,105 @@ class Signing:
         if self.developer_id:
             run(*self.dmg_args(dmg))
 
-    def notarize(self, path):
-        """Waits for Apple's verdict and staples the ticket to path."""
-        if self.notary_key:
-            run(self.rcodesign, "notary-submit", "--api-key-file", self.notary_key,
-                "--wait", "--max-wait-seconds", "3600", "--staple", path)
+    def notarize(
+        self,
+        path,
+        submit_attempts=3,
+        wait_attempts=6,
+        log_attempts=3,
+        delay_seconds=5,
+        max_wait_seconds=3600,
+    ):
+        """Submits path to Apple notarization, verifies an Accepted verdict, and staples it."""
+        if not self.notary_key:
+            return
+        # Submit without --wait or --staple so transient polling errors retry
+        # notary-wait on the same submission ID instead of re-uploading, and
+        # check Apple's JSON notary-log because rcodesign notary-wait exits 0
+        # even when Apple's verdict is Invalid or Rejected.
+        submit_output = ""
+        for attempt in range(1, submit_attempts + 1):
+            try:
+                submit_output = run_capture(
+                    self.rcodesign,
+                    "notary-submit",
+                    "--api-key-file",
+                    self.notary_key,
+                    path,
+                    merge_stderr=True,
+                    stream=True,
+                )
+                break
+            except subprocess.CalledProcessError:
+                if attempt == submit_attempts:
+                    raise
+                time.sleep(delay_seconds)
+        match = SUBMISSION_ID_RE.search(submit_output)
+        if not match:
+            raise RuntimeError(f"rcodesign notary-submit did not report a submission ID for {path}")
+        submission_id = match.group(1)
+
+        deadline = time.monotonic() + max_wait_seconds
+        for attempt in range(1, wait_attempts + 1):
+            remaining = max(1, int(deadline - time.monotonic()))
+            try:
+                run(
+                    self.rcodesign,
+                    "notary-wait",
+                    "--api-key-file",
+                    self.notary_key,
+                    "--max-wait-seconds",
+                    str(remaining),
+                    submission_id,
+                )
+                break
+            except subprocess.CalledProcessError:
+                now = time.monotonic()
+                if attempt == wait_attempts or now + delay_seconds >= deadline:
+                    raise
+                time.sleep(delay_seconds)
+
+        log_output = ""
+        for attempt in range(1, log_attempts + 1):
+            try:
+                log_output = run_capture(
+                    self.rcodesign,
+                    "notary-log",
+                    "--api-key-file",
+                    self.notary_key,
+                    submission_id,
+                )
+                break
+            except subprocess.CalledProcessError:
+                if attempt == log_attempts:
+                    raise
+                time.sleep(delay_seconds)
+        try:
+            payload = json.loads(log_output)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"Apple notarization log for {path} (submission {submission_id}) was not valid JSON"
+            ) from error
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if status != "Accepted":
+            raise RuntimeError(
+                f"Apple notarization did not accept {path} (submission {submission_id}, status={status!r})"
+            )
+
+        self.staple(path)
+
+    def staple(self, path, attempts=5, delay_seconds=5):
+        """Attaches Apple's already-issued notarization ticket to path."""
+        if not self.notary_key:
+            return
+        for attempt in range(1, attempts + 1):
+            try:
+                run(self.rcodesign, "staple", path)
+                return
+            except subprocess.CalledProcessError:
+                if attempt == attempts:
+                    raise
+                time.sleep(delay_seconds)
 
 
 def build_dmg(stage, workdir, output, volume_name):
@@ -433,6 +568,62 @@ def update_archive(app, output):
     print(f"{output} {os.path.getsize(output)} sha256={sha256(output)}", flush=True)
 
 
+def emit_outputs(stage, app, workdir, out_dir, version, arch, signing, include_update_archive):
+    """Produces the signed/notarized DMG and optional update archive.
+
+    When --notary-key is set, notarizes and staples Linger.app before
+    building the DMG so the nested bundle carries Contents/CodeResources, then
+    builds, signs, notarizes, and staples the DMG in a second Apple submission.
+    When --update-archive is also set, packing the update archive overlaps DMG
+    creation because both only read the already-signed, stapled bundle.
+    """
+    # IMPORTANT: Do NOT remove pre-DMG Linger.app notarization/stapling to
+    # optimize CI speed (two Apple submissions are required):
+    # - Stapling Linger.app writes Linger.app/Contents/CodeResources.
+    # - Putting Contents/CodeResources into the DMG after build_dmg mutates
+    #   vol.hfs/DMG bytes and invalidates the DMG signature and notarization
+    #   ticket.
+    # - Stapling only the outer .dmg in a single Apple submission leaves
+    #   Linger.app inside the DMG without Contents/CodeResources, failing
+    #   `syspolicy_check distribution` and causing macOS Gatekeeper to block
+    #   first launches ("Apple could not verify 'Linger' is free of
+    #   malware...") whenever online CloudKit lookup is unavailable, slow, or
+    #   blocked.
+    # Therefore BOTH submissions (Linger.app before DMG build, and the signed
+    # .dmg after DMG build) are required.
+    signing.notarize(app)
+    if signing.notary_key:
+        ticket = os.path.join(app, "Contents", "CodeResources")
+        if not os.path.isfile(ticket) or os.path.getsize(ticket) <= 0:
+            sys.exit(
+                f"missing stapled notarization ticket at {ticket} "
+                "(Contents/CodeResources); Linger.app must be stapled before building the DMG"
+            )
+
+    output = os.path.join(out_dir, f"Linger-{version}-{arch}.dmg")
+
+    def make_dmg():
+        build_dmg(stage, workdir, output, f"Linger {version}")
+        signing.sign_dmg(output)
+        signing.notarize(output)
+        print(f"{output} {os.path.getsize(output)} sha256={sha256(output)}", flush=True)
+
+    if include_update_archive:
+        def make_update():
+            archive = os.path.join(out_dir, f"Linger-{version}-{arch}.app.tar.gz")
+            update_archive(app, archive)
+            computer_tools.check_archive(archive, "Linger.app/Contents/Resources/", f"darwin-{arch}")
+
+        # Both threads only read the already-signed, stapled bundle and write
+        # separate outputs.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(make_dmg), pool.submit(make_update)]
+            for future in futures:
+                future.result()
+    else:
+        make_dmg()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--arch", action="append", choices=["arm64", "x64"])
@@ -467,30 +658,8 @@ def main():
             if args.notary_key:
                 check_bundled_archives(app)
             signing.sign_app(app, f"darwin-{arch}")
-            # The stapled app carries its ticket into the DMG and the update.
-            signing.notarize(app)
             computer_tools.check(os.path.join(app, RESOURCES), f"darwin-{arch}")
-            output = os.path.join(args.out, f"Linger-{version}-{arch}.dmg")
-
-            def make_dmg():
-                build_dmg(stage, workdir, output, f"Linger {version}")
-                signing.sign_dmg(output)
-                signing.notarize(output)
-                print(f"{output} {os.path.getsize(output)} sha256={sha256(output)}", flush=True)
-
-            def make_update():
-                archive = os.path.join(args.out, f"Linger-{version}-{arch}.app.tar.gz")
-                update_archive(app, archive)
-                computer_tools.check_archive(archive, "Linger.app/Contents/Resources/", f"darwin-{arch}")
-
-            if args.update_archive:
-                # Both only read the signed, stapled bundle.
-                with ThreadPoolExecutor(max_workers=2) as pool:
-                    futures = [pool.submit(make_dmg), pool.submit(make_update)]
-                    for future in futures:
-                        future.result()
-            else:
-                make_dmg()
+            emit_outputs(stage, app, workdir, args.out, version, arch, signing, args.update_archive)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 

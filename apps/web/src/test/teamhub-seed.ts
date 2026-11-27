@@ -8,7 +8,6 @@ import type {
   TeamHubGoogleCalendar,
   TeamHubNotionResource,
   TeamHubSlackConversation,
-  TeamHubAgentTemplatePage,
   TeamHubLocalComputerPage,
   TeamHubCurrentIdentity,
   TeamHubDocument,
@@ -39,7 +38,6 @@ export type TestTenantAgent = TeamHubTenantAgent & {
 
 export interface TeamHubTestSeed {
   actors: TeamHubActor[];
-  agentTemplates: TeamHubAgentTemplatePage["items"];
   directRoomIdByPeerActor: Map<string, string>;
   /** The My pages tree; without it every active Document the Human owns sits at the root. */
   documentTree?: TeamHubMyDocumentTree;
@@ -473,56 +471,9 @@ export function createTeamHubTestSeed(): TeamHubTestSeed {
     updated_at: offlineLocalReviewerActor.created_at,
     visibility_scope: "workspace",
   };
-  const agentTemplates: TeamHubAgentTemplatePage["items"] = [
-    {
-      avatar_key: "figure:raccoon:43A46A",
-      routines: [],
-      connector_bindings: [],
-      created_at: "2026-09-01T10:00:00.000Z",
-      description: "Reviews changes for correctness, risk, and clarity.",
-      instructions: "You are a Code Reviewer working with your Human Sponsor.",
-      name: "Code Reviewer",
-      origin: "builtin",
-      skill_bindings: [
-        {
-          manifest_version: "1.0.0",
-          name: "Review Changes",
-          skill_id: "skill-review-changes",
-        },
-      ],
-      template_id: "code-reviewer",
-      updated_at: "2026-09-01T10:00:00.000Z",
-    },
-    {
-      routines: [],
-      connector_bindings: ["gmail"],
-      created_at: "2026-09-02T10:00:00.000Z",
-      description: "Turns questions into sourced briefs.",
-      instructions: "You are a Research Analyst working with your Sponsor.",
-      name: "Market Researcher",
-      origin: "published",
-      published_by: {
-        display_name: "Jenny",
-        id: "actor-jenny",
-        kind: "human",
-        tenant_id: "tenant-northstar",
-      },
-      skill_bindings: [
-        {
-          manifest_version: "1.0.0",
-          name: "Research Market",
-          skill_id: "skill-research-market",
-        },
-      ],
-      template_id: "agent_template_market_researcher",
-      updated_at: "2026-09-02T10:00:00.000Z",
-    },
-  ];
   const localComputers: TeamHubLocalComputerPage["items"] = [
     {
       active_operations: 0,
-      available_capacity: 2,
-      capacity: 2,
       display_name: "Jenny's Mac",
       computer_id: "computer-jenny-mac",
       runtimes: [
@@ -552,8 +503,6 @@ export function createTeamHubTestSeed(): TeamHubTestSeed {
     },
     {
       active_operations: 0,
-      available_capacity: 0,
-      capacity: 2,
       display_name: "Offline Lab Mac",
       computer_id: "computer-offline-lab",
       last_seen_at: "2026-09-29T10:00:00.000Z",
@@ -584,8 +533,6 @@ export function createTeamHubTestSeed(): TeamHubTestSeed {
     },
     {
       active_operations: 0,
-      available_capacity: 0,
-      capacity: 2,
       display_name: "Assigned Offline Mac",
       computer_id: "computer-assigned-offline",
       last_seen_at: "2026-09-29T09:30:00.000Z",
@@ -616,8 +563,6 @@ export function createTeamHubTestSeed(): TeamHubTestSeed {
     },
     {
       active_operations: 0,
-      available_capacity: 0,
-      capacity: 2,
       display_name: "Legacy Mac",
       computer_id: "computer-legacy-mac",
       last_seen_at: "2026-09-29T08:00:00.000Z",
@@ -658,7 +603,6 @@ export function createTeamHubTestSeed(): TeamHubTestSeed {
 
   return {
     actors: [...actors, offlineLocalReviewerActor],
-    agentTemplates,
     directRoomIdByPeerActor: new Map([
       ["actor-codex", "room-dm-codex"],
       ["actor-delegate", "room-another-me"],

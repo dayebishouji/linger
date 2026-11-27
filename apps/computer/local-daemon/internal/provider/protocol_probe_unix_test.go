@@ -3,10 +3,8 @@
 package provider
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,15 +21,6 @@ func writeProbeScript(t *testing.T, body string) string {
 	return path
 }
 
-func captureProbeLog(t *testing.T) *bytes.Buffer {
-	t.Helper()
-	var output bytes.Buffer
-	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
-	t.Cleanup(func() { slog.SetDefault(previous) })
-	return &output
-}
-
 func TestProtocolProbeAcceptsAnAnswerFollowedByAFailedExit(t *testing.T) {
 	logged := captureProbeLog(t)
 	script := writeProbeScript(t, `read request
@@ -41,7 +30,7 @@ echo 'shutting down after input closed' >&2
 exit 1
 `)
 	environment := map[string]string{"PATH": "/usr/bin:/bin", "HOME": t.TempDir()}
-	if err := probeRuntimeProtocol(context.Background(), "codex", script, environment, 5*time.Second, "codex-cli 0.171.0"); err != nil {
+	if err := probeRuntimeProtocol(context.Background(), "codex", script, environment, 5*time.Second, ""); err != nil {
 		t.Fatalf("an answered handshake failed: %v", err)
 	}
 	if !strings.Contains(logged.String(), "runner.runtime_probe.exit_after_handshake") || !strings.Contains(logged.String(), "exit_code=1") {
@@ -55,11 +44,11 @@ func TestProtocolProbeLogsWhyAnUnansweredHandshakeFailed(t *testing.T) {
 exit 2
 `)
 	environment := map[string]string{"PATH": "/usr/bin:/bin", "HOME": t.TempDir()}
-	if err := probeRuntimeProtocol(context.Background(), "pi", script, environment, 5*time.Second, "1.6.0"); err == nil {
+	if err := probeRuntimeProtocol(context.Background(), "codex", script, environment, 5*time.Second, ""); err == nil {
 		t.Fatal("an unanswered handshake passed")
 	}
 	output := logged.String()
-	for _, want := range []string{"runner.runtime_probe.handshake_failed", "runtime_type=pi", "exit_code=2", "unexpected argument found"} {
+	for _, want := range []string{"runner.runtime_probe.handshake_failed", "runtime_type=codex", "exit_code=2", "unexpected argument found"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("log lacks %q: %s", want, output)
 		}

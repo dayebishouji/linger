@@ -1,8 +1,105 @@
+diff --git a/dist/ipc/proc_pool.cjs b/dist/ipc/proc_pool.cjs
+index a4f446ccc69f2ea8c206a825b4a9a2b677cde990..8c92e071c8baa206aac0da0a99e2deb2221c39bc 100644
+--- a/dist/ipc/proc_pool.cjs
++++ b/dist/ipc/proc_pool.cjs
+@@ -61,9 +61,17 @@ class ProcPool {
+   async launchJob(info) {
+     let proc;
+     if (this.procMutex) {
+-      const entry = await this.warmedProcQueue.get();
+-      proc = entry.proc;
+-      entry.unlock();
++      // A warmed process can die while it waits (the host slept past its ping
++      // timeout); sending it a job fails at once, so skip it. Its unlock lets
++      // the pool warm a replacement.
++      for (;;) {
++        const entry = await this.warmedProcQueue.get();
++        entry.unlock();
++        if (entry.proc.isAlive) {
++          proc = entry.proc;
++          break;
++        }
++      }
+     } else {
+       proc = new import_job_proc_executor.JobProcExecutor(
+         this.agent,
+@@ -113,6 +121,16 @@ class ProcPool {
+         } catch {
+         }
+         await proc.join();
++        // A warmed process that exits before any job takes it must leave the
++        // queue and free its slot, or the next job is handed a dead process.
++        // close() already released the queued entries it shuts down.
++        if (procUnlockTransferred && !this.closed) {
++          const queued = this.warmedProcQueue.items.findIndex((entry) => entry.proc === proc);
++          if (queued !== -1) {
++            this.warmedProcQueue.items.splice(queued, 1);
++            procUnlock();
++          }
++        }
+       } finally {
+         if (!initReleased) {
+           unlock();
+diff --git a/dist/ipc/proc_pool.js b/dist/ipc/proc_pool.js
+index 628ba309ac4bf1194c08cec510460184c6384376..7a44019a1816ce4a49d5d1b88e92f98c3fb8ca56 100644
+--- a/dist/ipc/proc_pool.js
++++ b/dist/ipc/proc_pool.js
+@@ -38,9 +38,17 @@ class ProcPool {
+   async launchJob(info) {
+     let proc;
+     if (this.procMutex) {
+-      const entry = await this.warmedProcQueue.get();
+-      proc = entry.proc;
+-      entry.unlock();
++      // A warmed process can die while it waits (the host slept past its ping
++      // timeout); sending it a job fails at once, so skip it. Its unlock lets
++      // the pool warm a replacement.
++      for (;;) {
++        const entry = await this.warmedProcQueue.get();
++        entry.unlock();
++        if (entry.proc.isAlive) {
++          proc = entry.proc;
++          break;
++        }
++      }
+     } else {
+       proc = new JobProcExecutor(
+         this.agent,
+@@ -90,6 +98,16 @@ class ProcPool {
+         } catch {
+         }
+         await proc.join();
++        // A warmed process that exits before any job takes it must leave the
++        // queue and free its slot, or the next job is handed a dead process.
++        // close() already released the queued entries it shuts down.
++        if (procUnlockTransferred && !this.closed) {
++          const queued = this.warmedProcQueue.items.findIndex((entry) => entry.proc === proc);
++          if (queued !== -1) {
++            this.warmedProcQueue.items.splice(queued, 1);
++            procUnlock();
++          }
++        }
+       } finally {
+         if (!initReleased) {
+           unlock();
 diff --git a/dist/worker.cjs b/dist/worker.cjs
-index 825526b2dfc3e91efc74b166a5f1c043d7a0ead6..b574cfac595f2fe070e7fe69c5bc4c1333301afc 100644
+index 825526b2dfc3e91efc74b166a5f1c043d7a0ead6..748668b0c2a36ff7de85dc0f4c4b4224bdc4298e 100644
 --- a/dist/worker.cjs
 +++ b/dist/worker.cjs
-@@ -281,7 +281,6 @@ class AgentServer {
+@@ -54,6 +54,12 @@ const MAX_RECONNECT_ATTEMPTS = 10;
+ const ASSIGNMENT_TIMEOUT = 7.5 * 1e3;
+ const UPDATE_LOAD_INTERVAL = 2.5 * 1e3;
+ const DRAIN_TIMEOUT = 60 * 60 * 1e3;
++// LiveKit keeps a worker registered while it can no longer write to it, and
++// every job assignment then fails. Its WebSocket answers pings, so pongs that
++// stop arriving reveal such a connection; terminating it lets the reconnect
++// loop register a working one.
++const HEARTBEAT_INTERVAL = 10 * 1e3;
++const HEARTBEAT_MISSED_PONGS = 3;
+ const PROJECT_TYPE = "nodejs";
+ const WORKER_PROTOCOL_VERSION = 1;
+ let localEotRunnerRegistered = false;
+@@ -281,7 +287,6 @@ class AgentServer {
          opts.loadThreshold = loadThreshold;
        }
      }
@@ -10,11 +107,53 @@ index 825526b2dfc3e91efc74b166a5f1c043d7a0ead6..b574cfac595f2fe070e7fe69c5bc4c13
      this.#inferenceExecutor = import_inference_proc_executor.InferenceProcExecutor.createIfNeeded();
      this.#procPool = new import_proc_pool.ProcPool(
        opts.agent,
+@@ -651,9 +656,28 @@ class AgentServer {
+         this.#logger.warn({ error: e }, "failed to measure CPU load");
+       });
+     }, UPDATE_LOAD_INTERVAL);
++    let unansweredPings = 0;
++    ws.on("pong", () => {
++      unansweredPings = 0;
++    });
++    const heartbeat = setInterval(() => {
++      if (unansweredPings >= HEARTBEAT_MISSED_PONGS) {
++        clearInterval(heartbeat);
++        this.#logger.warn(
++          { unansweredPings },
++          "worker connection stopped answering pings, reconnecting"
++        );
++        ws.terminate();
++        return;
++      }
++      if (ws.readyState !== import_ws.WebSocket.OPEN) return;
++      unansweredPings++;
++      ws.ping();
++    }, HEARTBEAT_INTERVAL);
+     try {
+       await close;
+     } finally {
++      clearInterval(heartbeat);
+       ws.removeAllListeners();
+     }
+   }
 diff --git a/dist/worker.js b/dist/worker.js
-index 78aeef83ed16858331c64e45644ca4393231e56a..52b5876daafa6c6c9663fcbb7c5fe94e60685bef 100644
+index 78aeef83ed16858331c64e45644ca4393231e56a..17df9a8805ec288a00ebfac48ddc0cb22ef0f267 100644
 --- a/dist/worker.js
 +++ b/dist/worker.js
-@@ -255,7 +255,6 @@ class AgentServer {
+@@ -28,6 +28,12 @@ const MAX_RECONNECT_ATTEMPTS = 10;
+ const ASSIGNMENT_TIMEOUT = 7.5 * 1e3;
+ const UPDATE_LOAD_INTERVAL = 2.5 * 1e3;
+ const DRAIN_TIMEOUT = 60 * 60 * 1e3;
++// LiveKit keeps a worker registered while it can no longer write to it, and
++// every job assignment then fails. Its WebSocket answers pings, so pongs that
++// stop arriving reveal such a connection; terminating it lets the reconnect
++// loop register a working one.
++const HEARTBEAT_INTERVAL = 10 * 1e3;
++const HEARTBEAT_MISSED_PONGS = 3;
+ const PROJECT_TYPE = "nodejs";
+ const WORKER_PROTOCOL_VERSION = 1;
+ let localEotRunnerRegistered = false;
+@@ -255,7 +261,6 @@ class AgentServer {
          opts.loadThreshold = loadThreshold;
        }
      }
@@ -22,3 +161,32 @@ index 78aeef83ed16858331c64e45644ca4393231e56a..52b5876daafa6c6c9663fcbb7c5fe94e
      this.#inferenceExecutor = InferenceProcExecutor.createIfNeeded();
      this.#procPool = new ProcPool(
        opts.agent,
+@@ -625,9 +630,28 @@ class AgentServer {
+         this.#logger.warn({ error: e }, "failed to measure CPU load");
+       });
+     }, UPDATE_LOAD_INTERVAL);
++    let unansweredPings = 0;
++    ws.on("pong", () => {
++      unansweredPings = 0;
++    });
++    const heartbeat = setInterval(() => {
++      if (unansweredPings >= HEARTBEAT_MISSED_PONGS) {
++        clearInterval(heartbeat);
++        this.#logger.warn(
++          { unansweredPings },
++          "worker connection stopped answering pings, reconnecting"
++        );
++        ws.terminate();
++        return;
++      }
++      if (ws.readyState !== WebSocket.OPEN) return;
++      unansweredPings++;
++      ws.ping();
++    }, HEARTBEAT_INTERVAL);
+     try {
+       await close;
+     } finally {
++      clearInterval(heartbeat);
+       ws.removeAllListeners();
+     }
+   }

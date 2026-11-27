@@ -30,6 +30,12 @@
   --color-app-info-hover: var(--app-info-hover);
   --color-app-focus: var(--app-focus);
   --color-app-danger: var(--app-danger);
+  --color-app-voice-island: var(--app-voice-island);
+  --color-app-voice-island-ink: var(--app-voice-island-ink);
+  --color-app-voice-island-control: var(--app-voice-island-control);
+  --color-app-voice-island-control-hover: var(--app-voice-island-control-hover);
+  --color-app-voice-end: var(--app-voice-end);
+  --color-app-voice-end-hover: var(--app-voice-end-hover);
   --color-app-success: var(--app-status-success-text);
   --color-app-warning: var(--app-status-warning-text);
   --color-app-work-surface: var(--app-work-surface);
@@ -155,7 +161,7 @@
   --app-pill-radius: 999px;
   --app-card-radius: 12px;
   --app-panel-radius: 16px;
-  --app-modal-radius: 8px;
+  --app-modal-radius: 16px;
   --app-typed-card-radius: 12px;
 
   /* Chat component tokens: the one place to tune how the chat looks.
@@ -428,6 +434,18 @@ a[href][aria-disabled="true"],
     border-color: var(--app-danger);
   }
 
+  /* A select reads as its value and chevron, with no box: it fills like a
+     ghost button on hover and while open, and keeps the red edge when it is
+     invalid. Typed comboboxes are inputs and keep their border. */
+  button.ui-field-control[role="combobox"]:not([aria-invalid="true"]) {
+    border-color: transparent;
+  }
+
+  button.ui-field-control[role="combobox"]:hover:not(:disabled),
+  button.ui-field-control[role="combobox"][aria-expanded="true"] {
+    background: hsl(var(--town-accent));
+  }
+
   /* Agent settings read as one 780px column (Town /assistant/settings) while
      the scroll container keeps its scrollbar at the panel edge. */
   .agent-settings-column {
@@ -548,7 +566,7 @@ a[href][aria-disabled="true"],
 .auth-form .ui-field-control {
   height: 2.75rem;
   border-color: hsl(var(--town-border-hover));
-  border-radius: 10px;
+  border-radius: var(--app-control-radius-large);
   background: hsl(var(--town-card));
   padding-inline-start: 0.875rem;
 }
@@ -578,7 +596,7 @@ a[href][aria-disabled="true"],
 .auth-form .auth-submit {
   height: 2.75rem;
   margin-top: 0.375rem;
-  border-radius: 10px;
+  border-radius: var(--app-button-radius-large);
 }
 
 .auth-local-account {
@@ -587,7 +605,7 @@ a[href][aria-disabled="true"],
 
 .auth-local-account .ui-button-large {
   height: 2.75rem;
-  border-radius: 10px;
+  border-radius: var(--app-button-radius-large);
 }
 
 .auth-divider {
@@ -599,9 +617,7 @@ a[href][aria-disabled="true"],
 }
 
 .auth-divider > span:not(:nth-child(2)) {
-  height: 1px;
   flex: 1;
-  background: hsl(var(--town-border-hover));
 }
 
 .auth-footer {
@@ -1376,7 +1392,6 @@ a[href][aria-disabled="true"],
   align-items: flex-start;
   gap: 12px;
   padding: 16px 16px 12px 20px;
-  border-bottom: 1px solid hsl(var(--town-border));
 }
 
 .app-dialog-title {
@@ -1437,27 +1452,20 @@ a[href][aria-disabled="true"],
   }
 }
 
-/* Template cards settle in on open, staggered by their position in the grid so
-   the shelf reads as one list arriving rather than a block appearing. */
-.template-card-enter {
-  animation: template-card-enter 240ms ease both;
-  animation-delay: calc(var(--template-card-index, 0) * 40ms);
+/* Live voice window: a new bubble and each newly arrived phrase fade in
+   whole, so the call does not pop in a packet at a time. */
+.voice-live-fade-in {
+  animation: voice-live-fade-in 200ms ease-out both;
 }
 
-@keyframes template-card-enter {
+@keyframes voice-live-fade-in {
   from {
     opacity: 0;
-    transform: translateY(6px);
-  }
-
-  to {
-    opacity: 1;
-    transform: none;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .template-card-enter {
+  .voice-live-fade-in {
     animation: none;
   }
 }
@@ -2176,7 +2184,7 @@ a[href][aria-disabled="true"],
 }
 
 .room-member-avatar[data-actor-kind="agent"] > [role="img"] {
-  border-radius: 5px;
+  border-radius: 20%;
 }
 
 .room-readable {
@@ -2283,12 +2291,6 @@ a[href][aria-disabled="true"],
 }
 
 .app-dialog.global-search {
-  width: min(560px, calc(100vw - 32px));
-  border-radius: 8px;
-}
-
-/* Provider key dialogs (Composio, voice) share the search dialog's width. */
-.app-dialog.app-key-dialog {
   width: min(560px, calc(100vw - 32px));
 }
 
@@ -2405,17 +2407,6 @@ a[href][aria-disabled="true"],
 /* The pinned badge sits after the room name and pops in (town-pill-pop). */
 .room-pin-badge {
   color: var(--app-muted);
-}
-
-/* The Room list header grows a hairline underline once the list scrolls. */
-.app-secondary-navigation-header {
-  box-shadow: 0 1px 0 transparent;
-  transition: box-shadow var(--app-micro-duration) var(--app-out-quint);
-}
-
-.app-secondary-navigation[data-scrolled="true"]
-  .app-secondary-navigation-header {
-  box-shadow: 0 1px 0 hsl(var(--town-border) / 0.6);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -2789,7 +2780,7 @@ a[href][aria-disabled="true"],
   display: inline;
   margin: 0;
   border: 0;
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   padding: 0;
   font: inherit;
   letter-spacing: inherit;
@@ -3498,6 +3489,13 @@ a[href][aria-disabled="true"],
 .select-pill:focus-visible {
   outline: none;
   box-shadow: 0 0 0 2px var(--app-ring);
+}
+
+/* A pill that opens a list draws no outline; choice pills keep theirs. */
+button.select-pill[role="combobox"],
+button.select-pill[role="combobox"]:hover:not(:disabled),
+button.select-pill[role="combobox"][aria-expanded="true"] {
+  border-color: transparent;
 }
 
 /* A pill that is one of several choices (weekdays, quick times) fills when
@@ -4524,9 +4522,10 @@ button.question-choice:focus-visible {
   }
 }
 
-/* A quiet pill for the one secondary action an Agent profile header offers:
-   hairline border and ink text at rest, a soft fill under the pointer. */
-.agent-publish-button {
+/* A quiet pill for the one secondary action a panel header offers, such as
+   sharing a Room: hairline border and ink text at rest, a soft fill under the
+   pointer. */
+.panel-header-action-button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -4545,12 +4544,12 @@ button.question-choice:focus-visible {
     border-color var(--app-micro-duration) ease;
 }
 
-.agent-publish-button:hover {
+.panel-header-action-button:hover {
   border-color: hsl(var(--town-foreground) / 0.15);
   background: hsl(var(--town-accent));
 }
 
-.agent-publish-button:focus-visible {
+.panel-header-action-button:focus-visible {
   outline: 2px solid var(--app-focus);
   outline-offset: 2px;
 }
@@ -5499,7 +5498,7 @@ button.question-choice:focus-visible {
   position: fixed;
   z-index: 50;
   padding: 5px 9px;
-  border-radius: 7px;
+  border-radius: var(--radius-md);
   background: var(--app-ink);
   color: #fdfdfc;
   font-size: 12px;
@@ -5566,16 +5565,10 @@ button.question-choice:focus-visible {
 }
 
 .voice-window-title {
-  background-color: #242527;
-  color: #f8f8f8;
-  font-size: 12px;
-  font-weight: 500;
-}
-/* A voice window inside the desktop app's page takes the window's own surface
-   for its bar instead of a browser-style dark frame. */
-:root[data-desktop-shell] .voice-window-title {
   background-color: var(--app-canvas);
   color: var(--app-ink);
+  font-size: 12px;
+  font-weight: 500;
   box-shadow: var(--town-shadow-outline);
   clip-path: inset(-1px -1px 0 -1px);
 }

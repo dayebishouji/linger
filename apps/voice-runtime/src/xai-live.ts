@@ -128,7 +128,7 @@ export function withLanguage(output: string, latestWords?: string) {
       : words;
   return `${output}
 
-If this result leads to another tool call for the same request, make that call now without a word, and speak only with the answer. When you speak, reply in the language of the user's latest words (“${quoted}”), every word except names of people, companies, products and apps, whatever language this result is in, and say what you did with I as its subject, the word for I in their language, even where that language usually leaves the subject out.`;
+If this result leads to another tool call for the same request, make that call now without a word. The request has already been acknowledged. Choose one for this response: a function call alone, in complete silence, or a spoken answer for the user. If a step succeeds but more work remains, or a read fails and another source is available, continue silently. Speak as soon as the whole request is fulfilled or you need a decision, permission or other help. On a partial failure that blocks progress, say what succeeded and what still needs attention. Leave recovered errors out of the final answer. When you speak, reply in the language of the user's latest words (“${quoted}”), every word except names of people, companies, products and apps, whatever language this result is in, and start the answer with its subject and the requested fact. For a meeting overview, start with what the participants discussed or decided; give the main point and at most one supporting detail. Omit source attributions and all commentary on reading, searching, sufficiency, or which material you used, even in the opening words. Tool fields such as Wiki summary, Quick Notes and transcript stay unspoken. Name a source only if the user asks for its identity or a disagreement between sources changes the answer. For an action the user requested, describe what you did with I as its subject.`;
 }
 
 const maximumQueuedEvents = 2_048;
@@ -146,6 +146,38 @@ const muteSilence = Buffer.alloc(inputRate * 0.7 * 2);
 // as JSON, and would say it aloud.
 const markupStart = "<tool_call>";
 const markupEnd = "</tool_call>";
+
+// After a tool call Grok sometimes writes its own marker for words it already
+// said, `<response_segment_0_already_spoken>…</response_segment_0_already_spoken>`,
+// around a repeat of them. The marker and the repeat are never said or shown.
+const spokenSegmentHead = "<response_segment_";
+const spokenSegmentOpen = /^<response_segment_\d+_already_spoken\s*>/;
+const spokenSegmentClose = /<\/response_segment_\d+_already_spoken\s*>/;
+const spokenSegmentStrayClose = /^<\/response_segment_\d+_already_spoken\s*>/;
+
+/**
+ * The length of an already-spoken marker `text` starts with, 0 while `text`
+ * may still become one (or a stray closing one), or undefined when it cannot.
+ */
+function spokenSegmentMarker(text: string): number | undefined {
+  const whole =
+    spokenSegmentOpen.exec(text) ?? spokenSegmentStrayClose.exec(text);
+  if (whole) return whole[0].length;
+  const head = text.startsWith("</")
+    ? "</" + spokenSegmentHead.slice(1)
+    : spokenSegmentHead;
+  if (text.length <= head.length) return head.startsWith(text) ? 0 : undefined;
+  if (!text.startsWith(head)) return undefined;
+  const after = text.slice(head.length);
+  const digits = /^\d*/.exec(after)![0];
+  const tail = after.slice(digits.length);
+  if (!digits) return tail === "" ? 0 : undefined;
+  const word = "_already_spoken";
+  return word.startsWith(tail) ||
+    (tail.startsWith(word) && /^\s*$/.test(tail.slice(word.length)))
+    ? 0
+    : undefined;
+}
 
 /**
  * The call in a tool call written as words, mapped to a known tool; values
@@ -206,6 +238,8 @@ interface UpdateRequest {
   tools: boolean;
 }
 
+type ResponseRequest = UpdateRequest | "tool_result";
+
 interface Response {
   id: string;
   /** An update composed with tell(). */
@@ -214,6 +248,8 @@ interface Response {
   updateId?: string;
   /** Whether it may call tools; an update said with tell() may not. */
   tools: boolean;
+  /** Interrupting this answer does not undo the preceding tool call. */
+  afterTool: boolean;
   audioStarted: boolean;
   canceled: boolean;
   /** The assistant item this response speaks, for truncation. */
@@ -225,6 +261,11 @@ interface Response {
   markup?: string;
   /** It wrote a tool call out: nothing more of it is said or shown. */
   silenced: boolean;
+  /**
+   * Inside an already-spoken marker: the words so far, kept only to find its
+   * end; neither they nor their audio are said or shown.
+   */
+  repeat?: string;
   /** Asked for after a call written as words could not run. */
   retry: boolean;
   /** It called a tool before it ended. */
@@ -233,6 +274,14 @@ interface Response {
 
 export const cutOffNote =
   "The user cut your last reply off before you called any tool: nothing it said you would do (starting a task, sending, opening, changing) has been done. If they still want it, call the tool now.";
+
+/**
+ * Closes the replayed Room history. Grok reads the replay as the same
+ * conversation, so a goodbye that ended the previous call ended this one at
+ * its first words unless the history is marked as before this call.
+ */
+export const newCallNote =
+  "A new voice call starts here. Everything above is earlier Room history from before this call: a goodbye or a call that ended there does not end this call. Answer what the user says from now on.";
 
 export class XaiLiveSession implements LiveSession {
   readonly #audioTransport: "binary" | "json";
@@ -259,11 +308,19 @@ export class XaiLiveSession implements LiveSession {
   private retrying = false;
   /** The assistant item whose audio plays last, for truncation. */
   private playingItemId?: string;
+  /**
+   * A local barge-in's cancel and truncation, held until the provider's VAD
+   * opens the input; see cancel(). The canceled response finishing, or a new
+   * one starting, also releases it, so a sound the provider never took for
+   * speech cannot leave it to land turns later.
+   */
+  #pendingInputEdit?: { response?: Response; run: () => void };
   /** Calls handed to the worker whose outputs have not come back yet. */
   private readonly pendingCalls = new Set<string>();
   private responseWanted = false;
   /** The update the wanted response says, if any. */
-  private wantedUpdate?: UpdateRequest;
+  private wantedResponse?: ResponseRequest;
+  private afterToolInstructions = "";
   /** Input items whose transcript the worker already received as final. */
   private readonly completedInputs = new Set<string>();
   private readonly inputTexts = new Map<string, string>();
@@ -398,14 +455,20 @@ export class XaiLiveSession implements LiveSession {
       this.socket.on("message", onMessage);
       this.socket.on("close", onClose);
     });
+    const toolNames = [
+      ...options.tools,
+      ...serverTools.map((tool) => ({ name: tool.type })),
+    ];
+    const now = new Date();
+    // A response override replaces the full session instructions, including permissions.
+    this.afterToolInstructions = withModelNames(
+      realtimeInstructions(options.instructions, toolNames, now, "after_tool"),
+    );
     this.send({
       type: "session.update",
       session: {
         instructions: withModelNames(
-          realtimeInstructions(options.instructions, [
-            ...options.tools,
-            ...serverTools.map((tool) => ({ name: tool.type })),
-          ]),
+          realtimeInstructions(options.instructions, toolNames, now),
         ),
         voice: options.voice,
         reasoning: { effort: options.reasoningEffort },
@@ -426,7 +489,8 @@ export class XaiLiveSession implements LiveSession {
       },
     });
     await updated;
-    for (const message of historyPairs(options.history))
+    const history = historyPairs(options.history);
+    for (const message of history)
       this.send({
         type: "conversation.item.create",
         item: {
@@ -440,6 +504,7 @@ export class XaiLiveSession implements LiveSession {
           ],
         },
       });
+    if (history.length > 0) this.system(newCallNote);
   }
 
   appendAudio(frame: Int16Array) {
@@ -459,16 +524,48 @@ export class XaiLiveSession implements LiveSession {
     this.muted = false;
   }
 
-  cancel() {
+  cancel({
+    playedMs,
+    localSpeech,
+  }: { playedMs?: number; localSpeech?: boolean } = {}) {
+    if (this.wantedResponse === "tool_result") {
+      this.responseWanted = false;
+      this.wantedResponse = undefined;
+    }
     const response = this.response;
-    if (!response || response.canceled) return;
-    // Deltas still in flight for this response are dropped locally.
-    response.canceled = true;
-    this.send({ type: "response.cancel" });
+    const active = response && !response.canceled ? response : undefined;
+    if (active) active.canceled = true;
+    const itemId = this.playingItemId;
+    const edit = () => {
+      if (active) {
+        if (!localSpeech) this.send({ type: "response.cancel" });
+        this.noteCutOff(active);
+      }
+      if (itemId && playedMs !== undefined) this.truncate(itemId, playedMs);
+    };
+    // Editing the conversation before server VAD opens the input can stall its
+    // interim transcripts until the user stops. Silence old output locally now.
+    if (!localSpeech) return edit();
+    this.#releaseInputEdit();
+    this.#pendingInputEdit = { response: active, run: edit };
+  }
+
+  #releaseInputEdit() {
+    const pending = this.#pendingInputEdit;
+    this.#pendingInputEdit = undefined;
+    pending?.run();
+  }
+
+  private noteCutOff(response: Response) {
     // Grok speaks before it calls a tool: a reply cut off while speaking
     // never made the call it announced, though the model remembers saying it.
     // Marked as the user's, like tell(): Grok weighs a system item less.
-    if (response.tools && response.audioStarted && !response.called)
+    if (
+      response.tools &&
+      response.audioStarted &&
+      !response.afterTool &&
+      !response.called
+    )
       this.send({
         type: "conversation.item.create",
         item: {
@@ -484,11 +581,10 @@ export class XaiLiveSession implements LiveSession {
     this.requestResponse();
   }
 
-  truncate(audioMs: number) {
-    if (!this.playingItemId) return;
+  private truncate(itemId: string, audioMs: number) {
     this.send({
       type: "conversation.item.truncate",
-      item_id: this.playingItemId,
+      item_id: itemId,
       content_index: 0,
       audio_end_ms: Math.max(0, Math.round(audioMs)),
     });
@@ -597,7 +693,7 @@ export class XaiLiveSession implements LiveSession {
     this.updateRound = undefined;
     if (!reply) return;
     this.requestResponse(
-      update === undefined ? undefined : { id: update, tools: true },
+      update === undefined ? "tool_result" : { id: update, tools: true },
     );
   }
 
@@ -618,14 +714,15 @@ export class XaiLiveSession implements LiveSession {
   async close() {
     if (this.closing) return;
     this.closing = true;
+    this.#pendingInputEdit = undefined;
     this.socket.close(1000);
     this.end();
   }
 
-  private requestResponse(update?: UpdateRequest) {
+  private requestResponse(update?: ResponseRequest) {
     if (this.response) {
       this.responseWanted = true;
-      this.wantedUpdate = update;
+      this.wantedResponse = update;
     } else this.createResponse(update);
   }
 
@@ -633,8 +730,16 @@ export class XaiLiveSession implements LiveSession {
    * An update's response carries its ID as metadata, which xAI echoes on
    * response.created and response.done, also when it is canceled.
    */
-  private createResponse(update?: UpdateRequest) {
+  private createResponse(update?: ResponseRequest) {
     if (!update) return this.send({ type: "response.create" });
+    if (update === "tool_result")
+      return this.send({
+        type: "response.create",
+        response: {
+          instructions: this.afterToolInstructions,
+          metadata: { tool_result: "true" },
+        },
+      });
     const tools = update.tools ? "auto" : "none";
     this.send({
       type: "response.create",
@@ -662,6 +767,7 @@ export class XaiLiveSession implements LiveSession {
         return;
       case "input_audio_buffer.speech_started": {
         const itemId = text("item_id");
+        this.#releaseInputEdit();
         this.lastInputId = itemId;
         return this.push({ type: "speech_started", itemId });
       }
@@ -681,11 +787,13 @@ export class XaiLiveSession implements LiveSession {
         const itemId = text("item_id");
         this.inputTexts.set(itemId, text("transcript"));
         this.latestWords = text("transcript") || this.latestWords;
-        // Interim segments also arrive as "completed" while still in progress.
-        if (event.status === "completed") this.completeInput(itemId);
+        // Interim segments also arrive as "completed", marked in_progress; the
+        // final one carries no status at all, so only in_progress is interim.
+        if (event.status !== "in_progress") this.completeInput(itemId);
         return;
       }
       case "response.created": {
+        this.#releaseInputEdit();
         const response = event.response as Record<string, unknown> | undefined;
         const metadata = response?.metadata as
           | Record<string, unknown>
@@ -696,7 +804,7 @@ export class XaiLiveSession implements LiveSession {
             ? metadata.update_id
             : undefined;
         const update = updateId !== undefined;
-        const tools = !update || metadata?.tools !== "none";
+        const tools = metadata?.tools !== "none";
         // A server-started reply supersedes calls nobody answers any more.
         if (!update) this.pendingCalls.clear();
         this.response = {
@@ -704,6 +812,7 @@ export class XaiLiveSession implements LiveSession {
           update,
           updateId,
           tools,
+          afterTool: metadata?.tool_result === "true",
           audioStarted: false,
           canceled: false,
           held: "",
@@ -731,7 +840,8 @@ export class XaiLiveSession implements LiveSession {
       }
       case "response.output_audio.delta": {
         const response = this.outputResponse();
-        if (!response || response.silenced) return;
+        if (!response || response.silenced || response.repeat !== undefined)
+          return;
         // A delta may end inside a sample; carry that byte to the next one.
         const bytes = Buffer.concat([
           this.audioCarry,
@@ -745,10 +855,11 @@ export class XaiLiveSession implements LiveSession {
         else this.pushAudio(response, pcm);
         return;
       }
-      case "response.output_audio.done":
-        if (this.outputResponse()?.audioStarted)
-          this.push({ type: "audio_done" });
+      case "response.output_audio.done": {
+        const response = this.outputResponse();
+        if (response?.audioStarted) this.push({ type: "audio_done" });
         return;
+      }
       case "response.output_audio_transcript.delta":
       case "response.output_text.delta":
       case "response.text.delta": {
@@ -759,7 +870,7 @@ export class XaiLiveSession implements LiveSession {
       case "response.function_call_arguments.done": {
         const response = this.outputResponse();
         // Server-side tools already ran on xAI's side within this reply.
-        if (!response || serverToolNames.has(text("name"))) return;
+        if (!response?.tools || serverToolNames.has(text("name"))) return;
         const call: LiveFunctionCall = {
           callId: text("call_id"),
           name: workerNames[text("name")] ?? text("name"),
@@ -771,6 +882,8 @@ export class XaiLiveSession implements LiveSession {
       case "response.done": {
         const response = this.response;
         this.response = undefined;
+        if (response && this.#pendingInputEdit?.response === response)
+          this.#releaseInputEdit();
         const status = (event.response as Record<string, unknown> | undefined)
           ?.status;
         const canceled = response?.canceled === true || status === "cancelled";
@@ -788,9 +901,9 @@ export class XaiLiveSession implements LiveSession {
             : { updateId: response.updateId }),
         });
         if (this.responseWanted && this.pendingCalls.size === 0) {
-          const update = this.wantedUpdate;
+          const update = this.wantedResponse;
           this.responseWanted = false;
-          this.wantedUpdate = undefined;
+          this.wantedResponse = undefined;
           this.createResponse(update);
         } else if (this.waitingTell) {
           const { cue, update } = this.waitingTell;
@@ -843,6 +956,18 @@ export class XaiLiveSession implements LiveSession {
     response.held = "";
     let said = "";
     while (rest) {
+      if (response.repeat !== undefined) {
+        const repeat = response.repeat + rest;
+        const end = spokenSegmentClose.exec(repeat);
+        if (!end) {
+          // Only the tail can still hold the start of its closing marker.
+          response.repeat = repeat.slice(-64);
+          break;
+        }
+        response.repeat = undefined;
+        rest = repeat.slice(end.index + end[0].length);
+        continue;
+      }
       if (response.markup !== undefined) {
         const written = response.markup + rest;
         const end = written.indexOf(markupEnd);
@@ -859,6 +984,7 @@ export class XaiLiveSession implements LiveSession {
       const plain = at < 0 ? rest : rest.slice(0, at);
       if (!response.silenced) said += plain;
       rest = rest.slice(plain.length);
+      const marker = rest ? spokenSegmentMarker(rest) : undefined;
       if (rest.startsWith(markupStart)) {
         if (said) this.pushText(response, said);
         said = "";
@@ -866,7 +992,15 @@ export class XaiLiveSession implements LiveSession {
         response.heldAudio = [];
         response.markup = "";
         rest = rest.slice(markupStart.length);
-      } else if (rest && markupStart.startsWith(rest)) {
+      } else if (marker) {
+        if (said) this.pushText(response, said);
+        said = "";
+        // The audio held with the marker's start is the repeat beginning.
+        response.heldAudio = [];
+        // An opening marker starts a repeat; a stray closing one is dropped.
+        if (!rest.startsWith("</")) response.repeat = "";
+        rest = rest.slice(marker);
+      } else if (rest && (markupStart.startsWith(rest) || marker === 0)) {
         response.held = rest;
         rest = "";
       } else if (rest) {
@@ -889,14 +1023,21 @@ export class XaiLiveSession implements LiveSession {
 
   private pushText(response: Response, text: string) {
     // Words can precede the audio; they still belong to an update.
-    this.push({ type: "text_delta", text, update: response.update });
+    this.push({
+      type: "text_delta",
+      text,
+      update: response.update,
+    });
   }
 
   private pushAudio(response: Response, pcm: Int16Array) {
     if (!response.audioStarted) {
       response.audioStarted = true;
       this.playingItemId = response.itemId;
-      this.push({ type: "audio_started", update: response.update });
+      this.push({
+        type: "audio_started",
+        update: response.update,
+      });
     }
     this.push({ type: "audio_delta", pcm });
   }
@@ -928,6 +1069,7 @@ export class XaiLiveSession implements LiveSession {
   /** Hands a call to the worker, as part of the reply or update under way. */
   private handOver(response: Response, call: LiveFunctionCall) {
     response.called = true;
+    if (response.afterTool) response.silenced = true;
     this.pendingCalls.add(call.callId);
     if (response.updateId !== undefined)
       this.updateCalls.set(call.callId, response.updateId);

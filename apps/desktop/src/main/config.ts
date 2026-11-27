@@ -28,6 +28,9 @@ export type SavedEnrollment = z.infer<typeof savedEnrollment>;
 // are dropped on read.
 const desktopConfig = z.object({
   serverUrl: z.string().url().optional(),
+  // Whether serverUrl points to a local server installed by this app, used to
+  // detect an orphaned local config when the installation home is missing.
+  localServer: z.boolean().optional(),
   displayName: z.string().optional(),
   computerId: z.string().optional(),
   tenantId: z.string().optional(),
@@ -52,8 +55,12 @@ const desktopConfig = z.object({
   // PI_CODING_AGENT_DIR). The Computer daemon runs with them.
   runtimeEnvironment: z.record(z.string(), z.string()).optional(),
   // The runtime the person chose in that installation; the daemon marks it
-  // so TeamHub places Another Me on it.
-  preferredRuntime: z.enum(["codex", "claude", "pi"]).optional(),
+  // so TeamHub places Another Me on it. A value this version does not offer
+  // is dropped, not the whole file.
+  preferredRuntime: z
+    .enum(["codex", "claude", "pi"])
+    .optional()
+    .catch(undefined),
   // The backup of the earlier Simplex app's data that the local server
   // already told about and enrolled this computer again for.
   legacyBackup: z.string().optional(),
@@ -67,6 +74,17 @@ const desktopConfig = z.object({
   diagnosticsUploadUrl: z
     .string()
     .refine(isUploadUrl)
+    .optional()
+    .catch(undefined),
+  // Persisted when a Windows NVIDIA driver update requires a reboot, so the
+  // next launch after reboot can auto-recheck local models and surface a ready
+  // notice for the model the person tried to unlock.
+  pendingDriverUpdate: z
+    .object({
+      targetVersion: z.string().min(1),
+      resumeModelId: z.string().optional(),
+      updatedAt: z.string().min(1),
+    })
     .optional()
     .catch(undefined),
   window: z

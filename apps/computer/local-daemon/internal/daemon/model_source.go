@@ -10,6 +10,8 @@ import (
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/linger/transport"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/localmodels"
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/protocol"
+	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider"
+	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/provider/redact"
 	wire "github.com/simplexai-labs/linger/contracts-go/runnergateway"
 )
 
@@ -33,7 +35,7 @@ type ModelSourceManager interface {
 // public Run failure code the tool's structured code maps to, empty when
 // none fits, so the Room names the cause instead of a refused connection
 // the Runtime cannot classify.
-func (d *Daemon) ensureModelGateway(ctx context.Context, runtimeType string) (string, error) {
+func (d *Daemon) ensureModelGateway(ctx context.Context, runtimeType string, modelGatewayUnavailable bool) (string, error) {
 	if d.modelSource == nil {
 		return "", nil
 	}
@@ -45,12 +47,15 @@ func (d *Daemon) ensureModelGateway(ctx context.Context, runtimeType string) (st
 	if !errors.As(err, &sourceErr) {
 		return "", err
 	}
-	slog.Warn("runner.model_gateway.unavailable", "runtime_type", runtimeType, "code", sourceErr.Code)
+	slog.Warn("runner.model_gateway.unavailable", "runtime_type", runtimeType, "code", sourceErr.Code, "detail", receiptReason(redact.Text(sourceErr.Message)))
 	switch sourceErr.Code {
 	case "BYOK_UNREACHABLE", "NETWORK_UNAVAILABLE":
 		return "network_error", err
 	case "BYOK_AUTH_FAILED":
 		return "authentication_required", err
+	}
+	if modelGatewayUnavailable {
+		return "model_gateway_unavailable", err
 	}
 	return "", err
 }
@@ -179,9 +184,14 @@ func (d *Daemon) handleModelSourceCommand(ctx context.Context, stream transport.
 		return sendFailed(localmodels.CodeToolFailed, "Could not complete the model source action on this Computer.", true)
 	}
 
-	if status != nil && !d.byokEndpoint.Load() {
-		// An Agent Service that predates BYOK paths rejects the unknown keys.
-		status.Byok.Path, status.Byok.Endpoint = "", ""
+	if status != nil {
+		if !d.byokEndpoint.Load() {
+			// An Agent Service that predates BYOK paths rejects the unknown keys.
+			status.Byok.Path, status.Byok.Endpoint = "", ""
+		}
+		if !d.dynamicReasoningEfforts.Load() && status.ReasoningEffort != "" && !provider.LegacyRuntimeReasoningEffort(status.ReasoningEffort) {
+			status.ReasoningEffort = ""
+		}
 	}
 	frame := wire.CapabilityModelSourceSucceeded{
 		ProtocolVersion: request.ProtocolVersion,

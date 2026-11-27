@@ -714,46 +714,34 @@ function installSeedRoutes(server: TeamHubTestServer, seed: TeamHubTestSeed) {
         })),
       ),
     )
-    .on(
-      "GET",
-      "/v0/tenants/{tenantId}/agents/{agentId}/skill-bindings",
-      ({ params }) => {
-        const agent = seed.tenantAgents.find(
-          (item) => item.actor.id === params.agentId,
-        );
-        if (!agent) return notFound("AGENT_NOT_FOUND");
-        return {
-          agent_actor_id: agent.actor.id,
-          binding_version: 1,
-          items: agent.skill_bindings.flatMap((item) =>
-            item.is_default
-              ? []
-              : [
-                  {
-                    agent_actor_id: agent.actor.id,
-                    binding_version: 1,
-                    config: {},
-                    enabled: true,
-                    id: `binding-${agent.actor.id}-${item.skill_id}`,
-                    skill: {
-                      manifest_version: item.manifest_version,
-                      skill_id: item.skill_id,
-                    },
-                    tenant_id: params.tenantId,
-                    updated_at: agent.updated_at,
-                    updated_by_actor_id: agent.created_by.id,
-                  },
-                ],
-          ),
-        };
-      },
-    )
     .on("GET", "/v0/tenants/{tenantId}/skill-manifests", () =>
       page(seed.skillManifests),
     )
     .on("GET", "/v0/tenants/{tenantId}/local-computers", () => ({
       items: seed.localComputers,
     }))
+    .on(
+      "GET",
+      "/v0/tenants/{tenantId}/local-computers/{computerId}/local-models",
+      ({ params }) => {
+        const computer = seed.localComputers.find(
+          (item) => item.computer_id === params.computerId,
+        );
+        if (!computer) return notFound("LOCAL_COMPUTER_NOT_FOUND");
+        return {
+          available: false,
+          computer: {
+            computer_id: computer.computer_id,
+            display_name: computer.display_name,
+            status: computer.status,
+          },
+          models: [],
+          pools: [],
+          reason: { code: "TOOL_NOT_INSTALLED" as const },
+          viewer_is_owner: true,
+        };
+      },
+    )
     .on(
       "GET",
       "/v0/tenants/{tenantId}/local-computers/{computerId}/model-source",
@@ -768,14 +756,6 @@ function installSeedRoutes(server: TeamHubTestServer, seed: TeamHubTestSeed) {
           viewer_is_owner: true,
         };
       },
-    )
-    .on("GET", "/v0/tenants/{tenantId}/agent-templates", () => ({
-      items: seed.agentTemplates,
-    }))
-    .on(
-      "GET",
-      "/v0/tenants/{tenantId}/agent-templates/{templateId}/skill-imports",
-      () => ({ items: [] }),
     )
     .on("GET", "/v0/tenants/{tenantId}/another-me", () => {
       const agent = seed.tenantAgents.find(

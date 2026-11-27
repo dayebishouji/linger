@@ -41,6 +41,14 @@ scripts/ci/desktop-release.sh publish desktop-v0.16.36 --notes-file notes.md
   `scripts/ci/desktop-release.sh publish` validates the uploaded assets,
   attaches the release notes, marks it as the latest release, and cleans up
   matching `desktop-v<version>-rc.*` prereleases and tags.
+- While the desktop app is in Beta, GitHub Releases carry `(Beta)` in the title
+  (`Linger Desktop <version> (Beta)`) and `notes.md` should open with a short
+  Beta notice to set expectations for new users. Keep stable releases
+  non-prerelease so `releases/latest` and auto-updates continue to work.
+- Before publishing a stable release, upgrade the previous stable release to
+  the candidate on each platform following the
+  [upgrade recipe](../.agents/skills/verify-linger/features/desktop-and-installer.md#upgrade-from-the-previous-release);
+  a fresh install does not catch state an earlier release left behind.
 - The version comes from the tag. The build writes it into
   `apps/desktop/package.json` for packaging and restores the file afterwards, so
   no version commit is needed.
@@ -50,33 +58,39 @@ scripts/ci/desktop-release.sh publish desktop-v0.16.36 --notes-file notes.md
 ## How the workflow runs
 
 The workflow runs for `desktop-v*` tags and from Actions → Desktop release →
-Run workflow. Its `build` (`darwin-arm64`, `linux-x64`) and `build-win32`
-(`win32-x64`) jobs run on `ubuntu-24.04` (the macOS and Windows runners have no
-Docker), pull the prebuilt `dmgtool` and `wintool` images from GHCR (published
-by [`.github/workflows/desktop-packaging-images.yml`](../.github/workflows/desktop-packaging-images.yml)
+Run workflow. `prepare` validates the version and stops before building when
+an official `simplexai-labs/linger` publish lacks the required macOS signing,
+notarization, or update-manifest secrets. Its `build` (`darwin-arm64`,
+`linux-x64`) and `build-win32` (`win32-x64`) jobs run on `ubuntu-24.04` (the
+macOS and Windows runners have no Docker), pull the prebuilt `dmgtool` and
+`wintool` images from GHCR (published by
+[`.github/workflows/desktop-packaging-images.yml`](../.github/workflows/desktop-packaging-images.yml)
 whenever a packaging Dockerfile changes, with automatic fallback to local
-`docker build`), and keep
-the files as workflow artifacts for 14 days: `desktop-<target>`, a zip of
-every file for the platform (with the Windows portable archive split into
-`desktop-win32-x64-portable` so `desktop-win32-x64` carries only the Setup and
-its `windows-setup.sha256` digest), and the installer on its own, not zipped
-(the `.dmg`, the `-setup.exe`, the Linux `.tar.gz`), for testers to download
-directly. `windows-smoke` depends only on `prepare` and `build-win32`, so it
-starts as soon as `win32-x64` finishes without waiting for `darwin-arm64`; it
-downloads `desktop-win32-x64`, verifies the Setup
-against `windows-setup.sha256`, and installs those bytes silently under a fresh
-standard user on `windows-2022`. It requests only packaged Pi preparation and
-checks the real Pi RPC handshake (`get_state`, `get_commands`) and the
-registered `mcp` command from the bundled managed MCP extension, with no
-`NODE_PATH` override. It starts no full Linger services, uses no model
-credentials, downloads no model weights, and does not verify the graphical
-installer, model inference, restart persistence, or uninstallation. `release`
-requires `windows-smoke` to pass, downloads `desktop-*`, checks the same
-`windows-setup.sha256` digest before removing that file, writes
-`SHA256SUMS.txt`, and creates the GitHub Release (as a draft for stable tags or
-published prerelease for hyphenated tags; reruns upload files to an existing
-release with `--clobber`). A manual run creates a release only with `publish`
-set, and a `publish=false` run still executes `windows-smoke`.
+`docker build`), notarize and staple `Linger.app` (`Contents/CodeResources`)
+before building the DMG and then sign, notarize, and staple the DMG in a second
+Apple submission (overlapping `.app.tar.gz` creation with DMG packaging so both
+the DMG and the nested app work offline without CloudKit lookup), and upload
+each release file once as an uncompressed workflow
+artifact for 14 days (under its exact filename, such as the `.dmg`, the
+`-setup.exe`, or the Linux `.tar.gz`), so testers download the installer
+directly and `windows-smoke` / `release` consume the same artifact without
+duplicate uploads. `windows-smoke` depends only on `prepare` and `build-win32`,
+so it starts as soon as `win32-x64` finishes without waiting for `darwin-arm64`;
+it downloads `Linger-<version>-windows-x64-setup.exe` and `windows-setup.sha256`,
+verifies the Setup against `windows-setup.sha256`, and installs those bytes
+silently under a fresh standard user on `windows-2022`. It requests only
+packaged Pi preparation and checks the real Pi RPC handshake (`get_state`,
+`get_commands`) and the registered `mcp` command from the bundled managed MCP
+extension, with no `NODE_PATH` override. It starts no full Linger services,
+uses no model credentials, downloads no model weights, and does not verify the
+graphical installer, model inference, restart persistence, or uninstallation.
+`release` requires `windows-smoke` to pass, downloads every `Linger-<version>-*`
+artifact and `windows-setup.sha256`, checks the same digest before removing
+that file, writes `SHA256SUMS.txt`, and creates the GitHub Release (as a draft
+for stable tags or published prerelease for hyphenated tags; reruns upload
+files to an existing release with `--clobber`). A manual run creates a release
+only with `publish` set, and a `publish=false` run still executes
+`windows-smoke`.
 
 The release goes to `RELEASE_REPO`, `simplexai-labs/linger` by default:
 
@@ -107,10 +121,10 @@ that runs the workflow:
 | `LINGER_DIAGNOSTICS_UPLOAD_URL` | secret               | no                                        | https URL of the hosted diagnostics receiver ([diagnostics-upload.md](diagnostics-upload.md)) that the build carries. A secret, so the address stays masked in logs. Without it Send Diagnostics is hidden unless `config.json` names a receiver. |
 | `RELEASE_REPO`                  | variable             | no                                        | `owner/name` that receives the release; `simplexai-labs/linger` when unset.                                                                                                                                                                       |
 | `LINGER_RELEASE_TOKEN`          | secret               | when `RELEASE_REPO` is another repository | Fine-grained token for `RELEASE_REPO` only, with Contents: read and write. Not needed in simplexai-labs/linger itself.                                                                                                                            |
-| `MACOS_DEVELOPER_ID_P12_BASE64` | secret               | no                                        | Base64 of the Developer ID `.p12`. Without it the app is signed ad hoc.                                                                                                                                                                           |
+| `MACOS_DEVELOPER_ID_P12_BASE64` | secret               | official publish                          | Base64 of the Developer ID `.p12`. Required when publishing to `simplexai-labs/linger`; optional on forks or `publish=false` runs (ad-hoc signed without it).                                                                                     |
 | `MACOS_DEVELOPER_ID_PASSWORD`   | secret               | with the `.p12`                           | Password of that `.p12`.                                                                                                                                                                                                                          |
-| `MACOS_NOTARY_KEY_JSON`         | secret               | no                                        | App Store Connect API key JSON; needs the Developer ID.                                                                                                                                                                                           |
-| `DESKTOP_UPDATE_KEY_PEM`        | secret               | for auto-update                           | Ed25519 private key (PEM) that signs `manifest.json`. Without it the release has no manifest and installed apps are not offered it.                                                                                                               |
+| `MACOS_NOTARY_KEY_JSON`         | secret               | official publish                          | App Store Connect API key JSON; needs the Developer ID. Required when publishing to `simplexai-labs/linger`; optional on forks or `publish=false` runs.                                                                                           |
+| `DESKTOP_UPDATE_KEY_PEM`        | secret               | official publish                          | Ed25519 private key (PEM) that signs `manifest.json`. Required when publishing to `simplexai-labs/linger`; on forks without it the release has no manifest and installed apps are not offered it.                                                 |
 | `WINDOWS_SIGNING_P12_BASE64`    | secret               | no                                        | Base64 of an Authenticode `.p12`. Without it the setup program is unsigned.                                                                                                                                                                       |
 | `WINDOWS_SIGNING_PASSWORD`      | secret               | with the `.p12`                           | Password of that `.p12`.                                                                                                                                                                                                                          |
 
@@ -230,15 +244,15 @@ linked; verify the file bytes and Agent logs separately with
 
 ## Release Files
 
-| File                                        | Contents                                                        |
-| ------------------------------------------- | --------------------------------------------------------------- |
-| `Linger-<version>-macos-arm64.dmg`          | macOS 14.0 or later, Apple silicon                              |
-| `Linger-<version>-linux-x64.tar.gz`         | Linux x64 (glibc 2.35 or newer for the bundled Native services) |
-| `Linger-<version>-windows-x64-setup.exe`    | Windows x64 per-user installer                                  |
-| `Linger-<version>-windows-x64-portable.zip` | Windows x64 folder to run without installing                    |
-| `Linger-<version>-macos-arm64.app.tar.gz`   | macOS app the updater swaps in                                  |
-| `manifest.json`, `manifest.json.sig`        | only with the update key: the [auto-update](#auto-update) feed  |
-| `SHA256SUMS.txt`                            | SHA-256 of every file above                                     |
+| File                                        | Contents                                                       |
+| ------------------------------------------- | -------------------------------------------------------------- |
+| `Linger-<version>-macos-arm64.dmg`          | macOS 14.0 or later, Apple silicon                             |
+| `Linger-<version>-linux-x64.tar.gz`         | Linux x64 (requires glibc 2.35 or newer)                       |
+| `Linger-<version>-windows-x64-setup.exe`    | Windows x64 per-user installer                                 |
+| `Linger-<version>-windows-x64-portable.zip` | Windows x64 folder to run without installing                   |
+| `Linger-<version>-macos-arm64.app.tar.gz`   | macOS app the updater swaps in                                 |
+| `manifest.json`, `manifest.json.sig`        | only with the update key: the [auto-update](#auto-update) feed |
+| `SHA256SUMS.txt`                            | SHA-256 of every file above                                    |
 
 Each package bundles the source package, PostgreSQL, voice tools, TeamHub and
 the Native services as described in
@@ -326,9 +340,10 @@ manifest must be signed by the same key.
 The `release` job signs `manifest.json` with `DESKTOP_UPDATE_KEY_PEM`
 (`desktop-release.sh manifest`) after all three packages are built, and
 refuses a key whose public half is not `UPDATE_PUBLIC_KEY`, since installed
-apps would reject its signature. Without the secret the job logs a warning and
-publishes the release without a manifest. Make a new pair only when the key is
-lost, and ship the new public key in a release first:
+apps would reject its signature. Official `simplexai-labs/linger` publishes
+fail fast when the secret is missing; on forks without the secret, the job logs
+a warning and publishes the release without a manifest. Make a new pair only
+when the key is lost, and ship the new public key in a release first:
 
 ```sh
 openssl genpkey -algorithm ed25519 -out ed25519.pem
@@ -365,23 +380,33 @@ repository root.
 
 ### Source Package
 
-Release builds set `LINGER_SOURCE_ARCHIVE_URL` (https) and
-`LINGER_SOURCE_ARCHIVE_SHA256` before `node build.mjs`. Produce them from the
-release tag in the repository root:
+Release builds bundle a minimal source skeleton inside the app and compile the
+Native runtime and TeamHub binaries from a full source archive of the same
+commit. Produce both from the release tag in the repository root:
 
 ```sh
 SOURCE_ARCHIVE_REF=v1.2.3 \
 SOURCE_ARCHIVE_URL_BASE=https://github.com/simplexai-labs/linger/releases/download/v1.2.3 \
   make source-archive
+node scripts/prepare-source-archive.mjs --ref v1.2.3 --mode minimal \
+  --output .linger-runtime/source-archive/shipped
 ```
 
-Upload `.linger-runtime/source-archive/linger-v1.2.3.tar.gz` to that release
-and take both values from `source-archive.json` next to it. One commit always
-gives the same digest. To ship the package inside the app instead (about
-45 MB more, no hosting needed), set `LINGER_SOURCE_ARCHIVE_FILE` to the
-archive; the build copies it beside the installer and pins its digest. Without
-either (and without `LINGER_CHECKOUT`) the build does not offer a
-local install.
+`scripts/ci/desktop-release.sh` sets `LINGER_SOURCE_ARCHIVE_FILE` to the
+`--mode minimal` archive (an 8-file runtime skeleton shipped inside the app so
+installers do not need to ship or unpack the full repository) and sets
+`LINGER_BUILD_SOURCE_ARCHIVE_FILE` to the full archive so `node build.mjs`
+compiles TeamHub and the Native runtime from it while recording the shipped
+skeleton's digest. Alternatively, set `LINGER_SOURCE_ARCHIVE_URL` (https) and
+`LINGER_SOURCE_ARCHIVE_SHA256` from `source-archive.json` to download the source
+package at install time; one commit always gives the same digest. Without
+either (and without `LINGER_CHECKOUT`) the build does not offer a local install.
+
+The staged Computer tools (`cli/computer-tools/` and `runtime/bin/node`) also
+ship the bundled Pi 1.5.2 runtime (`cli/computer-tools/bin/pi`, or `bin/pi.exe`
+on Windows) running on the bundled Node.js runtime, so local setup and the
+Daemon can use Pi immediately without downloading npm packages while still
+preferring a user-installed or newer harness-managed Pi when present.
 
 A downloaded source package can have a dependency store for each platform
 beside it, so the native install of its packages needs no registry. Build it
@@ -434,7 +459,12 @@ finds `cli/computer-tools/` (with its frozen `manifest.json`) and
 daemon from `resources/computer/`, so every package carries them as
 `resources/cli/computer-tools/` and `resources/runtime/` (on macOS under
 `Contents/Resources/`). Without them the daemon still starts and logs
-`computer_tools.missing` in `computer-daemon.log`.
+`computer_tools.missing` in `computer-daemon.log`. On Windows,
+`packaging/win/package.py` also downloads, SHA-256-verifies, and unpacks
+portable PowerShell 7.6.10 LTS (`PowerShell-7.6.10-win-x64.zip`, cached in
+`~/.cache/linger-desktop`, optional `PWSH_MIRROR` override) into
+`resources/runtime/pwsh/pwsh.exe`, which the Daemon appends to the end of
+Windows Runtime `PATH` as the default `pwsh` fallback.
 
 `build.mjs` stages them for each daemon target into
 `dist/computer-tools/<target>/` (`scripts/stage-computer-tools.mjs`) with
@@ -453,8 +483,18 @@ finished `.tar.gz`, `.zip` or update archive for them; a package without them
 fails.
 On macOS the tools' Node.js is signed with `node-entitlements.plist`, and Cua's
 driver (`CuaDriver.app` and the standalone `cua-driver`) keeps Cua's own
-Developer ID signature, which macOS grants Accessibility and Screen Recording
-to. Compressed, they add about 66 MB to the Linux archive, 73 MB to the
+Developer ID signature. Standalone installations grant permissions to CuaDriver.
+Packaged Linger runs the embedded driver with Linger's permissions.
+Deploy TeamHub before distributing this Desktop build, including on self-hosted
+installations. If an older TeamHub issued a CuaDriver card for this Desktop,
+request a fresh card after upgrading TeamHub.
+
+When enabling Linger in System Settings under Screen Recording, choose
+**Quit & Reopen** if macOS offers it. If you chose **Later** and the card
+still asks you to open Settings, quit Linger completely and reopen it.
+This restarts the embedded driver with the new grant.
+
+Compressed, they add about 66 MB to the Linux archive, 73 MB to the
 Windows zip, 46 MB to the Windows setup program and 115 MB to the macOS disk
 image, most of it Node.js and the universal Cua driver.
 
@@ -477,7 +517,13 @@ file and build. For one release:
 3. For a new PostgreSQL or localmodels release, update
    `distribution/<target>.json`: `localmodelsTool` for the localmodels
    release `scripts/installs/stack.sh` pins, and `nativeSources` holding that target's
-   `postgres-<target>.json` object.
+   `postgres-<target>.json` object. `localmodelsTool.runtimeVersions` and
+   `runtimeBaselines` copy that release's `release.json` fields of the same
+   names: the Codex, Claude and Pi versions it installs, and the oldest of each
+   it reuses instead. `distribution.test.ts` checks them against the
+   `STACK_RUNTIMES` and `STACK_RUNTIME_BASELINES` pins in
+   `scripts/installs/stack.sh`, and the Computer Daemon's Go tests fail when
+   one is below the Daemon's minimum.
 4. Build with `LINGER_DESKTOP_DAEMON_TARGETS` set to the target and the source package
    (`LINGER_SOURCE_ARCHIVE_FILE`, or the URL and SHA256, plus the target's
    `LINGER_SOURCE_DEPENDENCIES_URL` and SHA256) set, then package (`packaging/mac/package.py
@@ -539,13 +585,27 @@ Linux with `node scripts/prepare-native-voice-tools.mjs --target <target>
 and it checks the versions, the ffmpeg components the voice workers use,
 static linking and the Mach-O signatures. Licenses ship in `licenses/` of the
 archive. On every install and start, whether or not a voice key is saved,
-Native extracts the archive into
-`tools/native/components`, puts its `bin` first on the services' `PATH`
-(TeamHub and the voice workers run `ffmpeg`/`ffprobe` from it) and runs
-`livekit-server` as the `livekit` Native service: loopback only, HTTP and
-WebSocket on one free port and media on one free UDP port, both kept with
-the generated API key and secret in the owner-only `livekit.env` of the
-instance, logs in `native/logs/livekit.log`. ICE over TCP stays off because
+Native places the component's `bin` under `tools/native/components` first on
+the services' `PATH`, passes it to TeamHub as `TEAMHUB_VOICE_TOOLS_BIN`
+(TeamHub resolves `ffmpeg`/`ffprobe` lazily from it, and the voice workers run
+them from `PATH`), and runs `livekit-server` as the `livekit` Native service:
+HTTP and WebSocket signalling on one free `127.0.0.1` port and media on one
+free UDP port (bound to `127.0.0.1` on macOS and Linux, and to local interfaces
+alongside `127.0.0.1` with ICE-Lite on Windows because Windows blocks
+cross-scope UDP between WebRTC's non-loopback sockets and `127.0.0.1`; ICE-Lite
+keeps LiveKit from adding default public STUN servers when `node_ip` is unset,
+while signalling stays loopback-only so LAN peers cannot obtain ICE
+credentials; binding non-loopback UDP on Windows can trigger a Windows Defender
+Firewall prompt and single-port UDPMux snapshots local interfaces at startup so
+network changes require restarting LiveKit), both kept with the generated API
+key and secret in the owner-only `livekit.env` of the instance, logs in
+`native/logs/livekit.log`. On a cold first install where the archive is not yet
+extracted (and no voice provider key is configured), a detached background
+installer worker extracts and verifies the voice tools asynchronously while the
+main install temporarily holds LiveKit's loopback HTTP port so foundation
+services cannot claim it, then releases the port and signals the worker to
+start `livekit-server` once the core services are ready; subsequent starts
+reuse the extracted tools directly. ICE over TCP stays off because
 LiveKit binds it on every interface. Without the tools for the computer, or
 when they fail to prepare, Native logs it, keeps voice off, gives TeamHub
 `TEAMHUB_VOICE_MEDIA=off` and finishes the install. The macOS tools live in
@@ -564,26 +624,38 @@ refuse binaries that do not match the manifest or the bundled package
 (`packaging/native_bundle.py`). The desktop copies them into the unpacked source
 (`.simplexai-runtime/prebuilt/`), the installer checks them again and then
 skips the Go download, and `scripts/source-native.mjs` runs them (checking the
-sha256 before each start) instead of `go run` / `go build`. Without them, or
-when they do not verify, Native downloads Go and compiles as before.
+sha256 before each start) instead of `go run` / `go build`. In a full source
+checkout during development, missing or unverified binaries fall back to
+downloading Go and compiling from source; release packages ship the minimal
+offline source skeleton and fail fast if the prebuilt binaries are missing or
+corrupted.
 
 The same targets ship the services Native runs, built from that package
-(`scripts/build-native-runtime.mjs`): Web's production files, Node
+(`scripts/build-native-runtime.mjs`): Web's production files and Node
 Services bundled with esbuild beside the node_modules it loads at runtime,
-and the pinned Node.js, in `dist/installer/native/runtime-<target>/` with a
-`manifest.json` (schema 1). Windows and Linux ship `runtime.tar.zst` beside
-the Node.js release archive. Apple silicon ships the `runtime/` folder and
-`node/bin/node` unpacked instead, because the app's signature must cover
-every Mach-O file: `packaging/mac/package.py` signs them with the app (Node.js
-with `node-entitlements.plist`: JIT, and native modules under the hardened
-runtime its release signature keeps), records the signed bytes in the
+in `dist/installer/native/runtime-<target>/` with a `manifest.json`
+(schema 1). Windows and Linux ship `runtime.tar.zst`, and Apple silicon
+ships the `runtime/` folder unpacked because the app's signature must cover
+every Mach-O file. Rather than shipping a second copy of Node.js inside
+`runtime-<target>/`, `manifest.json` records `node.shared: true` with the
+expected path, byte size and sha256 of the pinned Node.js already bundled
+with Computer tools (`resources/runtime/bin/node` or
+`resources/runtime/bin/node.exe`), which `packaging/native_bundle.py`
+verifies on every target. On Apple silicon, `packaging/mac/package.py`
+signs the unpacked `runtime/` binaries and the shared
+`resources/runtime/bin/node` with the app (Node.js with
+`node-entitlements.plist`: JIT, and native modules under the hardened
+runtime its release signature keeps), records the signed bytes in both
 manifests and seals them with a shallow signature. The desktop unpacks or
 copies the services into `.simplexai-runtime/offline/` of the source and
-Node.js into its own folder, removing `com.apple.quarantine` on macOS;
-`checkNativeRuntime` then verifies every file, and Native installs no
-packages and needs no registry. On Linux the services need glibc 2.35
-(Ubuntu 22.04, Debian 12), like the PostgreSQL build; with an older glibc the
-desktop leaves them out and Native installs from the network. Model data
+copies and sha256-verifies the shared Node.js binary into its own folder,
+removing `com.apple.quarantine` on macOS; `checkNativeRuntime` then
+verifies every file, and Native installs no packages and needs no registry. On
+Linux the services need glibc 2.35 (Ubuntu 22.04, Debian 12), like the
+PostgreSQL build; because release packages ship the minimal offline source
+skeleton without source files to compile from the network, systems with an
+older glibc fail fast with an explicit glibc 2.35 error (while full development
+checkouts without bundled services can still install from source). Model data
 (Voice) is not bundled: Node Services downloads it on first use. Dependencies
 the services never load are left out too: officeparser imports its OCR
 engine, tesseract.js, only for OCR, which document extraction never asks for.

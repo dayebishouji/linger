@@ -6,7 +6,6 @@ import { useSearchParams } from "react-router";
 import { ActionMenu } from "@/components/ui/action-menu";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { UnderlineTabs } from "@/components/ui/underline-tabs";
 import { cn } from "@/lib/cn";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
 import type {
@@ -61,7 +60,6 @@ export function ConnectedAppsPage() {
   const apps = useQuery(externalAppsQueryOptions(client));
   const connections = useQuery(externalConnectionsQueryOptions(client));
   const webSearch = useQuery(webSearchBackendsQueryOptions(client));
-  // "all" shows every group; otherwise one group's id.
   const [filter, setFilter] = useState("all");
   const [connectedOnly, setConnectedOnly] = useState(false);
   // TeamHub lists only Connections that are not revoked.
@@ -84,25 +82,40 @@ export function ConnectedAppsPage() {
         ),
       ).length > 0,
   );
+  // One filter row: "all" shows every section, a group id shows that group's
+  // apps, and Web search shows the search backends.
   const filters = [
     { id: "all", label: t(m.filterAll) },
     ...groups.map(({ group }) => ({ id: group.id, label: t(group.title) })),
     { id: WEB_SEARCH_FILTER.id, label: t(WEB_SEARCH_FILTER.label) },
   ];
-  const groupApps = groups.find((entry) => entry.group.id === filter)?.apps;
+  const effectiveFilter = filters.some((item) => item.id === filter)
+    ? filter
+    : "all";
+  const searchFilter = effectiveFilter === WEB_SEARCH_FILTER.id;
+  const selectedGroupApps = groups.find(
+    (entry) => entry.group.id === effectiveFilter,
+  )?.apps;
   // Connected only narrows whichever view is open; with All it is one grid.
-  const filteredApps = connectedOnly
-    ? (groupApps ?? connectedApps).filter((app) => connectedApps.includes(app))
-    : groupApps;
+  const connectedAppSet = new Set(connectedApps);
+  const filteredApps = selectedGroupApps
+    ? connectedOnly
+      ? selectedGroupApps.filter((app) => connectedAppSet.has(app))
+      : selectedGroupApps
+    : connectedOnly
+      ? connectedApps
+      : undefined;
   const allSearchBackends = webSearch.data?.backends ?? [];
   const searchBackends = connectedOnly
     ? connectedWebSearchBackends(allSearchBackends)
     : shownWebSearchBackends(allSearchBackends);
-  const searchFilter = filter === WEB_SEARCH_FILTER.id;
   // DuckDuckGo needs no key, so Connected only always keeps the section.
-  const showSearch = filter === "all" || searchFilter;
+  const showSearch = effectiveFilter === "all" || searchFilter;
   const showApps =
-    !searchFilter && (!showSearch || !filteredApps || filteredApps.length > 0);
+    !searchFilter &&
+    (selectedGroupApps !== undefined ||
+      !filteredApps ||
+      filteredApps.length > 0);
 
   function renderApp(app: TeamHubExternalApp) {
     return (
@@ -171,25 +184,41 @@ export function ConnectedAppsPage() {
           </div>
         ) : (
           <>
-            {/* The toggle is as tall as the tabs and lines up with them; the
-                tab row keeps its own bottom margin. */}
-            <div className="flex items-start gap-3">
-              <UnderlineTabs
-                className="min-w-0 flex-1"
-                items={filters}
-                label={t(m.connectorCategories)}
-                onChange={setFilter}
-                value={filter}
-              />
-              <Button
-                aria-pressed={connectedOnly}
-                className="shrink-0"
-                onClick={() => setConnectedOnly((value) => !value)}
-                size="large"
-                tone={connectedOnly ? "primary" : "secondary"}
+            <div className="mb-5 flex items-start gap-3">
+              <div
+                aria-label={t(m.connectorCategories)}
+                className="flex min-w-0 flex-1 flex-wrap items-center gap-2"
+                role="group"
               >
-                {t(m.connectedOnly)}
-              </Button>
+                {filters.map((item) => (
+                  <button
+                    aria-pressed={item.id === effectiveFilter}
+                    className="select-pill shrink-0"
+                    key={item.id}
+                    onClick={() => setFilter(item.id)}
+                    type="button"
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+              <label
+                className={cn(
+                  "inline-flex h-7 shrink-0 cursor-pointer select-none items-center gap-2 text-sm transition-colors duration-150 motion-reduce:transition-none",
+                  connectedOnly
+                    ? "text-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <span>{t(m.connectedOnly)}</span>
+                <input
+                  checked={connectedOnly}
+                  className="agent-connector-switch"
+                  onChange={(event) => setConnectedOnly(event.target.checked)}
+                  role="switch"
+                  type="checkbox"
+                />
+              </label>
             </div>
             {!showApps ? null : filteredApps ? (
               filteredApps.length ? (
@@ -286,11 +315,18 @@ function CatalogAppCard({
   const authorizing =
     createConnection.isPending || Boolean(createConnection.blockedConnectUrl);
   const unconfirmed = connections.some(externalConnectionUnconfirmed);
-  const summary =
-    connectFlow.configured && app.availability === "unavailable"
-      ? t(m.unavailable)
-      : authorizing
-        ? t(m.authorizing)
+  const unavailable =
+    connectFlow.configured && app.availability === "unavailable";
+  const showNeedsReconnecting =
+    !connectedLabel && !unavailable && !authorizing && needsReconnecting > 0;
+  const summary = unavailable
+    ? t(m.unavailable)
+    : authorizing
+      ? t(m.authorizing)
+      : needsReconnecting > 0
+        ? needsReconnecting === 1
+          ? t(m.needsReconnecting)
+          : t(m.needReconnectingCount, { count: needsReconnecting })
         : unconfirmed
           ? t(m.couldNotConfirm)
           : appSummary(app, t);
@@ -299,10 +335,8 @@ function CatalogAppCard({
     <article
       aria-current={selected ? "true" : undefined}
       className={cn(
-        "flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border bg-card px-4 py-3 transition-colors duration-150 motion-reduce:transition-none",
-        selected
-          ? "border-border-hover bg-muted"
-          : "border-border hover:bg-accent/40",
+        "flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl px-4 py-3 transition-colors duration-150 motion-reduce:transition-none",
+        selected ? "bg-muted" : "hover:bg-accent",
       )}
     >
       <button
@@ -311,7 +345,7 @@ function CatalogAppCard({
         onClick={onOpen}
         type="button"
       >
-        <span className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-card text-foreground shadow-outline">
+        <span className="flex size-10 shrink-0 items-center justify-center text-foreground">
           <AppLogo name={app.display_name} url={app.logo_url} />
         </span>
         <span className="min-w-0 flex-1">
@@ -324,11 +358,19 @@ function CatalogAppCard({
                 aria-hidden
                 className="size-1.5 shrink-0 rounded-full bg-[var(--app-status-success-text)]"
               />
+            ) : showNeedsReconnecting ? (
+              <span
+                aria-hidden
+                className="size-1.5 shrink-0 rounded-full bg-[var(--app-status-warning-text)]"
+              />
             ) : null}
             <span
               className={cn(
                 "truncate",
-                !connectedLabel && authorizing && "town-shimmer-text",
+                !connectedLabel &&
+                  !unavailable &&
+                  authorizing &&
+                  "town-shimmer-text",
               )}
               title={connectedLabel ?? summary}
             >
@@ -337,7 +379,20 @@ function CatalogAppCard({
           </span>
         </span>
       </button>
-      {canStart && active.length === 0 ? (
+      {active.length === 0 && needsReconnecting > 0 ? (
+        <Button
+          aria-label={t(m.manageApp, { app: app.display_name })}
+          className="px-2.5"
+          onClick={(event) => {
+            stopCardClick(event);
+            onOpen();
+          }}
+          size="compact"
+          tone="secondary"
+        >
+          {t(m.manage)}
+        </Button>
+      ) : canStart && active.length === 0 ? (
         <Button
           aria-label={t(m.connectApp, { app: app.display_name })}
           className="px-2.5"

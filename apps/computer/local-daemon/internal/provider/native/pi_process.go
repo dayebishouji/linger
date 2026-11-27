@@ -55,16 +55,26 @@ type piProcess struct {
 	stdout *os.File
 
 	sessionID, sessionDir, contextDir string
+	compactionSettings                piCompactionSettings
 	shape                             *piShape
 	lock                              *os.File
 	mcp                               piMCPWiring
 	front                             *mcpFront
 	releaseTemp                       func() error
+	// prestartCreated marks a pre-started process for a brand-new session whose
+	// transcript file Pi has not flushed to disk yet.
+	prestartCreated bool
+	// canSyncMCP marks a process launched with the managed extension and MCP
+	// tool allowlist, so attach can synchronize MCP servers before a Run.
+	canSyncMCP bool
 
 	// cancel ends the process context, which outlives every caller.
 	cancel context.CancelFunc
 
 	writeMu sync.Mutex
+
+	syncMu sync.Mutex
+	syncCh chan piMCPSyncVerdict
 
 	closed      chan struct{} // the stdout reader ended
 	exited      chan struct{}
@@ -72,9 +82,10 @@ type piProcess struct {
 	terminated  atomic.Bool
 	releaseOnce sync.Once
 
-	mu      sync.Mutex
-	pending map[string]chan piReply
-	turn    *piTurn
+	mu        sync.Mutex
+	pending   map[string]chan piReply
+	turn      *piTurn
+	lastModel string
 }
 
 type piReplyFrame struct {
@@ -183,6 +194,39 @@ func (p *piProcess) boundTurn() *piTurn {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.turn
+}
+
+// setModel records an explicit provider model passed to Pi when not using Pi's default.
+func (p *piProcess) setModel(model string) {
+	model = strings.TrimSpace(model)
+	if model == "" || model == piDefaultModel {
+		return
+	}
+	p.mu.Lock()
+	p.lastModel = model
+	p.mu.Unlock()
+}
+
+// observeStateModel updates the last known model identifier from Pi's get_state response.
+func (p *piProcess) observeStateModel(model piCatalogModel) {
+	provider := strings.TrimSpace(model.Provider)
+	id := strings.TrimSpace(model.ID)
+	if id == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if provider != "" {
+		p.lastModel = provider + "/" + id
+	} else if p.lastModel == "" {
+		p.lastModel = id
+	}
+}
+
+func (p *piProcess) modelID() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastModel
 }
 
 // read consumes stdout until end of stream. Responses go to their pending
@@ -331,14 +375,17 @@ func (p *piProcess) sessionState(ctx context.Context) (piState, error) {
 	if state.SessionID != p.sessionID {
 		return state, errors.New("Pi returned a different session identity")
 	}
+	p.observeStateModel(state.Model)
 	return state, nil
 }
 
 type piState struct {
 	SessionID           string         `json:"sessionId"`
+	SessionFile         string         `json:"sessionFile"`
 	IsStreaming         bool           `json:"isStreaming"`
 	IsCompacting        bool           `json:"isCompacting"`
 	PendingMessageCount int            `json:"pendingMessageCount"`
+	MessageCount        *int           `json:"messageCount"`
 	Model               piCatalogModel `json:"model"`
 	ThinkingLevel       string         `json:"thinkingLevel"`
 }
@@ -347,6 +394,13 @@ type piState struct {
 // streaming, no compaction, nothing queued, and a transcript that still
 // belongs to the process's Context.
 func (p *piProcess) probeIdle(ctx context.Context) error {
+	return p.probeIdleWithTranscript(ctx, true)
+}
+
+// probeIdleWithTranscript checks RPC idle state and optionally validates the
+// on-disk transcript. A pre-started new session has no transcript until its
+// first message is flushed.
+func (p *piProcess) probeIdleWithTranscript(ctx context.Context, validateTranscript bool) error {
 	state, err := p.sessionState(ctx)
 	if err != nil {
 		return err
@@ -354,7 +408,22 @@ func (p *piProcess) probeIdle(ctx context.Context) error {
 	if state.IsStreaming || state.IsCompacting || state.PendingMessageCount != 0 {
 		return errPiProbeMismatch
 	}
+	if !validateTranscript {
+		return nil
+	}
 	return piValidateSession(p.sessionDir, p.sessionID, p.contextDir)
+}
+
+// applyThinkingLevel clamps and applies requestedThinking when Pi's reported
+// model metadata requires a narrower thinking level.
+func (p *piProcess) applyThinkingLevel(ctx context.Context, state piState, requestedThinking string) error {
+	catalog := piCatalogState{Model: state.Model, ThinkingLevel: state.ThinkingLevel}
+	if clamped, ok := piStateThinkingLevel(catalog, requestedThinking); ok {
+		if _, err := p.call(ctx, "set_thinking_level", map[string]any{"level": clamped}, nil); err != nil {
+			return fmt.Errorf("Pi thinking level could not be applied: %w", err)
+		}
+	}
+	return nil
 }
 
 // stop is the table-serialized stop of the whole process tree.

@@ -80,6 +80,8 @@ function setup(
       options.lease ?? {
         release: () => {},
         borrow: () => ({ release: () => {} }),
+        suspend: () => {},
+        resume: () => {},
       },
   );
   const placements = vi.fn(async () => options.placements ?? [alice, bob]);
@@ -336,12 +338,19 @@ describe("Runtime model call", () => {
     expect(none.invokeModel.mock.calls[0]![1].runtimeType).toBe("codex");
   });
 
-  it("calls an Antigravity Agent's model through Claude, else Codex", async () => {
+  it("calls an Antigravity Agent's model through Antigravity, falling back to Claude, else Codex", async () => {
     const antigravity: ModelPlacement = {
       ...alice,
       runtimeType: "antigravity",
     };
-    const claude = setup({ placements: [antigravity], ready: () => true });
+    const own = setup({ placements: [antigravity], ready: () => true });
+    await own.modelCall.call({ ...ask, input: "x" });
+    expect(own.invokeModel.mock.calls[0]![1].runtimeType).toBe("antigravity");
+
+    const claude = setup({
+      placements: [antigravity],
+      ready: (_computer, runtime) => runtime !== "antigravity",
+    });
     await claude.modelCall.call({ ...ask, input: "x" });
     expect(claude.invokeModel.mock.calls[0]![1].runtimeType).toBe("claude");
 
@@ -351,6 +360,21 @@ describe("Runtime model call", () => {
     });
     await codex.modelCall.call({ ...ask, input: "x" });
     expect(codex.invokeModel.mock.calls[0]![1].runtimeType).toBe("codex");
+
+    const none = setup({
+      placements: [antigravity],
+      ready: () => false,
+      outcomes: [
+        new ModelCallError(
+          "runtime_unavailable",
+          "Runtime antigravity is not ready",
+        ),
+      ],
+    });
+    await expect(
+      none.modelCall.call({ ...ask, input: "x" }),
+    ).rejects.toMatchObject({ kind: "runtime_unavailable" });
+    expect(none.invokeModel.mock.calls[0]![1].runtimeType).toBe("antigravity");
   });
 
   it("caches an owner's placement for 30 seconds and drops it when the Computer is offline", async () => {
@@ -663,6 +687,8 @@ describe("Model chains", () => {
   const lease = () => ({
     release: vi.fn(),
     borrow: () => ({ release: vi.fn() }),
+    suspend: () => {},
+    resume: () => {},
   });
 
   it("takes a new place for each call on the same Runtime", async () => {
@@ -1023,13 +1049,29 @@ describe("Model context window", () => {
   const catalogs: Record<string, Record<string, RuntimeModelInfo[]>> = {
     computer_alice: {
       codex: [
-        { id: "gpt-large", contextWindow: 400_000 },
-        { id: "gpt-default", contextWindow: 272_000, isDefault: true },
+        { id: "gpt-large", runtimeModel: "gpt-large", contextWindow: 400_000 },
+        {
+          id: "gpt-default",
+          runtimeModel: "gpt-default",
+          contextWindow: 272_000,
+          isDefault: true,
+        },
+        { id: "codex-default" },
       ],
-      claude: [{ id: "default", contextWindow: 65_536, isDefault: true }],
+      claude: [
+        {
+          id: "default",
+          runtimeModel: "default",
+          contextWindow: 65_536,
+          isDefault: true,
+        },
+      ],
     },
     computer_bob: {
-      claude: [{ id: "opus" }, { id: "default", isDefault: true }],
+      claude: [
+        { id: "opus", runtimeModel: "opus" },
+        { id: "default", runtimeModel: "default", isDefault: true },
+      ],
     },
   };
   const runtimeModels = (computerId: string, runtimeType: string) =>
@@ -1052,6 +1094,79 @@ describe("Model context window", () => {
         ready: (_computer, runtime) => runtime === "claude",
       }).modelCall.contextWindow!({ placement: alice }),
     ).resolves.toBe(65_536);
+  });
+
+  it("uses the placed Agent's configured model and its context window", async () => {
+    const aliceCustom: ModelPlacement = { ...alice, model: "gpt-large" };
+    const { modelCall, invokeModel } = setup({
+      placements: [aliceCustom],
+      runtimeModels,
+    });
+    await expect(
+      modelCall.contextWindow!({
+        anotherMe: {
+          tenantId: aliceCustom.tenantId,
+          agentActorId: "another_me_alice",
+        },
+      }),
+    ).resolves.toBe(400_000);
+    await modelCall.call({
+      ...ask,
+      owner: { tenantId: aliceCustom.tenantId, ownerActorId: "alice" },
+      input: "Question?",
+    });
+    expect(invokeModel).toHaveBeenCalledWith(
+      "computer_alice",
+      expect.objectContaining({
+        runtimeType: "codex",
+        model: "gpt-large",
+      }),
+    );
+
+    // Cross-Runtime fallback never leaks the source Runtime's model across a chain.
+    const fallback = setup({
+      placements: [aliceCustom],
+      runtimeModels,
+      ready: (_computer, runtime) => runtime === "claude",
+    });
+    await expect(
+      fallback.modelCall.contextWindow!({ placement: aliceCustom }),
+    ).resolves.toBe(65_536);
+    await fallback.modelCall.chain(
+      { kind: "wiki", key: "wiki:1", placement: aliceCustom },
+      (chain) =>
+        chain.call({
+          step: "plan",
+          schemaName: "answer",
+          outputSchema: schema,
+          input: "Plan?",
+        }),
+    );
+    expect(fallback.invokeModel).toHaveBeenCalledWith(
+      "computer_alice",
+      expect.objectContaining({
+        runtimeType: "claude",
+        model: "default",
+      }),
+    );
+
+    // Legacy default catalog entries (runtimeModel undefined) fall back to the Runtime's default.
+    const legacy = setup({
+      placements: [{ ...alice, model: "codex-default" }],
+      runtimeModels,
+    });
+    await legacy.modelCall.call({
+      ...ask,
+      owner: { tenantId: alice.tenantId, ownerActorId: "alice" },
+      input: "Legacy?",
+    });
+    expect(legacy.invokeModel).toHaveBeenCalledWith(
+      "computer_alice",
+      expect.objectContaining({
+        runtimeType: "codex",
+        model: "gpt-default",
+      }),
+    );
   });
 
   it("is unknown without a window or a placement", async () => {

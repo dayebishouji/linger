@@ -5,12 +5,21 @@ package native
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/simplexai-labs/linger/apps/computer/local-daemon/internal/permission"
 )
+
+// ErrSessionNotFound reports that a retained native session cannot be resumed
+// on this Computer.
+var ErrSessionNotFound = errors.New("native session not found")
+
+// ErrProviderPrepareNotEligible reports that a Runtime installation or
+// configuration cannot park a pre-started process for provider prepare.
+var ErrProviderPrepareNotEligible = errors.New("provider prepare is not eligible")
 
 // Kinds lists the Runtime kinds this package can open.
 var Kinds = []string{"claude", "codex", "pi", "antigravity"}
@@ -64,7 +73,6 @@ type Profile struct {
 	Env                 map[string]string
 	Logger              *slog.Logger
 	ToolVersion         string
-	CodexToolVersion    string
 	ComputerVersion     string
 	TaskID              string
 	RuntimeID           string
@@ -84,20 +92,18 @@ type Profile struct {
 	// RetainProcessTemp is called once per provider process before spawn. The
 	// returned release runs only after the process tree is confirmed gone.
 	RetainProcessTemp func() (release func() error, err error)
+	// TempBase holds private temporary directories inside the Daemon's state
+	// directory; empty falls back to the OS temporary directory.
+	TempBase string
 }
 
 type RunSpec struct {
-	Dir             string
-	Model           string
-	Budget          time.Duration
-	ResumeID        string
-	AssignSessionID string
-	ResumeRequired  bool
-	// FreshSession, when set, lets a Runtime that reported its turn started
-	// before its retained session loaded continue in a new session when the
-	// session is gone, as the executor does for one that reported nothing.
-	// The Runtime calls it before it opens the new session.
-	FreshSession          func()
+	Dir                   string
+	Model                 string
+	Budget                time.Duration
+	ResumeID              string
+	AssignSessionID       string
+	ResumeRequired        bool
 	PrepareOnly           bool
 	WarmMCP               bool
 	MCPReady              func(context.Context) error
@@ -176,14 +182,17 @@ type TokenCount struct {
 }
 
 type Outcome struct {
-	Parked      bool
-	Status      string
-	Output      string
-	Error       string
-	SessionID   string
-	TurnID      string
-	ElapsedMs   int64
-	Diagnostics RuntimeFailureDiagnostics
+	Parked bool
+	Status string
+	Output string
+	Error  string
+	// PublicDetail carries redacted-eligible, public-safe failure text set
+	// only from structured provider/runtime notices (never CLI stderr).
+	PublicDetail string
+	SessionID    string
+	TurnID       string
+	ElapsedMs    int64
+	Diagnostics  RuntimeFailureDiagnostics
 	// FailureCode is a public failure code set only from a runtime-specific
 	// structured signal; empty leaves classification to Diagnostics.
 	FailureCode     string

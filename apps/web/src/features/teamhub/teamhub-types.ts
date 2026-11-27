@@ -34,16 +34,7 @@ export type TeamHubTenantAgentUpdateInput =
   components["schemas"]["TenantAgentUpdateRequest"];
 export type TeamHubAgentVisibilityScope =
   components["schemas"]["AgentVisibilityScope"];
-export type TeamHubAgentSkillRegistration =
-  components["schemas"]["AgentSkillRegistration"];
 export type TeamHubSkillManifest = components["schemas"]["SkillManifest"];
-export type TeamHubAgentTemplate = components["schemas"]["AgentTemplate"];
-export type TeamHubAgentTemplatePage =
-  components["schemas"]["AgentTemplatePage"];
-export type TeamHubAgentTemplatePublishInput =
-  components["schemas"]["AgentTemplatePublishRequest"];
-export type TeamHubAgentTemplateSkillImport =
-  components["schemas"]["AgentTemplateSkillImport"];
 export type TeamHubDocument = components["schemas"]["Document"];
 export type TeamHubDocumentShareViewV2 =
   components["schemas"]["DocumentShareViewV2"];
@@ -425,12 +416,11 @@ export interface TeamHubArtifactContentLocation {
 
 export type TeamHubVoiceEventPage = components["schemas"]["VoiceEventPage"];
 
-export type TeamHubAgentSkillBinding =
-  components["schemas"]["AgentSkillBinding"];
-
 export type TeamHubVoiceLiveTurnMarker =
   components["schemas"]["VoiceLiveTurnMarker"];
 export type TeamHubVoiceLiveClientEvent =
   components["schemas"]["VoiceLiveClientEvent"];
+export type TeamHubVoiceLiveAudioStats =
+  components["schemas"]["VoiceLiveAudioStats"];
 export type TeamHubVoiceLiveRuntimeEvent =
   components["schemas"]["VoiceLiveRuntimeEvent"];

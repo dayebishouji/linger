@@ -50,9 +50,11 @@ describe("Direct Agent runtime settings", () => {
     expect(
       await screen.findByRole("dialog", { name: "Runtime settings" }),
     ).toBeVisible();
-    expect(
-      screen.getByRole("combobox", { name: "Agent runtime" }),
-    ).toHaveTextContent("Codex");
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Agent runtime" }),
+      ).toHaveTextContent("Codex"),
+    );
     fireEvent.click(screen.getByRole("combobox", { name: "Agent model" }));
     fireEvent.click(await screen.findByRole("option", { name: "5.4 Luna" }));
     fireEvent.click(

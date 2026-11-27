@@ -12,37 +12,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func TestWindowsAncestorDeleteRightsRespectVolumeRoot(t *testing.T) {
-	sid, err := CurrentSID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, test := range []struct {
-		name       string
-		access     string
-		volumeRoot bool
-		allowed    bool
-	}{
-		{"default volume root modify", "0x1301bf", true, true},
-		{"replaceable ordinary ancestor", "0x1301bf", false, false},
-		{"root child deletion", "0x40", true, false},
-		{"root ACL changes", "WD", true, false},
-		{"root ownership changes", "WO", true, false},
-		{"root all access", "GA", true, false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			sd, err := windows.SecurityDescriptorFromString("O:" + sid.String() + "D:P(A;;FA;;;" + sid.String() + ")(A;;" + test.access + ";;;AU)")
-			if err != nil {
-				t.Fatal(err)
-			}
-			err = validateAncestorDescriptor(sd, test.volumeRoot, func() map[string]bool { return nil })
-			if (err == nil) != test.allowed {
-				t.Fatalf("allowed = %v, error = %v", test.allowed, err)
-			}
-		})
-	}
-}
-
 func TestWindowsPrivateOwnerIsUserOrAdministrators(t *testing.T) {
 	sid, err := CurrentSID()
 	if err != nil {
@@ -68,34 +37,6 @@ func TestWindowsPrivateOwnerIsUserOrAdministrators(t *testing.T) {
 				t.Fatal(err)
 			}
 			err = validateDescriptor(sd, true)
-			if (err == nil) != test.allowed {
-				t.Fatalf("allowed = %v, error = %v", test.allowed, err)
-			}
-		})
-	}
-}
-
-func TestWindowsAncestorTrustsOnlyCodexSandboxSIDs(t *testing.T) {
-	sid, err := CurrentSID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	const sandbox = "S-1-5-21-1158770811-2547671072-1736395728-810166692"
-	sandboxSIDs := func() map[string]bool { return map[string]bool{sandbox: true} }
-	for _, test := range []struct {
-		name    string
-		grantee string
-		allowed bool
-	}{
-		{"Codex sandbox modify", sandbox, true},
-		{"other account modify", "S-1-5-21-1-2-3-4", false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			sd, err := windows.SecurityDescriptorFromString("O:" + sid.String() + "D:P(A;;FA;;;" + sid.String() + ")(A;OICI;0x1301ff;;;" + test.grantee + ")")
-			if err != nil {
-				t.Fatal(err)
-			}
-			err = validateAncestorDescriptor(sd, false, sandboxSIDs)
 			if (err == nil) != test.allowed {
 				t.Fatalf("allowed = %v, error = %v", test.allowed, err)
 			}
@@ -229,28 +170,96 @@ func TestWindowsPrivateWritePreservesExistingParentPermissions(t *testing.T) {
 	}
 }
 
-func TestWindowsPrivateWriteRejectsReplaceableAncestor(t *testing.T) {
-	root := t.TempDir()
-	private := filepath.Join(root, "private")
-	if err := EnsureDir(private); err != nil {
-		t.Fatal(err)
-	}
+func TestWindowsPrivateWriteAllowsBroadAncestorACL(t *testing.T) {
 	sid, err := CurrentSID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// DELETE_CHILD is sufficient to replace the private directory even when
-	// the child itself has a protected DACL.
-	sd, err := windows.SecurityDescriptorFromString("O:" + sid.String() + "D:P(A;;FA;;;" + sid.String() + ")(A;;0x40;;;WD)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	acl, _, _ := sd.DACL()
-	if err := windows.SetNamedSecurityInfo(root, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteFile(filepath.Join(private, "secret"), []byte("private"), true); err == nil {
-		t.Fatal("credential published through replaceable ancestor")
+	for _, tc := range []struct {
+		name      string
+		principal string
+	}{
+		{"Authenticated Users modify", "AU"},
+		{"Everyone modify", "WD"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			private := filepath.Join(root, "private")
+			if err := EnsureDir(private); err != nil {
+				t.Fatal(err)
+			}
+			sd, err := windows.SecurityDescriptorFromString(
+				"O:" + sid.String() + "D:P(A;OICI;FA;;;" + sid.String() + ")(A;OICI;0x1301bf;;;" + tc.principal + ")",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			acl, _, err := sd.DACL()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := windows.SetNamedSecurityInfo(root, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
+				t.Fatal(err)
+			}
+			secret := filepath.Join(private, "secret")
+			if err := WriteFile(secret, []byte("private"), true); err != nil {
+				t.Fatalf("WriteFile under broad ancestor failed: %v", err)
+			}
+			got, err := ReadFile(secret, 0)
+			if err != nil {
+				t.Fatalf("ReadFile under broad ancestor failed: %v", err)
+			}
+			if string(got) != "private" {
+				t.Fatalf("ReadFile = %q, want %q", string(got), "private")
+			}
+			if err := CheckPath(secret, "file", true); err != nil {
+				t.Fatalf("target file is not strictly owner-only: %v", err)
+			}
+			if err := CheckPath(root, "directory", true); err == nil {
+				t.Fatal("broadly accessible ancestor passed target-level owner-only check")
+			}
+
+			// Creating a brand-new private directory under the already-broad
+			// ancestor applies a protected owner-only DACL to the directory and
+			// its files.
+			fresh := filepath.Join(root, "fresh-private")
+			if err := EnsureDir(fresh); err != nil {
+				t.Fatalf("EnsureDir fresh directory under broad ancestor failed: %v", err)
+			}
+			if err := CheckPath(fresh, "directory", true); err != nil {
+				t.Fatalf("fresh directory is not strictly owner-only: %v", err)
+			}
+			freshSecret := filepath.Join(fresh, "secret")
+			if err := WriteFile(freshSecret, []byte("fresh"), true); err != nil {
+				t.Fatalf("WriteFile in fresh directory under broad ancestor failed: %v", err)
+			}
+			gotFresh, err := ReadFile(freshSecret, 0)
+			if err != nil {
+				t.Fatalf("ReadFile in fresh directory under broad ancestor failed: %v", err)
+			}
+			if string(gotFresh) != "fresh" {
+				t.Fatalf("ReadFile(fresh) = %q, want %q", string(gotFresh), "fresh")
+			}
+			if err := CheckPath(freshSecret, "file", true); err != nil {
+				t.Fatalf("fresh target file is not strictly owner-only: %v", err)
+			}
+
+			// Repairing a directory that inherited the ancestor's broad ACL
+			// tightens the target directory to a protected owner-only DACL.
+			inherited := filepath.Join(root, "inherited-private")
+			if err := os.Mkdir(inherited, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := CheckPath(inherited, "directory", true); err == nil {
+				t.Fatal("directory inheriting broad ancestor ACL passed CheckPath before EnsureDir")
+			}
+			if err := EnsureDir(inherited); err != nil {
+				t.Fatalf("EnsureDir repair of inherited directory under broad ancestor failed: %v", err)
+			}
+			if err := CheckPath(inherited, "directory", true); err != nil {
+				t.Fatalf("repaired directory is not strictly owner-only: %v", err)
+			}
+		})
 	}
 }
 
@@ -369,5 +378,108 @@ func TestWindowsProtectDirectoryRepairsInheritedFiles(t *testing.T) {
 	}
 	if _, err := ReadFile(later, 0); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWindowsProtectFileRepairsWeakACLAndRejectsHardLinks(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "claude")
+	if err := EnsureDir(root); err != nil {
+		t.Fatal(err)
+	}
+	sid, err := CurrentSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	broad, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + sid.String() + ")(A;;FA;;;SY)(A;;0x1301bf;;;AU)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acl, _, err := broad.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := filepath.Join(root, ".credentials.json")
+	if err := os.WriteFile(cred, []byte(`{"token":"secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(cred, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckPath(cred, "file", true); err == nil {
+		t.Fatal("broadly accessible file passed CheckPath before ProtectFile")
+	}
+	if err := ProtectFile(cred); err != nil {
+		t.Fatalf("ProtectFile: %v", err)
+	}
+	if err := CheckPath(cred, "file", true); err != nil {
+		t.Fatalf("CheckPath after ProtectFile: %v", err)
+	}
+	// Hard-linked file with weak ACL must be rejected without modifying its ACL.
+	linked := filepath.Join(root, "linked.json")
+	if err := os.Link(cred, linked); err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(linked, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProtectFile(linked); err == nil {
+		t.Fatal("hard-linked file accepted by ProtectFile")
+	}
+}
+
+func TestWindowsEnsureDirSkipsRewriteWhenAlreadyPrivate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "private-dir")
+	if err := EnsureDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	sid, err := CurrentSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Apply a valid owner-only protected DACL distinct from SecurityDescriptor()
+	// (adds BUILTIN\Administrators) and verify EnsureDir leaves it untouched.
+	custom, err := windows.SecurityDescriptorFromString("O:" + sid.String() + "D:P(A;OICI;FA;;;" + sid.String() + ")(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	customACL, _, err := custom.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, customACL, nil); err != nil {
+		t.Fatal(err)
+	}
+	before, err := windows.GetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDir(dir); err != nil {
+		t.Fatalf("EnsureDir fast-path: %v", err)
+	}
+	after, err := windows.GetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.String() != after.String() {
+		t.Fatalf("EnsureDir rewrote an already-private directory DACL:\nbefore: %s\nafter:  %s", before.String(), after.String())
+	}
+
+	// Weakening the DACL must still trigger repair.
+	broad, err := windows.SecurityDescriptorFromString("D:P(A;OICI;FA;;;" + sid.String() + ")(A;OICI;FA;;;SY)(A;OICI;FR;;;AU)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	broadACL, _, err := broad.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, broadACL, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDir(dir); err != nil {
+		t.Fatalf("EnsureDir repair: %v", err)
+	}
+	if err := CheckPath(dir, "directory", true); err != nil {
+		t.Fatalf("CheckPath after EnsureDir repair: %v", err)
 	}
 }

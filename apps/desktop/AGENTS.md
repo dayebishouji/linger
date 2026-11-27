@@ -18,6 +18,13 @@ Gateway and runs Agents. The daemon exits with the app.
   binary; pnpm does not run its install script. Set `ELECTRON_MIRROR` when the
   default host is unreachable.
 - `pnpm --filter @linger/desktop start`: build and run from source.
+- `pnpm --filter @linger/desktop dev -- [options]`: watch desktop main/preload,
+  installer, `teamhub-cli`, and Go daemon sources, rebuild incrementally, and
+  auto-restart Electron in an isolated `.linger-runtime/desktop-dev/<profile>`
+  directory (`--server http://127.0.0.1:3000` for Web HMR, `--quick-install`
+  for local checkout installation, `--localmodels <llm-inference-lab-dir>` for
+  live Python edits without restarts, `--debug simulate|tiny`, `--reset`,
+  `--skip-daemon`, `--no-watch`, `--dry-run`).
 - `python3 packaging/mac/package.py [--arch arm64|x64]`: build
   `out/Linger-<version>-<arch>.dmg` for Apple silicon and Intel on Linux
   after `node build.mjs` with the darwin daemon targets. The daemon is signed
@@ -25,7 +32,10 @@ Gateway and runs Agents. The daemon exits with the app.
   `packaging/mac/Dockerfile` and `rcodesign` (ad-hoc signature). Add
   `--developer-id P12 --developer-id-password FILE` for a Developer ID
   signature with the hardened runtime, and `--notary-key JSON` to notarize and
-  staple; see the script's docstring. Notarizing needs the bundled macOS
+  staple `Linger.app` (`Contents/CodeResources`) before building the DMG, then
+  sign, notarize, and staple the DMG in a second Apple submission (with
+  `--update-archive`, `.app.tar.gz` creation overlaps DMG packaging); see the
+  script's docstring. Notarizing needs the bundled macOS
   archives Developer ID signed first: the Sign macOS native archives workflow
   runs `packaging/mac/sign_native_archives.py` with the release secrets (see
   [Bundled archives](../../docs/desktop-release.md#bundled-archives)).
@@ -48,12 +58,30 @@ Gateway and runs Agents. The daemon exits with the app.
   The callback restores the originating window and forwards the return to its
   signed-in SPA, which requests TeamHub verification.
 
-- The Web link preview panel frames other sites. The window drops their
-  framing refusals (`X-Frame-Options`, CSP `frame-ancestors`) for frames of
-  the app, except the panel's frame, named `linger-url-preview:<id>`. When
-  that frame's final response refuses framing, the window sends
-  `preview.frame-refused`, and the panel offers the system browser instead,
-  where the user's sign-ins work.
+- The Web link preview panel shows other sites in native views
+  (`src/main/preview-views.ts`, `preview.view` in the preload API). Each is a
+  `WebContentsView` the page asks for by id (at most eight) and lays over its
+  panel; a top-level page ignores framing rules (`X-Frame-Options`, CSP
+  `frame-ancestors`), so every site shows. Previews share the persistent
+  `persist:linger-preview` session, apart from the app's session with the
+  Linger server: sign-ins made there last across restarts, and sites get no
+  permissions beyond clipboard writes. They keep Electron's user agent, so
+  sites that refuse embedded browsers, such as Google sign-in, need the
+  system browser. Only the Linger page's main frame may drive the views. It
+  learns each view's address and history after every navigation, never its
+  content. A view loads only http and https; links asking for a new tab load
+  in place, and only script popups (sign-in windows) open a window: at most
+  two per view, titled with their site and closed with the view. A crashed
+  view reloads once. While a layer of the page (a portal beside the app
+  root, an open dialog or popover, or an element hit-tested over the panel)
+  covers the panel, or the panel is inert or being resized, the page hides
+  the view and the panel shows empty. The window closes every view when its
+  page navigates, crashes or its window closes.
+- Web builds without native previews still frame sites. The window drops
+  framing refusals for frames of the app, except the panel's frame, named
+  `linger-url-preview:<id>`. When that frame's final response refuses
+  framing, the window sends `preview.frame-refused`, and the panel offers
+  the system browser instead.
 
 - `src/main/modules.ts`: `Module` interface, typed bus and the host that starts
   modules in dependency layers and stops them in reverse.
@@ -62,12 +90,28 @@ Gateway and runs Agents. The daemon exits with the app.
   status summary, tray menu and tray icons, drawn from the logo PNGs in
   `resources/tray/` with a status badge.
 - `src/main/local-server.ts`: LocalServer, the setup page's Quick Install
-  path. It fetches the pinned Node runtime (sources in the download region's
-  order, `scripts/installs/README.md`) and unpacks the linger source package
-  into the install location (the default home, or a folder picked under
-  Customize; tar runs inside the target with relative paths, and the
+  path. On Windows, install preflight checks both the install home and the
+  Computer daemon directory (`<userData>/computer`) non-destructively via
+  `windowsPrivateLocation` before fetching Node or unpacking, so private-path
+  validation failures (such as symlink/junction ancestors or foreign target
+  ownership) fail immediately with the offending ancestor path or SID instead
+  of after enrollment. It reuses the pinned Node.js binary shipped with Computer
+  tools (`resources/runtime/bin/node(.exe)` via `bundledNodePath`, copied and
+  SHA-256 verified into `<home>/desktop/node/v<version>/`, falling back to
+  legacy bundled manifests or downloading in the download region's order,
+  `scripts/installs/README.md`) and unpacks the linger source package
+  into the install location (the default home, or a folder picked on the
+  welcome screen). The selected folder's disk must have enough room for the
+  services (`LOCATION_FREE_BYTES`) plus any local model shown in the install
+  plan: `freeDiskBytes` performs a read-only `statfs` pre-check (refreshed
+  when opening Setup, picking or resetting a folder, rechecking, or refocusing
+  Setup) so the welcome screen warns dynamically by plan, and `checkLocation`
+  enforces write access and free space on all platforms before unpacking.
+  Windows also validates private access when a folder is picked. Tar runs inside the target with relative paths, falling back to
+  the pure-Node extractor when `tar.exe` is missing with `ENOENT` on stripped
+  Windows images. The
   finished folder is moved into place with `renameRetrying`, which waits out
-  Windows' short-lived locks on new files) and starts the bundled
+  Windows' short-lived locks on new files, and starts the bundled
   `dist/installer/installer.js` headless (`--no-open`), which runs every
   service natively. It drives the installer's local API itself (`InstallerApi`):
   the session from `installer/launch.html`, one job for instance `desktop`
@@ -103,8 +147,18 @@ Gateway and runs Agents. The daemon exits with the app.
   which lists `base + path + /models` and sends one request to
   `base + path + endpoint` in the format the page derived from that address.
   Then it saves the installed runtime's executable and profile paths
-  (`GET /api/instances/desktop/runtime`) as `runtimeEnvironment` in the
-  Desktop config, and the runtime its `setupChoice` runs (`local-models` runs
+  from the live completed job as `runtimeEnvironment` in the
+  Desktop config. After sign-in, when reusing a completed job, or when the installer
+  omits the runtime, it reads `GET /api/instances/desktop/runtime` for the current
+  environment. The job's setup choice identifies the runtime for sign-in when available.
+  On Windows that lookup can take minutes (#385, #549): the
+  desktop waits for it while the installer answers, asks again after a
+  dropped connection (the installer joins the running lookup), and gives up
+  only after `RUNTIME_LOOKUP_LIMIT_MS` (10 minutes) with the typed `failure`
+  `runtime_lookup_timed_out` or, once unreachable for the reconnect window,
+  `runtime_lookup_unreachable`; the setup page words both. After 15 seconds
+  the status carries `waiting: "runtime"` and the page says what the bar
+  waits on. Desktop also saves the runtime its `setupChoice` runs (`local-models` runs
   on Pi) as `preferredRuntime`. The daemon config carries that as
   `preferred_runtime`, and the daemon marks that runtime's diagnostic
   `preferred`, so TeamHub creates Another Me and the starter Agents on it
@@ -177,9 +231,16 @@ Gateway and runs Agents. The daemon exits with the app.
   (`local_server.inspected`), never to the page. Under Customize the Local
   model card stays visible once the check ends: disabled, "Not available on
   this computer", with that reason. For `cuda-driver-update-required` and
-  `cuda-driver-version-unknown`, the page explains the NVIDIA driver
-  requirement and shows Check again (`local.recheck`) so the user can
-  re-check after updating the driver.
+  `cuda-driver-version-unknown`, the page explains the NVIDIA graphics driver
+  requirement (with required driver branch via `@linger/service-kit/nvidia-driver`),
+  offers one-click verified Windows GeForce RTX driver installation
+  (`driver.start-install`, downloading from NVIDIA's allowlisted CDN, verifying
+  NVIDIA Authenticode signature before elevated silent install, and persisting
+  `pendingDriverUpdate` across reboots), NVIDIA App launch on Windows
+  (`driver.open-nvidia-app`), NVIDIA's official download and upgrade guide links
+  (`SETUP_EXTERNAL_URLS`), and Check again (`local.recheck`), and auto-rechecks
+  when installation completes or the setup window regains focus after a driver
+  action.
   Off macOS the page names the system tray, not the menu bar.
   Under Customize the local model runs only behind Pi: with another runtime
   it is greyed (`aria-disabled`, still focusable), does not toggle, and says
@@ -203,7 +264,9 @@ Gateway and runs Agents. The daemon exits with the app.
   fallbacks go once the pinned tool reports `state`. The page adds no host rule of its own; while
   the check runs the button waits with a spinner and says what it waits for
   (the first run downloads the localmodels tool, counted by `download`
-  event lines before the report), and Customize marks the
+  event lines before the report), except when the user picks BYOK under
+  Customize, which unblocks Install as soon as the BYOK fields are valid while
+  keeping late check results from overwriting the choice; Customize marks the
   recommended runtime and model. While installing, a step that downloads
   shows its bytes, what remains and the rate from the installer's byte
   counter (`localmodels.stack-progress/v1` for the local model and
@@ -232,22 +295,52 @@ Gateway and runs Agents. The daemon exits with the app.
   origin (`details.origin`, or the setup job's `origin`). The record, the
   window's `serverUrl` and the `savedEnrollments` entry follow it together
   (`setServer` with the previous origin emits `server.moved`, not
-  `server.changed`), so the Computer stays enrolled: it reaches TeamHub
-  through the gateway URL TeamHub gave it, and the session cookies are not
-  port-scoped. The record and `serverUrl` change only together, so a later
-  launch still resumes. A source folder removed since, or
+  `server.changed`), so the Computer stays enrolled and the session cookies
+  are not port-scoped. When `node-services` also (or independently) moved off
+  a taken port, `LocalServer` reads the instance's `source.ports.nodeServices`
+  after resume or a fast-ready move and updates the saved loopback `gatewayUrl`
+  in `credential.json` through `Enrollment.syncLocalGatewayUrl` (emitting
+  `computer.changed` to restart the daemon on the new port without changing the
+  Computer identity or token; remote gateway URLs are never rewritten). The
+  record and `serverUrl` change only together, so a later launch still resumes. A source folder removed since, or
   one the installer no longer accepts as a Linger checkout (such as one the
   earlier Simplex app unpacked, or this package's own folder with files
   missing since), is unpacked again from the app's package first and
   replaces the recorded one. The record also names the app
   version that unpacked the source; when this app brings another source
   package (it was installed over an older one), that launch unpacks it and
-  resumes on it, with the "Updating Linger" page instead of the older
-  interface. Only when the installer reports the services serving from the
-  new folder (`details.source`) and the origin answers does it record that
-  folder and prune the older one; otherwise the older services keep running
-  from their folder, the record keeps naming it, and the start failure page's
-  Retry moves them again. An app older than the recorded version
+  resumes on it, showing "Updating Linger" when the app version increased and
+  "Starting Linger" for a same-version source bundle refresh. Only when the
+  installer reports the services serving from the new folder (`details.source`,
+  compared after canonicalizing symlinks/paths on both sides) and the origin
+  answers does it record that folder and schedule pruning the older one
+  asynchronously after signaling `resume_ready` so removing the previous
+  checkout never delays opening the window; otherwise the older services keep
+  running from their folder, the record keeps naming it, and the start failure
+  page's Retry moves them again. `LocalServer` marks `localServer: true` in
+  `config.json` when it owns the active server (explicitly set to `false` on
+  `server.changed` to another origin, preserved on `server.moved`, and cleared
+  with `serverUrl` on reset while keeping `preferredRuntime`/`runtimeEnvironment`);
+  during `LocalServer.start()`, when a Desktop-managed loopback config has
+  `ENOENT` on `desktop/local-server.json` and the server does not answer, it
+  logs `local_server.orphaned_config_reset` and runs `#reset()` (clearing
+  credentials and enrollment via `Enrollment.unenroll()` and hiding the main
+  window) so `SetupWindow.start()`, which evaluates `show` after `LocalServer`
+  starts, opens Setup cleanly without disturbing external loopback dev servers.
+  On macOS, bundled runtime copies clone via APFS when available and probe for
+  `com.apple.quarantine` before running recursive `xattr -dr`. Before
+  `UpdaterModule` announces an unpacked macOS bundle `ready`,
+  `prepareUpdateTool` best-effort pre-fetches that bundle's pinned `localmodels`
+  tool into the enrolled local installation's tool cache, pre-stages the
+  staged bundle's packed source checkout, TeamHub binaries, and offline runtime
+  directory (when present) into the enrolled home's versioned source directory,
+  and pre-stages its shared bundled Node.js binary (`runtime/bin/node`)
+  into `<defaultHome>/desktop/node/v<version>/` (logged as
+  `local_server.update_node_prepared`) without mutating setup/resume progress or
+  getting deleted by background pruning (failures warn as
+  `update.prepare_failed` without blocking the app update). A prune never removes a folder a running process
+  still starts from (`foldersInUse`; when processes cannot be listed, it
+  removes nothing) and logs `local_server.source_in_use` instead. An app older than the recorded version
   (a downgrade) leaves the services on their newer source and logs
   `local_server.source_newer_than_app`. When local models fail to come back on a
   resume, the installer still brings up the services and reports
@@ -278,7 +371,15 @@ Gateway and runs Agents. The daemon exits with the app.
   mid-download without toggling the saved `preventSleep` preference. A Quick Install that stopped
   before the computer enrolled is not resumed: setup shows again and Install
   finishes it, reusing a finished job only while its origin answers (a stopped
-  server gets a new job, which starts the services again). The start failure
+  server gets a new job, which starts the services again). It follows a
+  running or finished job only when that job's `setupChoice` is what the
+  person chose now (`local-models` for the local model; any but
+  `local-models` for the installer's pick); otherwise it asks for a new job.
+  The installer answers at once with that job `queued` and runs it once it
+  has stopped the earlier one, such as a local model download that kept
+  running after a quit or services still starting; setup polls the queued
+  job like any other, so a subscription chosen since never shows the earlier
+  download. The start failure
   page's Set Up Again forgets the record (`local-server.json`), clears the
   active enrollment while keeping per-origin `savedEnrollments` in
   `config.json` (`legacy_data_set_aside` clears `savedEnrollments` as well),
@@ -323,6 +424,44 @@ Gateway and runs Agents. The daemon exits with the app.
   LiveKit whenever this computer has voice tools, with or without a voice
   key (see Source Package and Release). There is no settings page
   after setup yet: keys change on the next Install or Try Again.
+  When the setup window opens and runs `inspect()`, in addition to prewarming
+  Node, `LocalServer` silently pre-stages a bundled local source archive (source
+  skeleton, TeamHub binaries, and offline native runtime) into the default home
+  (`#startPrestage`, skipped for remote URLs, developer checkouts, unsupported
+  macOS, or custom locations; on Windows it checks `windowsPrivateLocation`
+  first and never mutates setup UI progress or phase). After inspection succeeds
+  on the default home (and fire-and-forget when the user clicks BYOK model
+  listing or endpoint test), it runs
+  `installer.js --prefetch-bifrost --abort-on-stdin-close`
+  (`#startBifrostPrefetch`) to populate localmodels' archive cache without
+  blocking BYOK controls, allocating ports, or writing `owned.json`. Closing the
+  setup window (`cancelPrestage()`) or switching the install location
+  (`chooseLocation()`) cancels both idle background tasks and suppresses late
+  post-inspect prefetch (`#prestageAllowed` when setup closes, `#location` on
+  custom locations), while `runChild` awaits child exit on abort and
+  `#prestageSettling` drains prior cleanup so `.partial` cleanup and TeamHub
+  unquarantine abort cleanup never race a subsequent install. Starting Install
+  joins or reuses an in-flight or completed same-home pre-stage, and always
+  stops `#bifrostPrefetch` and awaits its child tree exit
+  (`#stopBifrostPrefetch`, via stdin EOF, `SIGTERM`, and
+  `SIGKILL`/`taskkill /T /F` escalation) before launching `installer_job` so
+  `hosts.file_lock` is free and `source apply`/`stack apply` can resume partial
+  downloads with live progress instead of blocking on the lock. During
+  installation, `InstallerApi.run` and `#awaitAgents` use fast initial polling
+  (`200 ms` for the first 10 s via `pollDelayMs`, then falling back to
+  `basePollMs`); once `services` succeeds or `account` begins running,
+  `LocalServer` triggers one deduplicated cookieless
+  `WindowManager.prewarmAssets(origin)`; once `installer_job` completes without
+  sign-in required, `loadRuntime`, `handleLegacyBackup`, and `signInOwner` run
+  in parallel (with a scoped `AbortController` so any failure cancels a pending
+  runtime lookup) before recording state, calling `enroll()`, preloading the
+  hidden window (`preloadAuthenticated`), and awaiting agents.
+- `src/main/updater.ts`: `UpdaterModule` defers startup leftover cleanup
+  (`.Linger-old-*`, stale `.Linger-update-*`, and previous downloads) until 5 s
+  after `local-server.busy` clears (pausing while busy, with a 60 s fallback
+  when no busy event arrives), runs it at most once via a memoized promise, and
+  flushes or coalesces onto any in-flight cleanup before downloading in
+  `check()`.
 - `src/main/diagnostics.ts`: Diagnostics, "Show Logs" (opens
   `<userData>/logs`) and "Save Diagnostics" (a redacted
   `linger-diagnostics-<time>.zip` in Downloads) for the setup page's failed
@@ -333,7 +472,13 @@ Gateway and runs Agents. The daemon exits with the app.
   `control.key`, `credential.json`, `launch.html`, `*.env`, `*.input.json`,
   keys, cookies, databases) never go in, every saved voice key is replaced
   wherever a log printed it, and every text passes through `redact` plus a
-  secret-key JSON filter, and the person's home folder becomes `~`. It
+  secret-key JSON filter, and the person's home folder becomes `~`. It also
+  bundles the newest bounded `localmodels` stack run records
+  (`runtime/localmodels/state/stacks/*.run.json` and `.progress`), local
+  deployment records (`runtime/localmodels/state/deployments/local/*.json`),
+  and deployment engine logs (`runtime/localmodels/models/deployments/*/server.log`),
+  capped in count and byte size and excluding `byok.json`, `api-key`, and model
+  weights. It
   imports no Electron API, so it is tested with Windows paths on any
   platform.
 - `src/main/diagnostics-upload.ts`: "Send Diagnostics" on the setup page, the
@@ -374,12 +519,26 @@ Gateway and runs Agents. The daemon exits with the app.
   away. `window.did_finish_load` logs
   `{ reason, duration_ms, target }` with origin + pathname only (never query or
   hash), and `LocalServer` resume emits `local_server.resume_started`,
-  `local_server.resume_stage` (`stage`, `ms`), `local_server.resume_succeeded`
-  (`total_ms`), and `local_server.resume_failed` (`stage`, `total_ms`,
+  `local_server.resume_stage` (`stage`, `ms`),
+  `local_server.installer_resume_timings` (`path`, `probe_ms`, `total_ms`, and
+  optional stage durations when reported by `installer.js --resume`),
+  `local_server.resume_succeeded` (`total_ms`), and `local_server.resume_failed`
+  (`stage`, `total_ms`,
   redacted `error` bounded to 500 chars with query/hash stripped). A resume
   whose saved BYOK gateway did not come back still succeeds and logs
   `local_server.byok_gateway_unavailable` (`code`, `message`); the Computer
-  mounts the gateway again before the next Run on it.
+  mounts the gateway again before the next Run on it. Once ready, a server
+  the window shows can still stop: its supervisor restarts it, and the
+  desktop resumes it like a launch when it does not answer
+  (`local_server.unreachable_resume` with `trigger`): at once on
+  `local-server.retry`, and after `UNREACHABLE_GRACE_MS` (longer than the
+  supervisor's restart delays) on `local-server.unreachable` (WindowManager
+  emits it when it shows `offline.html` for a failed load) or the
+  `WATCH_MS` watch. Those two resume at most once a minute, and only after
+  `UNREACHABLE_PROBES` checks in a row spread over the grace went unanswered,
+  each allowed `UNREACHABLE_PROBE_TIMEOUT_MS` (longer than the launch's 1 s
+  fast check), so a server slowed by heavy load is not taken for a stopped
+  one; a resume that fails shows the start failure page as on launch.
 - `src/main/voice-window.ts`: the floating voice window. Electron cannot open
   Document Picture-in-Picture windows, so the SPA opens a small native window
   with `window.open("")` under the target `linger-voice-window-<n>`
@@ -433,7 +592,20 @@ Gateway and runs Agents. The daemon exits with the app.
   English. Errors from transfers and servers stay in English.
 - `src/preload/index.ts`: the only SPA API, `window.lingerDesktop`. Its
   `update` reads the Updater's state (without the release page URL) and runs
-  the tray's install and check, for the SPA's account menu.
+  the tray's install and check, for the SPA's account menu; `settings` exposes
+  `preventSleep` (`get`, `set`, `onChange`) so Settings › Computers mirrors and
+  stays in sync with the tray's Prevent Sleep toggle; `driverUpdate`
+  (`src/main/driver-updater.ts`, `src/main/windows-driver-platform.ts`) detects
+  and launches NVIDIA App / GeForce Experience on Windows, opens the allowlisted
+  NVIDIA download/guide URLs, and on Windows x64 runs verified one-click GeForce
+  RTX DCH WHQL downloads (allowlisted CDN, Windows Authenticode check, elevated
+  `-s -noreboot -noeula` install, `PowerGuard` sleep block, and `config.json`
+  `pendingDriverUpdate` post-reboot resume) with `getInstallState` /
+  `onInstallState` / `startInstall` / `clearInstallState`; and
+  `localServer.owned()` reports whether the window points at this app's own
+  local installation regardless of startup/resume readiness, so the SPA can hide
+  CLI daemon download entry points even during hot start or install-time
+  preload.
 - `src/shared/api.ts`, `src/shared/shell.ts`: preload contract types and IPC
   channel names.
 - `src/main/computer-daemon.ts`: ComputerDaemon. While the computer is
@@ -443,7 +615,14 @@ Gateway and runs Agents. The daemon exits with the app.
   credential in `LINGER_COMPUTER_TOKEN` (`gateway.token_env`). The config's
   `desktop` section puts the daemon in Desktop mode: no self-update, it exits
   when its stdin closes, and it reports `{"type":"status",...}` lines on
-  stdout, which drive the tray and the SPA status. Its log goes to
+  stdout (`gateway_state`, `active_operations`, `active_model_invokes`).
+  `active_operations` drives the tray busy state, quit confirmation, idle
+  restarts, updater waiting and the SPA status (`runtime.activity`);
+  `active_model_invokes` (omitted by older daemons, treated as `0`) emits
+  `runtime.model_activity` for `PowerGuard` only, so background model calls
+  (Memory, Wiki) hold `prevent-app-suspension` while running and through a
+  short release tail (`MODEL_ACTIVITY_TAIL_MS`) without marking the Computer
+  busy. Its log goes to
   `<userData>/logs/computer-daemon.log`. Crashes and launch failures retry
   with backoff. The Desktop reports the reason after three consecutive
   attempts fail before the daemon reports a status. The exit log
@@ -459,9 +638,24 @@ Gateway and runs Agents. The daemon exits with the app.
   are attributed to); a `relaunch` request is answered, then quits and
   relaunches the app. The permission card in the SPA running this
   computer's own Computer takes Linger's steps (prompt, System Settings,
-  relaunch) and opens CuaDriver's System Settings pane through
-  `lingerDesktop.permissions.act` instead; CuaDriver's prompt and restart,
-  and every step from another page, go through TeamHub to the daemon.
+  relaunch) through `lingerDesktop.permissions.act`. The permission subject
+  selects the settings action. Linger registers its own screen capture before
+  opening Screen Recording settings. A `computer_use` settings action opens
+  the system pane directly. Other pages send steps through TeamHub to the daemon.
+- A packaged macOS app starts the signed embedded driver for each enrolled
+  Computer daemon with a matching credential. The first daemon config already
+  contains its private socket. Window startup proceeds during driver startup.
+  Enrollment uses its normal identity request. Driver selection needs no
+  TeamHub capability, session cookie, or extra network request. A driver crash
+  retries within the same daemon lifetime. Daemon exit, unenrollment, and app
+  quit retire that driver and its retries. A new daemon gets a fresh socket.
+  Standalone Computers and unpackaged clients retain their existing mode.
+  Verify the test build on a fresh macOS account: grant only Linger Screen
+  Recording and Accessibility, then capture a test window, click its text
+  field, and type into it. Linger owns both grants in embedded mode.
+  A settings visit alone does not request a relaunch. If the owner enables
+  Screen Recording there and defers the macOS restart, they must quit and
+  reopen Linger to apply the grant.
 - `src/main/computer-credential.ts`: the Gateway credential in
   `<userData>/computer/credential.json` (0600).
 - Installs from before the product was renamed Linger move once on start.
@@ -505,14 +699,20 @@ Gateway and runs Agents. The daemon exits with the app.
   never error text or paths; a successful retry keeps the first failure.
   It keeps `%APPDATA%\Linger` and the Linger home with all their data; a
   later install starts the services again (resume, or setup's Install).
-  Setup over an installed release stops it the same way before it replaces
-  the files, since the services run on `Linger.exe` and hold it open. Setup
-  always stops them with its own `installer.js`, copied to the plugins
-  folder, on the old `Linger.exe`: an earlier release's script may not stop
-  them (0.1.2's left TeamHub, web and node-services running on Windows). Each
-  install writes `resources\stops-services`; a release without it would start
-  on `--quit`, so setup skips `--quit` for it (CloseLinger asks the person to
-  quit a running app). Retry in that prompt runs the stop again. Nothing running: the stop finds nothing and setup goes on. The
+  Manual setup over an installed release stops it the same way with a full
+  `--stop` before replacing files (as does the uninstaller), using setup's own
+  `installer.js`, copied to the plugins folder, on the old `Linger.exe`: an
+  earlier release's script may not stop its services (0.1.2's left TeamHub, web
+  and node-services running on Windows). Self-updates (`/update`) skip that
+  initial full `--stop` after `Linger.exe --quit` so warm external-Node services
+  stay running for the new version's in-place resume; if `Linger.exe` remains
+  locked after waiting (for example upgrading from an earlier release whose
+  services ran on `Linger.exe`), `StopLinger` falls back once to `--stop` before
+  `CloseLinger` prompts. Each install writes `resources\stops-services`; a
+  release without it would start on `--quit`, so setup skips `--quit` and runs
+  `--stop` directly (CloseLinger asks the person to quit a running app). Retry
+  in that prompt always forces a full `--stop` again. Nothing running: the stop
+  finds nothing and setup goes on. The
   stop also asks the pinned localmodels kit, when that kit is installed in the
   home, to unload every model its model library loaded (`library status`,
   then `library cancel` for each `loading` model, `library status` every
@@ -542,20 +742,35 @@ home> --stop-local-models` under `ELECTRON_RUN_AS_NODE`, detached, with
   model source to a subscription; a BYOK source gets its gateway mounted
   again instead. A
   quit for an update or a relaunch, and the `--quit` of setup or the
-  uninstaller (which stop the models themselves right after), leave them.
+  uninstaller, leave local models running: manual setup and the uninstaller
+  stop services and local models themselves right after `--quit`, whereas
+  `/update` leaves them warm for in-place resume unless the wait-expiry
+  fallback or Retry forces `--stop`.
 - `src/main/legacy-migration.ts`: on start, stops a bridge an older version
   left running and moves its credential and the Desktop 0.16 daemon identity
   into the daemon layout, so the computer keeps its id.
   `src/main/legacy-bridge.ts` keeps only the old bridge paths and the socket
   handshake that this needs; the bridge itself was deleted.
 - `scripts/build-daemon.mjs`: cross-compiles the daemon, stamped with the
-  `apps/computer` release the Gateway checks.
+  `apps/computer` release the Gateway checks, and the Windows Desktop TeamHub
+  CLI launcher (`cmd/linger-teamhub-launcher`) to `dist/teamhub-cli/teamhub.exe`.
 - `scripts/stage-computer-tools.mjs`: stages the browser and computer-control
-  tools and their Node.js for each daemon target into
-  `dist/computer-tools/<target>/` with the root
-  `scripts/computer-tool-bundle.mjs`; `packaging/computer_tools.py` puts them in
-  `resources/cli/` and `resources/runtime/` and checks every package for them
-  (see [Computer Tools](../../docs/desktop-release.md#computer-tools)).
+  tools (with `@earendil-works/pi-coding-agent`'s `createMcpExtension` bundled
+  beside `jiti`, `@playwright/mcp`, `quickjs-wasi`, and Cua drivers) and their
+  Node.js for each daemon target into `dist/computer-tools/<target>/` with the
+  root `scripts/computer-tool-bundle.mjs`; `packaging/computer_tools.py` puts
+  them in `resources/cli/` and `resources/runtime/` and checks every package
+  for them (see [Computer Tools](../../docs/desktop-release.md#computer-tools)).
+  On Windows, `packaging/win/package.py` also stages a pinned portable PowerShell
+  7 LTS runtime (`PowerShell-7.6.10-win-x64.zip`, verified by SHA-256 and
+  reused from `~/.cache/linger-desktop` or `PWSH_MIRROR`) into
+  `resources/runtime/pwsh/`; the Daemon appends that directory to the end of
+  Windows Runtime `PATH` so Agents resolve `pwsh.exe` without overriding user
+  installs or system DLLs.
+  `scripts/build-native-runtime.mjs` pins that shared `resources/runtime/bin/node(.exe)`
+  digest in `manifest.json` (`node.shared: true`) instead of duplicating Node.js
+  inside `dist/installer/native/runtime-<target>/`, and `packaging/mac/package.py`
+  refreshes the digest after signing.
 
 ## Important Conventions
 
@@ -588,11 +803,21 @@ home> --stop-local-models` under `ELECTRON_RUN_AS_NODE`, detached, with
    `AGENT_RUNNER_PUBLIC_GATEWAY_URL` and `TEAMHUB_CLI_BASE_URL` to origins the
    computer can reach.
 4. The computer needs Codex or Claude Code installed and signed in; the
-   daemon finds them through the login shell PATH. The teamhub CLI runs on
-   the app's own Node (`ELECTRON_RUN_AS_NODE`) in packaged builds and on the
-   `node` in PATH from source. The Desktop TeamHub shell launcher uses
-   `wslpath` and `WSLENV` when WSL starts the Windows executable, so the
-   script path and `ELECTRON_RUN_AS_NODE` reach that process correctly.
+   daemon finds them through the login shell PATH (`src/main/shell-env.ts`
+   probes `-ilc` and `-lc` concurrently, returns as soon as `-ilc` succeeds with
+   a valid `PATH` while cleaning up `-lc`'s `fnm_multishells` probe symlink in
+   the background, and falls back to `-lc` when `-ilc` fails). On Windows, the teamhub CLI
+   runs through the native `dist/teamhub-cli/teamhub.exe` launcher (preferring
+   `resources/runtime/bin/node.exe`, then `Linger.exe` with
+   `ELECTRON_RUN_AS_NODE=1`, then `LINGER_NODE` or `node` on PATH from source)
+   so arguments pass directly without `cmd.exe`. On macOS, Linux, Git Bash, and
+   WSL, the POSIX `teamhub` launcher (`scripts/teamhub.sh`) runs it on the
+   app's own Node (`ELECTRON_RUN_AS_NODE`) in packaged builds and on
+   `LINGER_NODE` or `node` in PATH from source, using `wslpath` and `WSLENV`
+   when WSL starts the Windows executable so the script path,
+   `ELECTRON_RUN_AS_NODE`, `WSL_DISTRO_NAME`, and any non-empty `TEAMHUB_CONFIG`
+   (translated from a Linux path with `wslpath -w`) and `TEAMHUB_PROFILE` reach
+   that process correctly.
    The CLI translates absolute Linux paths for local attachments, input files
    and Document file outputs using the invoking WSL distribution. Message text
    and remote paths stay unchanged. The same local file checks apply to the
@@ -626,11 +851,27 @@ building a package.
   section, which the daemon's model library runs. Every `--resume` reports
   the runtime again; a change updates `runtimeEnvironment` and restarts the
   daemon once its tasks end (`computer.runtime`), so an install from before
-  the daemon knew the tool gains it.
+  the daemon knew the tool gains it. When `--resume` reports
+  `details.localModelsRestored` or `details.restoredLocalModels` (reloaded
+  library models or a revived local stack) without changing
+  `runtimeEnvironment`, the desktop logs `local_server.local_models_restored`
+  and emits `computer.runtime` once so an already-running daemon refreshes its
+  library snapshot and Pi model catalog.
+- `LINGER_BUNDLED_LOCALMODELS_KIT_DIR`: optional packaging-time directory
+  holding `<target>.tgz` matching `distribution/<target>.json`'s
+  `localmodelsTool` byte size and SHA-256; when set, `build.mjs` and
+  `scripts/ci/desktop-release.sh` fail closed on missing, linked, or mismatched
+  archives and stage it as `dist/installer/bundled-localmodels-kit.tgz` beside
+  `distribution.json`. When unset, any stale copy is removed so official
+  releases never embed a kit archive.
 - `LINGER_LOCALMODELS_DEV_PYTHON`, `LINGER_LOCALMODELS_DEV_MODULE_DIR`:
   absolute Python and module directory for running a local `localmodels`
   checkout in Quick Install and the Desktop Computer without fetching the
-  published kit. `LOCALMODELS_DEBUG` (`simulate` or `tiny`) or
+  published kit. Both variables also configure `ComputerDaemonModule`'s
+  `local_models` block directly (preserving custom install state/model paths
+  when present, or deriving them under `LINGER_HOME`), so connecting Desktop to
+  `pnpm dev` via `LINGER_SERVER_URL` works without Quick Install and Python
+  edits apply on the next call. `LOCALMODELS_DEBUG` (`simulate` or `tiny`) or
   `~/.config/localmodels/debug.json` enables fast local-model testing in both
   source and packaged builds.
 - Without a display, run with `--ozone-platform=headless --disable-gpu`. The

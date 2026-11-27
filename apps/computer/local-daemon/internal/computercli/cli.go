@@ -42,7 +42,7 @@ type deps struct {
 	// interruptible derives a context that an interrupt arriving after the
 	// call cancels.
 	interruptible    func(ctx context.Context) (context.Context, context.CancelFunc)
-	diagnoseRuntimes func(ctx context.Context, configuredPaths, environment map[string]string, enabled []string) ([]runtimeDiagnostic, error)
+	diagnoseRuntimes func(ctx context.Context, request runtimeRequest, enabled []string) ([]runtimeDiagnostic, error)
 	newClient        func(stateDirectory string) controlClient
 	inspectDaemon    func(ctx context.Context, stateDirectory string) doctorCheck
 	probeGateway     func(ctx context.Context, gatewayURL string) doctorCheck
@@ -461,6 +461,9 @@ func (c *cli) executeDoctorPrune(ctx context.Context, parsed command) (int, erro
 }
 
 func (c *cli) executeLogin(ctx context.Context, parsed command) (int, error) {
+	if parsed.deprecatedConcurrencyFlag {
+		c.write(c.deps.stderr, "Warning: --max-concurrent-runs and --no-max-concurrent-runs are deprecated and ignored. Model endpoints now control concurrency.\n")
+	}
 	var requested map[string]string
 	if len(parsed.runtimePaths) > 0 {
 		requested = parsed.runtimePaths
@@ -469,7 +472,12 @@ func (c *cli) executeLogin(ctx context.Context, parsed command) (int, error) {
 	if parsed.codexAuthFile != "" {
 		environment = withVariable(environment, "CODEX_HOME", filepath.Dir(parsed.codexAuthFile))
 	}
-	diagnostics, err := c.deps.diagnoseRuntimes(ctx, requested, environment, parsed.enabledRuntimes)
+	tempBase := validatedProbeTempBase(filepath.Join(filepath.Dir(parsed.configPath), "state"))
+	diagnostics, err := c.deps.diagnoseRuntimes(ctx, runtimeRequest{
+		configuredPaths: requested,
+		environment:     environment,
+		tempBase:        tempBase,
+	}, parsed.enabledRuntimes)
 	if err != nil {
 		return 0, wrapError(categoryCapabilityProbe, "Runtime capability probing failed: "+err.Error(), err)
 	}
@@ -489,7 +497,6 @@ func (c *cli) executeLogin(ctx context.Context, parsed command) (int, error) {
 	result, err := c.deps.setup(ctx, setupOptions{
 		configPath: parsed.configPath, stateDirectory: filepath.Join(filepath.Dir(parsed.configPath), "state"),
 		webURL: parsed.webURL, displayName: parsed.displayName,
-		maxRunsSet: parsed.maxRunsSet, maxRuns: parsed.maxRuns,
 		runtimePaths: runtimePaths, enabledRuntimes: parsed.enabledRuntimes,
 		codexAuthFile: parsed.codexAuthFile, gatewayURL: parsed.gatewayURL, serverToken: token,
 		localModels: parsed.localModels,

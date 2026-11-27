@@ -52,13 +52,13 @@ type Options struct {
 	OperationResolver   OperationResolver
 	RetryDelay          func(attempt int) time.Duration
 	DisplayName         string
-	Capacity            *int
 	Runtimes            []string
 	EnabledRuntimes     []string
 	RuntimeDiagnostics  json.RawMessage
 	WorkspaceGrants     json.RawMessage
 	StateDirectory      string
 	RuntimeHomeRoot     string
+	AntigravityHome     string
 	RuntimeObservations []transport.RegistrationObservation
 	// OnModelUnavailable learns that the Runtime login refused a model, so
 	// the Computer can stop offering it.
@@ -132,6 +132,12 @@ type Daemon struct {
 	// localModelsEngine holds whether the current Agent Service declared
 	// serviceFeatureLocalModelsEngine in its welcome.
 	localModelsEngine atomic.Bool
+	// localModelsConcurrencyProbe holds whether the current Agent Service
+	// declared serviceFeatureLocalModelsConcurrencyProbe in its welcome.
+	localModelsConcurrencyProbe atomic.Bool
+	// localModelsExternalHolders holds whether the current Agent Service
+	// declared serviceFeatureLocalModelsExternalHolders in its welcome.
+	localModelsExternalHolders atomic.Bool
 	// modelInvokeOutcomes holds whether the current Agent Service declared
 	// serviceFeatureModelInvokeOutcomes in its welcome.
 	modelInvokeOutcomes atomic.Bool
@@ -144,6 +150,24 @@ type Daemon struct {
 	// localModelUnavailable holds whether the current Agent Service declared
 	// serviceFeatureLocalModelUnavailable in its welcome.
 	localModelUnavailable atomic.Bool
+	// modelGatewayUnavailable holds whether the current Agent Service declared
+	// serviceFeatureModelGatewayUnavailable in its welcome.
+	modelGatewayUnavailable atomic.Bool
+	// runtimeFailureDetail holds whether the current Agent Service declared
+	// serviceFeatureRuntimeFailureDetail in its welcome.
+	runtimeFailureDetail atomic.Bool
+	// operationBackgroundWait holds whether the current Agent Service declared
+	// serviceFeatureOperationBackgroundWait in its welcome.
+	operationBackgroundWait atomic.Bool
+	// dynamicReasoningEfforts holds whether the current Agent Service declared
+	// serviceFeatureDynamicReasoningEfforts in its welcome.
+	dynamicReasoningEfforts atomic.Bool
+	// antigravityHistory holds whether the current Agent Service declared
+	// serviceFeatureAntigravityHistory in its welcome.
+	antigravityHistory atomic.Bool
+	// antigravityUsageProvider holds whether the current Agent Service declared
+	// serviceFeatureAntigravityUsageProvider in its welcome.
+	antigravityUsageProvider atomic.Bool
 	// authorityRevision counts, under admissionMu, the commands that can change
 	// what an accepted Operation may start with: Registration snapshots, Agent
 	// Runner commands and Context commands. A start whose revision is unchanged
@@ -169,30 +193,31 @@ type Daemon struct {
 	// after a failed model call; nil dials for real.
 	dialNetwork func(ctx context.Context, network, address string) error
 	// localModelsMu orders runner.local_models sends with their revision.
-	localModelsMu       sync.Mutex
-	localModelsRevision uint64
-	operationWG         sync.WaitGroup
-	inputWG             sync.WaitGroup
-	preparationWG       sync.WaitGroup
-	cleanupWG           sync.WaitGroup
-	draining            bool
-	closing             bool
-	selfUpdate          SelfUpdater
-	retryDelay          func(int) time.Duration
-	stableConnection    time.Duration
-	now                 func() time.Time
-	displayName         string
-	capacity            *int
-	runtimes            []string
-	runtimeDiagnostics  json.RawMessage
-	workspaceGrants     json.RawMessage
-	stateDirectory      string
-	runtimeHomeRoot     string
-	runtimeObservations []transport.RegistrationObservation
-	inventoryMu         sync.RWMutex
-	diagnosticsRevision uint64
-	connectionMu        sync.Mutex
-	diagnosticsStream   transport.Stream
+	localModelsMu           sync.Mutex
+	localModelsRevision     uint64
+	operationWG             sync.WaitGroup
+	inputWG                 sync.WaitGroup
+	preparationWG           sync.WaitGroup
+	cleanupWG               sync.WaitGroup
+	draining                bool
+	closing                 bool
+	selfUpdate              SelfUpdater
+	retryDelay              func(int) time.Duration
+	stableConnection        time.Duration
+	now                     func() time.Time
+	displayName             string
+	runtimes                []string
+	runtimeDiagnostics      json.RawMessage
+	workspaceGrants         json.RawMessage
+	stateDirectory          string
+	runtimeHomeRoot         string
+	antigravityHome         string
+	runtimeObservations     []transport.RegistrationObservation
+	inventoryMu             sync.RWMutex
+	diagnosticsRevision     uint64
+	connectionMu            sync.Mutex
+	diagnosticsStream       transport.Stream
+	sentDiagnosticsRevision uint64
 	// localModelsStream is the live connection when its Agent Service
 	// accepts runner.local_models; nil otherwise.
 	localModelsStream transport.Stream
@@ -224,10 +249,6 @@ type activeOperation struct {
 	inputMu           sync.Mutex
 	finishing         bool
 	pendingInputs     map[string]*pendingOperationInput
-	// sessionMoved is set when the Run continued in a new native session
-	// after announcing its retained one; it then declines a scheduler
-	// yield, whose follow-up would resume the session that is gone.
-	sessionMoved atomic.Bool
 }
 
 func New(options Options) (*Daemon, error) {
@@ -274,14 +295,14 @@ func New(options Options) (*Daemon, error) {
 		stableConnection:     stableGatewayConnection,
 		now:                  time.Now,
 		displayName:          options.DisplayName,
-		capacity:             options.Capacity,
 		runtimes:             append([]string(nil), options.Runtimes...),
 		runtimeDiagnostics:   append(json.RawMessage(nil), options.RuntimeDiagnostics...),
 		workspaceGrants:      append(json.RawMessage(nil), options.WorkspaceGrants...),
 		stateDirectory:       options.StateDirectory,
 		runtimeHomeRoot:      options.RuntimeHomeRoot,
+		antigravityHome:      options.AntigravityHome,
 		runtimeObservations:  append([]transport.RegistrationObservation(nil), options.RuntimeObservations...),
-		diagnosticsRevision:  1,
+		diagnosticsRevision:  nextRevisionAbove(1, options.RuntimeObservations),
 		gatewayState:         "connecting",
 		locallyStopped:       make(map[string]bool),
 		welcomedEpochs:       make(map[uint64]bool),
@@ -306,8 +327,15 @@ func New(options Options) (*Daemon, error) {
 // Run loads or creates the Daemon Identity and keeps the Gateway stream
 // connected until ctx ends or a terminal configuration error stops redials.
 func (d *Daemon) Run(ctx context.Context) error {
+	if base := d.operationTempBase(); base != "" {
+		native.ConfigureAntigravityHookTempBase(base)
+	}
 	defer func() {
 		_, _ = native.StopAllParkedResidents()
+		_ = native.CloseAntigravitySharedHookEndpoint()
+		if d.stateDirectory != "" {
+			native.ConfigureAntigravityHookTempBase("")
+		}
 		if d.modelInvoker != nil {
 			d.modelInvoker.Close()
 		}
@@ -413,6 +441,14 @@ func (d *Daemon) ActiveOperationCount() int {
 	d.activeMu.Lock()
 	defer d.activeMu.Unlock()
 	return len(d.activeOperations)
+}
+
+// ActiveModelInvokeCount returns the number of in-flight one-shot model
+// invocations.
+func (d *Daemon) ActiveModelInvokeCount() int {
+	d.modelInvokeMu.Lock()
+	defer d.modelInvokeMu.Unlock()
+	return len(d.modelInvokes)
 }
 
 func (d *Daemon) DrainIfIdle() int {

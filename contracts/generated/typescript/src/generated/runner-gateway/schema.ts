@@ -210,8 +210,22 @@ export const runnerGatewayEnvelopeSchema = {
         "local_models_diagnostics",
         "model_invoke_outcomes",
         "local_models_engine",
+        "local_models_concurrency_probe",
         "local_model_unavailable",
+        "model_gateway_unavailable",
+        "local_models_external_holders",
+        "runtime_failure_detail",
+        "operation_background_wait",
+        "dynamic_reasoning_efforts",
+        "antigravity_history",
+        "antigravity_usage_provider",
       ],
+    },
+    ReasoningEffort: {
+      type: "string",
+      minLength: 1,
+      maxLength: 20,
+      pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$",
     },
     Timestamp: {
       type: "string",
@@ -316,13 +330,14 @@ export const runnerGatewayEnvelopeSchema = {
         },
         allowed_reasoning_effort: {
           type: "array",
+          maxItems: 32,
           uniqueItems: true,
           items: {
-            enum: ["none", "low", "medium", "high", "xhigh", "max", "ultra"],
+            $ref: "#/$defs/ReasoningEffort",
           },
         },
         default_reasoning_effort: {
-          enum: ["none", "low", "medium", "high", "xhigh", "max", "ultra"],
+          $ref: "#/$defs/ReasoningEffort",
         },
         context_window: {
           description:
@@ -1118,7 +1133,12 @@ export const runnerGatewayEnvelopeSchema = {
           enum: ["available", "unavailable"],
         },
         source: {
-          enum: ["codex_rollout", "claude_transcript", "pi_session"],
+          enum: [
+            "codex_rollout",
+            "claude_transcript",
+            "pi_session",
+            "antigravity_transcript",
+          ],
         },
         reason: {
           type: "string",
@@ -1251,7 +1271,12 @@ export const runnerGatewayEnvelopeSchema = {
           maxLength: 500,
         },
         source: {
-          enum: ["codex_rollout", "claude_transcript", "pi_session"],
+          enum: [
+            "codex_rollout",
+            "claude_transcript",
+            "pi_session",
+            "antigravity_transcript",
+          ],
         },
         snapshot: {
           $ref: "#/$defs/DebugHistorySnapshot",
@@ -1813,7 +1838,7 @@ export const runnerGatewayEnvelopeSchema = {
         reasoning_effort: {
           description:
             "After apply, the reasoning effort runtime_model needs; absent when it offers none.",
-          enum: ["none", "low", "medium", "high", "xhigh", "max", "ultra"],
+          $ref: "#/$defs/ReasoningEffort",
         },
         gateway_url: {
           type: "string",
@@ -2334,6 +2359,23 @@ export const runnerGatewayEnvelopeSchema = {
         },
       },
     },
+    LocalModelPoolExternalHolder: {
+      description:
+        "A desktop application outside localmodels holding pool memory, such as a browser, video player, or game, that the user could close.",
+      type: "object",
+      additionalProperties: false,
+      required: ["name", "bytes"],
+      properties: {
+        name: {
+          type: "string",
+          minLength: 1,
+          maxLength: 200,
+        },
+        bytes: {
+          $ref: "#/$defs/NonNegativeInteger",
+        },
+      },
+    },
     LocalModelPool: {
       description:
         "One place models load into. The system and unified budgets are 80% of RAM, as localmodels computes them.",
@@ -2363,6 +2405,16 @@ export const runnerGatewayEnvelopeSchema = {
           maxItems: 256,
           items: {
             $ref: "#/$defs/LocalModelPoolHolder",
+          },
+        },
+        external_holders: {
+          description:
+            "Closeable desktop applications holding this pool's memory, as localmodels reports them. [] means localmodels looked and found none; an absent field means not reported. Sent only when service_features declares local_models_external_holders.",
+          type: "array",
+          minItems: 0,
+          maxItems: 256,
+          items: {
+            $ref: "#/$defs/LocalModelPoolExternalHolder",
           },
         },
       },
@@ -2763,10 +2815,15 @@ export const runnerGatewayEnvelopeSchema = {
         },
         concurrency: {
           description:
-            "Maximum concurrent request slots for this model when loaded. Sent only when runner.welcome service_features names local_models_engine.",
+            "Maximum concurrent request slots configured or probed for this model when loaded. Sent only when runner.welcome service_features names local_models_engine.",
           type: "integer",
           minimum: 1,
           maximum: 64,
+        },
+        concurrency_probing: {
+          description:
+            "True while a model is running its post-load max-concurrency probe before reporting loaded. Sent only when runner.welcome service_features names local_models_concurrency_probe.",
+          type: "boolean",
         },
         host_ram_bytes: {
           description:
@@ -3149,7 +3206,7 @@ export const runnerGatewayEnvelopeSchema = {
           minimum: 1,
           maximum: 100,
           description:
-            "Optional Computer-wide active Operation limit. Omission means unlimited.",
+            "Deprecated. Older Computers can report a locally enforced Operation limit. The gateway schedules by model endpoint.",
         },
         runtimes: {
           type: "array",
@@ -3470,7 +3527,7 @@ export const runnerGatewayEnvelopeSchema = {
           maxLength: 160,
         },
         reasoning_effort: {
-          enum: ["none", "low", "medium", "high", "xhigh", "max", "ultra"],
+          $ref: "#/$defs/ReasoningEffort",
         },
       },
     },
@@ -4066,6 +4123,23 @@ export const runnerGatewayEnvelopeSchema = {
         },
       },
     },
+    PreviousRuntimeSession: {
+      type: "object",
+      additionalProperties: false,
+      description:
+        "Identifies the superseded native session of this Context so a fresh run.start can export its local transcript into ./playground/.previous-context.md.",
+      required: ["provider_type", "session_id"],
+      properties: {
+        provider_type: {
+          enum: ["codex", "claude", "pi", "antigravity"],
+        },
+        session_id: {
+          type: "string",
+          minLength: 1,
+          maxLength: 256,
+        },
+      },
+    },
     ContextRunStartRequest: {
       type: "object",
       additionalProperties: false,
@@ -4090,6 +4164,9 @@ export const runnerGatewayEnvelopeSchema = {
         },
         session: {
           $ref: "#/$defs/OpaqueObject",
+        },
+        previous_session: {
+          $ref: "#/$defs/PreviousRuntimeSession",
         },
         input: {
           $ref: "#/$defs/AgentInput",
@@ -4617,7 +4694,7 @@ export const runnerGatewayEnvelopeSchema = {
           $ref: "#/$defs/Id",
         },
         runtime_type: {
-          enum: ["codex", "claude", "pi"],
+          enum: ["codex", "claude", "pi", "antigravity"],
         },
         execution_context_key: {
           $ref: "#/$defs/ExecutionContextKey",
@@ -4662,7 +4739,7 @@ export const runnerGatewayEnvelopeSchema = {
     },
     SessionCompact: {
       description:
-        "Compacts the native session of the process parked for this Context with the Runtime's own compaction. It never starts a process; without a parked process the answer is no_process.",
+        "Compacts the native session of the process parked for this Context with the Runtime's own compaction. It never starts a process; without a parked process the answer is no_process. Pi and Antigravity compaction are sent only to Computer releases that decode them.",
       type: "object",
       additionalProperties: false,
       required: [
@@ -4700,7 +4777,7 @@ export const runnerGatewayEnvelopeSchema = {
           $ref: "#/$defs/Id",
         },
         runtime_type: {
-          enum: ["codex", "claude"],
+          enum: ["codex", "claude", "pi", "antigravity"],
         },
         execution_context_key: {
           $ref: "#/$defs/ExecutionContextKey",
@@ -4717,7 +4794,7 @@ export const runnerGatewayEnvelopeSchema = {
     },
     ModelInvoke: {
       description:
-        "Runs one model call on the Computer's signed-in Codex or Claude CLI in a fresh temporary directory, outside the Operation ledger and without a Context. Only structured carries output_schema, which it requires; only workspace carries workspace_files, the input files of the temporary directory, and gets its tree back. A workspace file may not be AGENTS.md, AGENTS.override.md or CLAUDE.md at the root or lie under a .codex or .claude directory. Codex cannot read files in workspace mode, so the Daemon also inlines the workspace files into the prompt and Codex writes only through apply_patch. The Daemon answers failed for a request that breaks these rules, and for a reply whose encoded model.invoked would exceed the frame limit.",
+        "Runs one model call on the Computer's signed-in Codex, Claude, Pi, or Antigravity CLI in a fresh temporary directory, outside the Operation ledger and without a Context. Only structured carries output_schema, which it requires; only workspace carries workspace_files, the input files of the temporary directory, and gets its tree back. A workspace file may not be AGENTS.md, AGENTS.override.md or CLAUDE.md at the root or lie under a .codex or .claude directory. Codex cannot read files in workspace mode, so the Daemon also inlines the workspace files into the prompt and Codex writes only through apply_patch. Pi and Antigravity do not support workspace mode. The Daemon answers failed for a request that breaks these rules, and for a reply whose encoded model.invoked would exceed the frame limit.",
       type: "object",
       additionalProperties: false,
       required: [
@@ -4766,7 +4843,14 @@ export const runnerGatewayEnvelopeSchema = {
           $ref: "#/$defs/Id",
         },
         runtime_type: {
-          enum: ["codex", "claude", "pi"],
+          enum: ["codex", "claude", "pi", "antigravity"],
+        },
+        model: {
+          description:
+            "Explicit provider model to run on this Runtime. Omitted leaves selection to the Runtime's own default; sent only to a Computer release that decodes it.",
+          type: "string",
+          minLength: 1,
+          maxLength: 160,
         },
         mode: {
           enum: ["structured", "text", "workspace"],
@@ -5395,6 +5479,57 @@ export const runnerGatewayEnvelopeSchema = {
         {
           type: "object",
           additionalProperties: false,
+          required: ["type", "observed_at_unix_ms", "tools"],
+          properties: {
+            type: {
+              const: "run.background_waiting",
+            },
+            observed_at_unix_ms: {
+              $ref: "#/$defs/NonNegativeInteger",
+            },
+            tools: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["call_id", "tool_name", "started_at_unix_ms"],
+                properties: {
+                  call_id: {
+                    $ref: "#/$defs/Id",
+                  },
+                  tool_name: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: 200,
+                  },
+                  started_at_unix_ms: {
+                    $ref: "#/$defs/NonNegativeInteger",
+                  },
+                },
+              },
+            },
+          },
+        },
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["type", "observed_at_unix_ms", "trigger"],
+          properties: {
+            type: {
+              const: "run.background_resumed",
+            },
+            observed_at_unix_ms: {
+              $ref: "#/$defs/NonNegativeInteger",
+            },
+            trigger: {
+              type: "string",
+              enum: ["background_continuation", "user_input"],
+            },
+          },
+        },
+        {
+          type: "object",
+          additionalProperties: false,
           required: ["type"],
           properties: {
             type: {
@@ -5642,7 +5777,7 @@ export const runnerGatewayEnvelopeSchema = {
             maxLength: 128,
           },
           provider: {
-            enum: ["openai", "anthropic", "unknown"],
+            enum: ["openai", "anthropic", "antigravity", "unknown"],
           },
           last: {
             $ref: "#/$defs/RunTokenCounts",
@@ -5723,7 +5858,9 @@ export const runnerGatewayEnvelopeSchema = {
             "network_error",
             "rate_limited",
             "model_unavailable",
+            "model_not_offered",
             "local_model_unavailable",
+            "model_gateway_unavailable",
             "context_too_long",
             "model_service_error",
             "timeout",
@@ -5737,6 +5874,11 @@ export const runnerGatewayEnvelopeSchema = {
           type: "string",
           pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$",
           maxLength: 80,
+        },
+        detail: {
+          type: "string",
+          minLength: 1,
+          maxLength: 500,
         },
       },
     },

@@ -1,5 +1,4 @@
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
 
 import { localComputersQueryOptions } from "@/features/local-computer/local-computer-queries";
 import { localModelsQueryOptions } from "@/features/local-models/local-models-queries";
@@ -15,64 +14,29 @@ import type {
 import { composerMessages } from "../chat/composer.messages";
 import { runtimeModelLabel } from "./runtime-model-label";
 
-interface RuntimeModel {
-  id: string;
-  label: string;
-  allowed_reasoning_effort?: readonly TeamHubAgentReasoningEffort[];
-  default_reasoning_effort?: TeamHubAgentReasoningEffort;
-}
-
-/** The model and reasoning effort of a new Agent, chosen among the models the
- * selected Computer Runtime reports; the first model is the default. */
-export function useAgentModelSelection(models: readonly RuntimeModel[]) {
-  const t = useT();
-  const [requestedModel, setRequestedModel] = useState("");
-  const [requestedReasoningEffort, setRequestedReasoningEffort] = useState<
-    TeamHubAgentReasoningEffort | ""
-  >("");
-  const selectedModel =
-    models.find(({ id }) => id === requestedModel) ?? models[0];
-  const reasoningEfforts = [...(selectedModel?.allowed_reasoning_effort ?? [])];
-  const defaultReasoningEffort =
-    selectedModel?.default_reasoning_effort &&
-    reasoningEfforts.includes(selectedModel.default_reasoning_effort)
-      ? selectedModel.default_reasoning_effort
-      : reasoningEfforts[0];
-  const reasoningEffort = reasoningEfforts.includes(
-    requestedReasoningEffort as TeamHubAgentReasoningEffort,
-  )
-    ? (requestedReasoningEffort as TeamHubAgentReasoningEffort)
-    : defaultReasoningEffort;
-
-  return {
-    items: models.map((item) => ({
-      value: item.id,
-      label: runtimeModelLabel(item, t),
-    })),
-    model: selectedModel?.id ?? "",
-    reasoningEffort,
-    reasoningEfforts,
-    selectModel: setRequestedModel,
-    selectReasoningEffort: setRequestedReasoningEffort,
-  };
-}
-
-export const reasoningEffortMessages = {
+export const reasoningEffortMessages: Readonly<Record<string, Message>> = {
+  off: composerMessages.effortOff,
   none: composerMessages.effortNone,
+  minimal: composerMessages.effortMinimal,
   low: composerMessages.effortLow,
   medium: composerMessages.effortMedium,
   high: composerMessages.effortHigh,
   xhigh: composerMessages.effortExtraHigh,
   max: composerMessages.effortMaximum,
   ultra: composerMessages.effortUltra,
-} satisfies Record<TeamHubAgentReasoningEffort, Message>;
+};
 
 /** The effort's name; a component passes its own `t` to follow the language. */
 export function reasoningEffortLabel(
   value: TeamHubAgentReasoningEffort,
   t: Translate = translate,
 ) {
-  return t(reasoningEffortMessages[value]);
+  const message = Object.hasOwn(reasoningEffortMessages, value)
+    ? reasoningEffortMessages[value]
+    : undefined;
+  if (message) return t(message);
+  const words = value.replace(/[_-]+/g, " ").trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : value;
 }
 
 /**

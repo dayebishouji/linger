@@ -7,8 +7,8 @@
   supervision, and Runtime execution.
 - The Go implementation under `local-daemon/` is the only Local Computer
   Daemon and Runtime execution implementation, and `local-daemon/cmd/linger-computer`
-  is the control CLI the release bundle ships as `cli/linger-computer`. The bundled Node runs only the `teamhub` CLI and the managed
-  Computer tools.
+  is the control CLI the release bundle ships as `cli/linger-computer`. The bundled Node runs only the `teamhub` CLI, the managed
+  Computer tools, and the bundled Pi runtime.
 - The Desktop app (`apps/desktop`) ships the same Daemon and runs it as its
   child. A `desktop` config section selects Desktop mode: no
   self-update, shutdown when stdin closes, status lines on stdout, and the
@@ -50,9 +50,17 @@
 
 - `cmd/linger-computer-launcher` is the stable Windows command: as
   `linger-computer-<environment>.exe` it runs the active bundle's CLI, and as
-  `cli/teamhub.exe` the bundled Node TeamHub CLI. The Daemon's Windows-only
-  `platform` subcommand serves the Windows installer helper (owner-only files,
-  process identity, owned-process cleanup); nothing else calls it.
+  `cli/teamhub.exe` the bundled Node TeamHub CLI. `cmd/linger-pi-launcher` is
+  the minimal Windows native launcher shipped as `cli/computer-tools/bin/pi.exe`
+  that starts the bundled Pi runtime on the sibling bundled Node inside a
+  kill-on-close Job Object. `cmd/linger-teamhub-launcher` is the Windows native
+  launcher Desktop ships as `dist/teamhub-cli/teamhub.exe`; it runs `teamhub.js`
+  on the Desktop bundled Node (or `Linger.exe` with `ELECTRON_RUN_AS_NODE=1`,
+  falling back to `LINGER_NODE` or `node` on `PATH` from source) inside a
+  kill-on-close Job Object without routing arguments through `cmd.exe`. The
+  Daemon's Windows-only `platform` subcommand serves the Windows installer
+  helper (owner-only files, process identity, owned-process cleanup); nothing
+  else calls it.
 - `scripts/` builds the development bundle, and `tests/` holds the Vitest
   checks of the bundle tools and the Runner Gateway wire against the Go
   Daemon. Do not add a second Runtime detector, Runtime executor, Gateway
@@ -69,20 +77,30 @@
 - On Windows an npm-launched Runtime starts on the Node the bundle ships in
   `runtime/bin`, so an engine requirement a Runtime declares is independent of
   the Node installed on the machine; the machine's `PATH` stays the user's.
-- A Pi background model call uses one ephemeral RPC turn with no tools on
-  whatever model Pi's profile selects by default, local or remote; the Daemon
-  does not check which.
-- A Codex background model call runs the model its `config.toml` selects (the
-  active profile's or the top-level `model`). When it selects none, the call
-  names the model Codex's own catalog marks as the default for the signed-in
-  account, the catalog Agent runs choose from; the Daemon passes that default
-  on and never picks among models. Codex's built-in default may be one the
-  account cannot use. A call the provider rejects with `model_not_found` is
-  reported as `runtime_incompatible`, not as a transient failure.
+- Background model calls (`execute` `model_invoke`) follow the same model as
+  Agent Runs when the Agent Service supplies `model` (Computer `0.62.0` or
+  later), passing it explicitly to Codex (`-m` / `--config model=...`), Claude
+  (`--model`), Pi (`--model`), and Antigravity (Computer `0.67.0` or later,
+  via isolated `agy acp` `session/set_config_option`), normalizing reasoning
+  effort against that model, and calling `ensureLocalModel` for Pi library
+  models on demand.
+- For legacy callers that omit `model`, a Pi background model call runs on
+  whatever model Pi's profile selects by default (refused when no library model
+  is loaded), and a Codex call runs the model its `config.toml` selects or the
+  signed-in account's catalog default when `config.toml` names none. A call the
+  provider rejects with `model_not_found` is reported as
+  `runtime_incompatible`, not as a transient failure.
 - Codex turn cleanup keeps receiving a process's notifications after its
   Operation detaches, so a retried stop sees the turn complete. After an
   invalid-request interrupt rejection the Daemon also accepts an idle status on
   the same thread. Terminal cleanup and process exit checks still apply.
+
+- A Pi assistant message with `stopReason: "aborted"` interrupts the turn.
+  A scheduler cancellation resumes the same Run only after the native turn
+  stops for that cancellation and cleanup is confirmed. If Pi reports an abort
+  while the cancellation RPC is pending, the Daemon gives Pi a bounded grace
+  period to report whether the cancellation stopped that turn. An independent Pi
+  abort ends the Run as interrupted, including when a yield arrives late.
 
 - Default tests use deterministic providers and real fixture child processes;
   they never call a live model.
@@ -93,14 +111,19 @@
   credential. Resolve canonical workspace grants before invoking an
   installed Runtime provider.
 - The `feishu_mail` Computer tool (`localtools.FeishuMail`) runs the owner's
-  own lark-cli for TeamHub's Feishu Mail. It finds lark-cli on PATH or where
-  its installers put it, and runs the native binary beside npm's Node
-  launcher, so Node need not be on a short Daemon PATH. A request names only a
+  own lark-cli for TeamHub's Feishu Mail. It finds lark-cli where Runtime
+  discovery looks (`provider.ExecutableCandidates`: PATH, `~/.local/bin`,
+  `~/.claude/local`, `~/.npm-global/bin`, and `%APPDATA%\npm` on Windows) or
+  where its installers put it, and runs
+  the native binary beside npm's Node launcher, so Node need not be on a
+  short Daemon PATH. A request names only a
   method and an API path under `/open-apis/mail/v1/user_mailboxes/me`, never
   lark-cli's other Feishu scopes. A started login's device code stays in the
   Daemon's memory under the caller's login name, so a restart drops it and
-  the owner connects again. Results carry lark-cli's error type, subtype and
-  Feishu code, never a decision made from its message.
+  the owner connects again. Results carry lark-cli's error type, subtype,
+  Feishu code, never a decision made from its message; a
+  `config` error, a lark-cli never set up with a Feishu app, is
+  `not_configured`.
 - Do not commit runtime state, PID files, sockets, logs, credentials, or build
   output.
 
@@ -138,7 +161,7 @@
   do not require the full installer lifecycle gate. CI runs
   `make check-computer-go` (the daemon's Go unit tests) when `local-daemon/`
   changes, and `check (computer-go-windows)` builds every daemon package for
-  Windows and tests only `cmd/linger-computer-launcher`, `internal/computercli`,
+  Windows and tests only `cmd/linger-computer-launcher`, `cmd/linger-pi-launcher`, `cmd/linger-teamhub-launcher`, `internal/computercli`,
   `internal/computerconfig`, `internal/localmodels`, and `internal/process`
   there; other packages (`internal/uiruntime`, `internal/provider/native`, and
   so on) are not tested on Windows in CI. The rest of `check-computer` stays

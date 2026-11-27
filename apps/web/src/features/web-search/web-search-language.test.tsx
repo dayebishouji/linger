@@ -66,9 +66,9 @@ describe("web search in the language on screen", () => {
       name: connectors.filterWebSearch,
     });
     expect(
-      within(screen.getByRole("tablist")).getByRole("tab", {
-        name: connectors.filterWebSearch,
-      }),
+      within(
+        screen.getByRole("group", { name: connectors.connectorCategories }),
+      ).getByRole("button", { name: connectors.filterWebSearch }),
     ).toBeVisible();
     const tavily = within(section)
       .getByRole("button", { name: "Tavily" })
@@ -101,7 +101,6 @@ describe("web search in the language on screen", () => {
     expect(
       within(dialog).getByRole("button", { name: connectors.removeKey }),
     ).toHaveAttribute("data-voice-risk", "never");
-    expect(dialog).toHaveTextContent(keyField.storedEncrypted);
   });
 
   it("words the chat's search key card in Chinese", async () => {

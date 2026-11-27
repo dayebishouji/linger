@@ -29,6 +29,7 @@ import {
   sequenceIds,
   settlesWithin,
 } from "./runner-gateway-fixtures.js";
+import { runtimeDiagnostics } from "./runtime-diagnostics-fixture.js";
 
 describe("RunnerGateway", () => {
   it("holds an MCP initialize request until the dispatched Operation is accepted", async () => {
@@ -1093,5 +1094,120 @@ describe("RunnerGateway", () => {
       }),
     );
     await operation.result;
+  });
+
+  it.each([
+    { daemonVersion: "0.62.0", expected: undefined },
+    {
+      daemonVersion: "0.63.0",
+      expected: { provider_type: "codex", session_id: "thread-prev" },
+    },
+  ])(
+    "gates previous_session on operation.start by Computer version ($daemonVersion)",
+    async ({ daemonVersion, expected }) => {
+      const gateway = createTestRunnerGateway({
+        heartbeatIntervalMs: 1_000,
+        createId: sequenceIds(),
+      });
+      const peer = new RecordingPeer();
+      const connection = await acceptReadyConnection(
+        gateway,
+        peer,
+        { ...contextHello(), daemon_version: daemonVersion },
+        defaultAgentPlacement({ workspaceGrantId: "grant-owner" }),
+      );
+      const context = localContextViewIdentity();
+      const baseTarget = contextRunTarget(context, []);
+      const operation = await gateway.startOperation({
+        ...baseTarget,
+        request: {
+          ...baseTarget.request,
+          previous_session: {
+            provider_type: "codex",
+            session_id: "thread-prev",
+          },
+        },
+      });
+      const start = peer.sent.find(
+        (envelope) => envelope.type === "operation.start",
+      );
+      if (start?.type !== "operation.start") {
+        throw new Error("Expected operation.start");
+      }
+      expect(start.request.previous_session).toEqual(expected);
+
+      await connection.receive(
+        event(start, 1, {
+          type: "operation.accepted",
+          command_id: start.command_id,
+          runner_pid: 100,
+        }),
+      );
+      await connection.receive(
+        event(start, 2, {
+          type: "operation.completed",
+          result: {
+            type: "run",
+            final_response: "done",
+            session: { thread_id: "thread-1" },
+          },
+        }),
+      );
+      await operation.result;
+    },
+  );
+
+  it("validates and sends provider.prepare for Antigravity with a blank session", async () => {
+    const gateway = createTestRunnerGateway({
+      heartbeatIntervalMs: 1_000,
+      createId: sequenceIds(),
+    });
+    const peer = new RecordingPeer();
+    await acceptReadyConnection(
+      gateway,
+      peer,
+      {
+        ...contextHello(),
+        runtimes: ["antigravity"],
+        runtime_diagnostics: runtimeDiagnostics({ ready: ["antigravity"] }),
+      },
+      defaultAgentPlacement({
+        workspaceGrantId: "grant-owner",
+        runtime: { type: "antigravity" },
+      }),
+    );
+    const context = localContextViewIdentity();
+    const prepareTarget = {
+      tenantId: context.tenantId,
+      agentId: context.agentId,
+      runnerId: context.computerId,
+      ownerActorId: "actor-alice",
+      workspaceGrantId: context.workspaceGrantId,
+      executionContextKey: context.executionContextKey,
+      runtimeInstanceId: context.runtimeInstanceId,
+    };
+
+    const prepared = gateway.prepareProvider(prepareTarget, {
+      runtime: { type: "antigravity" },
+      sessionOptions: { thread_name: "Reviewer" },
+      session: { threadId: "" },
+      contextViewRef: { view_digest: context.viewDigest },
+      runContext: { permission_review: true },
+    });
+    expect(prepared).toBeDefined();
+
+    const providerPrepare = peer.sent.find(
+      (envelope) =>
+        envelope.type === "prepare" && envelope.target === "provider",
+    );
+    expect(providerPrepare).toMatchObject({
+      type: "prepare",
+      target: "provider",
+      prepare_id: prepared!.prepareId,
+      runtime_type: "antigravity",
+      runtime: { type: "antigravity" },
+      session: { threadId: "" },
+      run_context: { permission_review: true },
+    });
   });
 });

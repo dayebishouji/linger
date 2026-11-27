@@ -24,6 +24,7 @@ import {
   poolLabel,
   poolOf,
   poolOtherBytes,
+  poolUnaccountedBytes,
   type LoadCheck,
   type ModelEntry,
 } from "./local-models-rules";
@@ -87,6 +88,7 @@ export function MakeRoomDialog({
   const pool = poolLabel(view, check.pool, t);
   const place = placeName(view, check.pool.id, t);
   const otherBytes = poolOtherBytes(check.pool);
+  const unaccountedBytes = poolUnaccountedBytes(check.pool);
   const unifiedFitsHardware =
     check.pool.kind === "unified" &&
     (view.computer.host?.ram_total_bytes ?? 0) >= check.needBytes;
@@ -99,7 +101,16 @@ export function MakeRoomDialog({
   const tooBig = check.needBytes > check.pool.total_bytes;
   const inUse = [
     ...(otherBytes
-      ? [{ bytes: otherBytes, id: "", name: t(m.otherApps) }]
+      ? [{ bytes: otherBytes, id: "other-apps", name: t(m.otherApps) }]
+      : []),
+    ...(unaccountedBytes
+      ? [
+          {
+            bytes: unaccountedBytes,
+            id: "system-engine",
+            name: t(m.systemAndEngine),
+          },
+        ]
       : []),
     ...check.kept,
   ];
@@ -180,7 +191,7 @@ export function MakeRoomDialog({
             <legend className="mb-1.5 text-xs font-medium text-muted-foreground">
               {t(m.unloadTheseLegend)}
             </legend>
-            <div className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-card">
+            <div className="overflow-hidden rounded-lg border border-border bg-card">
               {check.loaded.map((item) => (
                 <label
                   className={cn(
@@ -239,7 +250,7 @@ export function MakeRoomDialog({
             {inUse.length ? (
               <ul
                 aria-label={t(m.alsoUsingMemory)}
-                className="divide-y divide-border/70 overflow-hidden rounded-lg border border-border bg-muted/40"
+                className="overflow-hidden rounded-lg border border-border bg-muted/40"
               >
                 {inUse.map((holder) => (
                   <li

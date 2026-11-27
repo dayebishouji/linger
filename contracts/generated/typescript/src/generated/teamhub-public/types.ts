@@ -276,7 +276,7 @@ export interface paths {
     };
     /**
      * Read the current Human's Another Me and its Chat.
-     * @description Both fields are absent until the Human's Computer first comes online with a ready Runtime and a writable workspace, which creates the Another Me.
+     * @description Both agent_actor_id and room_id are absent until the Human's Computer first comes online with a ready Runtime and a writable workspace, which creates the Another Me. While absent, placement_blocker reports why TeamHub could not place or create it on the Human's registered Local Computers.
      */
     get: operations["getAnotherMe"];
     put?: never;
@@ -690,82 +690,6 @@ export interface paths {
      * @description Human Sponsor only. The caller supplies only the package file. TeamHub parses SKILL.md, matches the runtime name against this Agent's explicit bindings, then either publishes a new immutable version for that Skill or creates a Sponsor-private Skill and binds it. Same-name platform default Skills cannot be replaced. Saving completes the configuration update without activating idle Contexts. Subsequent new ordinary Runs read the current configuration; active Runs, steer, and recovery of the same execution retain their loaded versions.
      */
     post: operations["uploadAgentSkillPackage"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/v0/tenants/{tenantId}/agent-templates": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        tenantId: components["parameters"]["TenantId"];
-      };
-      cookie?: never;
-    };
-    /**
-     * List reusable Agent templates available for Agent creation.
-     * @description Returns deployment built-in templates and every published template. Clients group the result by origin. Skill references are returned exactly as published and are resolved against this Tenant catalog only when an Agent is created.
-     */
-    get: operations["listAgentTemplates"];
-    put?: never;
-    /**
-     * Publish one reusable Agent template to the deployment template market.
-     * @description Any authenticated Human Actor in the Tenant may publish. The published definition becomes visible to every Tenant in this deployment, so callers must obtain explicit Human intent before sending it. Only the publisher may remove it afterwards. A repeated submission publishes another template.
-     */
-    post: operations["publishAgentTemplate"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/v0/tenants/{tenantId}/agent-templates/{templateId}": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        tenantId: components["parameters"]["TenantId"];
-        templateId: components["parameters"]["AgentTemplateId"];
-      };
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    post?: never;
-    /**
-     * Remove one published Agent template.
-     * @description Only the publishing Human Actor may remove a published template. Built-in templates are owned by the deployment and cannot be removed. Agents already created from the template keep their own configuration.
-     */
-    delete: operations["deleteAgentTemplate"];
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/v0/tenants/{tenantId}/agent-templates/{templateId}/skill-imports": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        tenantId: components["parameters"]["TenantId"];
-        templateId: components["parameters"]["AgentTemplateId"];
-      };
-      cookie?: never;
-    };
-    /**
-     * Preview which template Skills this caller would need copied into the Tenant.
-     * @description Read-only. Lists the template's Skill references that the caller cannot bind from this Tenant catalog, and whether each can be copied from the publishing Tenant. Publishing a template shares its Skill versions with every Tenant, so a Skill the publisher uploaded privately is importable while it stays sealed and active.
-     */
-    get: operations["listAgentTemplateSkillImports"];
-    put?: never;
-    /**
-     * Copy the template's importable Skills into this Tenant as private Skills of the caller.
-     * @description Each importable source version becomes a sealed, owner-scoped Skill of the calling Human in this Tenant, reusing the immutable package files. A copy with identical package name and content that the caller already owns is reused, so repeating the import is harmless. Nothing is bound to an Agent here.
-     */
-    post: operations["importAgentTemplateSkills"];
     delete?: never;
     options?: never;
     head?: never;
@@ -2509,6 +2433,26 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v0/url-preview/framing": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * Report whether a site lets the link preview panel frame it.
+     * @description A browser cannot read a cross-origin frame's response headers, so the Web link preview panel asks TeamHub before it frames a page. TeamHub sends HEAD without cookies (GET only when the server refuses HEAD, which may spend a one-time link), follows up to five redirects and reads the framing rules of the final response. It requests only public addresses, checked at connection time, on ports 80 and 443, runs a few probes at once and gives up after five seconds. The desktop app shows pages natively and does not use this. 400 INVALID_REQUEST for a URL that is not http or https, or that carries credentials.
+     */
+    get: operations["getUrlPreviewFraming"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v0/web-search/backends": {
     parameters: {
       query?: never;
@@ -3997,6 +3941,23 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v0/external-apps/feishu-mail/setup": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Check whether the signed-in account can start Feishu Mail authorization. */
+    get: operations["checkFeishuMailSetup"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v0/external-apps/provider-key": {
     parameters: {
       query?: never;
@@ -4093,12 +4054,13 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
   schemas: {
-    /** @description Reliable LiveKit data packet on topic linger.voice.live sent by the VoiceSession publisher to Voice Runtime. tool_result answers one tool_request; context silently tells the live model where the Human is, such as the page they opened. These packets only steer the conversation and never authorize writes. */
+    /** @description Reliable LiveKit data packet on topic linger.voice.live sent by the VoiceSession publisher to Voice Runtime. tool_result answers one tool_request; context silently tells the live model where the Human is, such as the page they opened; audio_stats reports how the browser received the reply audio and sent the microphone since its previous report, only for Voice Runtime to log. These packets only steer the conversation and never authorize writes. */
     VoiceLiveClientEvent: {
       /** @enum {string} */
-      type: "tool_result" | "context";
+      type: "tool_result" | "context" | "audio_stats";
       call_id?: string;
       text?: string;
+      audio?: components["schemas"]["VoiceLiveAudioStats"];
     };
     /** @description Reliable LiveKit data packet on topic linger.voice.live sent by Voice Runtime to the VoiceSession publisher. user_partial and user_turn carry the Human's transcript; reply_delta and reply_done carry the live reply text for subtitles; reply_done also means the turn's whole reply, including its tool rounds, has finished, so the browser saves the turn after it; reply_interrupted stops playback of that turn; tool_request asks the browser to read or operate the page it shows, or to end Voice Mode; speech_started opens the bubble of a background update the runtime started saying, identified by speech_id, whose reply_delta/reply_done carry its actual spoken words without touching the turn's own reply. playout_done says the turn's reply audio has finished playing on the reply track. session_failure asks the browser to fall back to dictation. */
     VoiceLiveRuntimeEvent: {
@@ -4319,15 +4281,7 @@ export interface components {
      * @enum {string}
      */
     AgentType: "general" | "anotherme";
-    /** @enum {string} */
-    AgentReasoningEffort:
-      | "none"
-      | "low"
-      | "medium"
-      | "high"
-      | "xhigh"
-      | "max"
-      | "ultra";
+    AgentReasoningEffort: string;
     /** @enum {string} */
     LocalRuntimeType: "codex" | "claude" | "pi" | "antigravity";
     /** @description Agents run on one of the Sponsor's Local Computers. Placement requires computer_id, runtime_type, and workspace_grant_id; TeamHub validates that invariant before persistence. */
@@ -4404,8 +4358,6 @@ export interface components {
      */
     CreatableAgentType: "general";
     TenantAgentCreateRequest: {
-      /** @description TeamHub freezes this template's Routines when reserving the Agent. Activation creates the Sponsor direct Room and copies all Routines atomically. Registration retries reuse the frozen snapshot even if the template is later removed. */
-      template_id?: components["schemas"]["Id"];
       name: string;
       description?: string;
       /** @description Product avatar selection stored with the Agent so every Human sees the same avatar. Clients that do not recognise the key fall back to their own derived default. */
@@ -4471,7 +4423,8 @@ export interface components {
       | "RUNTIME_AUTHENTICATION_REQUIRED"
       | "RUNTIME_INCOMPATIBLE"
       | "RUNTIME_DIAGNOSTIC_FAILED"
-      | "LOCAL_COMPUTER_OFFLINE";
+      | "LOCAL_COMPUTER_OFFLINE"
+      | "LOCAL_COMPUTER_UPGRADE_REQUIRED";
     LocalAgentRuntimeStatus: {
       computer_id: components["schemas"]["Id"];
       display_name: string;
@@ -4516,11 +4469,35 @@ export interface components {
       consecutive_failures: number;
       reason: components["schemas"]["AnotherMeBackgroundFailureReason"];
     };
-    /** @description The Human's Another Me and its live direct Chat. Empty until the Another Me exists; room_id is also absent while the Chat is being deleted. */
+    /**
+     * @description Why TeamHub skipped or failed creating the Human's Another Me on their Local Computers. Clients treat an unknown value as unknown.
+     * @enum {string}
+     */
+    AnotherMePlacementBlockerReason:
+      | "no_online_computer"
+      | "computer_upgrade_required"
+      | "no_writable_workspace_grant"
+      | "no_ready_runtime_with_models"
+      | "create_failed";
+    AnotherMePlacementRuntimeStatus: {
+      type: components["schemas"]["LocalRuntimeType"];
+      status: components["schemas"]["LocalRuntimeDiagnosticStatus"];
+      model_count: number;
+      message?: string;
+    };
+    /** @description Present while the Human has no Another Me yet and TeamHub has a known reason it cannot place or create one on the Human's Local Computers. Absent once the Another Me exists or before any Local Computer is registered for the Human. */
+    AnotherMePlacementBlocker: {
+      reason: components["schemas"]["AnotherMePlacementBlockerReason"];
+      computer_id?: components["schemas"]["Id"];
+      /** @description Runtime diagnostics last reported by the candidate Computer when placement is blocked because no Runtime is ready with models. */
+      runtimes?: components["schemas"]["AnotherMePlacementRuntimeStatus"][];
+    };
+    /** @description The Human's Another Me and its live direct Chat. Empty until the Another Me exists or a registered Local Computer reports a placement blocker; room_id is also absent while the Chat is being deleted. */
     AnotherMe: {
       agent_actor_id?: components["schemas"]["Id"];
       room_id?: components["schemas"]["Id"];
       background_failure?: components["schemas"]["AnotherMeBackgroundFailure"];
+      placement_blocker?: components["schemas"]["AnotherMePlacementBlocker"];
     };
     TenantAgentAvatarUpdateRequest: {
       avatar_key: string;
@@ -4576,10 +4553,6 @@ export interface components {
       /** @description Recommended Computer release. This is advisory and does not prevent legacy execution. */
       recommended_version?: string;
       last_seen_at?: components["schemas"]["Timestamp"];
-      /** @description Optional maximum simultaneous active Operations on this Computer. Omission means unlimited; it does not limit bound Agents. */
-      capacity?: number;
-      /** @description Currently available active Operation slots. Present only when capacity is configured. */
-      available_capacity?: number;
       /** @description Active Operations the Computer reported at its last heartbeat; 0 while it is offline. */
       active_operations: number;
       /** @description Runtimes and models as the Computer last reported them, kept while it is offline so an Agent can be placed there. */
@@ -4702,6 +4675,12 @@ export interface components {
       /** Format: int64 */
       bytes: number;
     };
+    /** @description A desktop application outside localmodels holding pool memory, such as a browser, video player, or game, that the user could close. */
+    LocalModelPoolExternalHolder: {
+      name: string;
+      /** Format: int64 */
+      bytes: number;
+    };
     /** @description One place models load into. The system and unified budgets are 80% of RAM, as localmodels computes them. */
     LocalModelPool: {
       id: components["schemas"]["LocalModelPoolId"];
@@ -4714,6 +4693,8 @@ export interface components {
       /** Format: int64 */
       used_bytes: number;
       holders: components["schemas"]["LocalModelPoolHolder"][];
+      /** @description Closeable desktop applications holding this pool's memory, as localmodels reports them. An empty list means localmodels looked and found no closeable app; absent means not reported, and the rest of used_bytes is then not known to be other apps. */
+      external_holders?: components["schemas"]["LocalModelPoolExternalHolder"][];
     };
     /** @description Stable localmodels library id: catalog id and variant, such as qwen3-4b:Q4_K_M. */
     LocalModelId: string;
@@ -4920,8 +4901,10 @@ export interface components {
       engine?: components["schemas"]["LocalModelEngine"];
       /** @description Display-only engine version and backend for this model, such as PolyStrata 0.2.19-poly.1 · CUDA. */
       engine_label?: string;
-      /** @description Maximum concurrent request slots configured for this model when loaded. */
+      /** @description Maximum concurrent request slots configured or probed for this model when loaded. */
       concurrency?: number;
+      /** @description True while a loaded or loading local model is running its post-load max-concurrency probe before reporting loaded. */
+      concurrency_probing?: boolean;
       /**
        * Format: int64
        * @description Additional host system RAM used alongside GPU VRAM for hybrid offload engines (such as PolyStrata); absent when all weights stay in the model's primary pool.
@@ -5279,113 +5262,6 @@ export interface components {
        * @description A Skill ZIP with root SKILL.md, or a single SKILL.md / skill.md file. TeamHub derives identity and the next Manifest version from the package.
        */
       package: string;
-    };
-    /**
-     * @description builtin templates ship with the deployment and belong to no Tenant. published templates are Human-published and are visible to every Tenant in the deployment.
-     * @enum {string}
-     */
-    AgentTemplateOrigin: "builtin" | "published";
-    /** @description Stable catalog key. TeamHub validates app availability and capabilities. */
-    ExternalAppKey: string;
-    /** @enum {string} */
-    RoutineCadenceKind:
-      | "daily"
-      | "weekly"
-      | "every_n_hours"
-      | "every_n_minutes"
-      | "once";
-    /** @enum {string} */
-    RoutineWeekday:
-      | "monday"
-      | "tuesday"
-      | "wednesday"
-      | "thursday"
-      | "friday"
-      | "saturday"
-      | "sunday";
-    RoutineCadence: {
-      kind: components["schemas"]["RoutineCadenceKind"];
-      /** @description IANA timezone used to evaluate the cadence. */
-      timezone: string;
-      /** @description Local hour for daily and weekly cadences. */
-      hour?: number;
-      /** @description Local minute for daily and weekly cadences. */
-      minute?: number;
-      /** @description Selected local weekdays for weekly cadences, ordered Monday through Sunday in responses. Required for weekly cadences. */
-      weekdays?: components["schemas"]["RoutineWeekday"][];
-      /** @description Repeat interval for every_n_hours cadences. */
-      interval_hours?: number;
-      /** @description Repeat interval in minutes for every_n_minutes cadences, in 10-minute increments. */
-      interval_minutes?: number;
-      /**
-       * Format: date-time
-       * @description The one moment a once cadence fires; the Routine is done (disabled) afterwards.
-       */
-      run_at?: string;
-    };
-    AgentTemplateRoutine: {
-      key: components["schemas"]["Id"];
-      name: string;
-      instruction: string;
-      cadence: components["schemas"]["RoutineCadence"];
-      enabled: boolean;
-      /** @enum {string} */
-      created_by_role: "human" | "agent";
-      /**
-       * @description Absent when the source Routine has no valid mention of the source Agent. Raw instruction text is never rewritten.
-       * @enum {string}
-       */
-      mention_role?: "agent";
-    };
-    /** @description A reusable Agent definition. It carries identity text, instructions, Routines, and the exact Skill and Connector selections. Runtime provider, model, reasoning effort, and placement are Agent deployment facts and never belong to a template. */
-    AgentTemplate: {
-      template_id: components["schemas"]["Id"];
-      origin: components["schemas"]["AgentTemplateOrigin"];
-      name: string;
-      description: string;
-      instructions: string;
-      /** @description Product avatar selection carried with the template. Clients that do not know the key fall back to their own default. */
-      avatar_key?: string;
-      skill_bindings: components["schemas"]["AgentSkillRegistration"][];
-      /** @description Connected App keys this Agent used, carried so a consumer knows what to authorize. A template never carries a connection, account, credential, or token: the consumer grants access from their own connected accounts after the Agent exists. */
-      connector_bindings: components["schemas"]["ExternalAppKey"][];
-      /** @description Fixed snapshots of all Routines in the publisher's direct Room with the source Agent. Copied automatically into the new Agent's direct Room with its Sponsor. */
-      routines: components["schemas"]["AgentTemplateRoutine"][];
-      /** @description Present only for published templates. */
-      published_by?: components["schemas"]["ActorRef"];
-      created_at: components["schemas"]["Timestamp"];
-      updated_at: components["schemas"]["Timestamp"];
-    };
-    AgentTemplatePage: {
-      items: components["schemas"]["AgentTemplate"][];
-    };
-    /** @description Publishes one reusable definition to the deployment-wide template market. Skill references are stored exactly as given and are resolved against the consuming Tenant catalog when an Agent is created. Publishing shares the referenced Skill versions: a consumer may copy a version private to the publisher into their own Tenant through importAgentTemplateSkills. A reference that can be neither bound nor copied is skipped rather than rejected here. Connector references name Apps only; no connection, credential, or account of the publisher is ever carried. */
-    AgentTemplatePublishRequest: {
-      /** @description When present, TeamHub verifies the caller sponsors this Agent and snapshots every Routine in their direct Room. An absent direct Room produces an empty snapshot. */
-      source_agent_actor_id?: components["schemas"]["Id"];
-      name: string;
-      description?: string;
-      instructions: string;
-      avatar_key?: string;
-      skill_bindings?: components["schemas"]["AgentSkillRegistration"][];
-      /** @description Connected App keys this Agent used, carried so a consumer knows what to authorize. A template never carries a connection, account, credential, or token: the consumer grants access from their own connected accounts after the Agent exists. */
-      connector_bindings?: components["schemas"]["ExternalAppKey"][];
-    };
-    /**
-     * @description importable means the published template's Skill version can be copied from the publisher's Tenant into this Tenant as a private Skill of the caller. imported means the copy exists (created now or reused from an earlier import with identical content). unavailable means the source version is missing, disabled, deleted, or not owned by the template's publishing Tenant.
-     * @enum {string}
-     */
-    AgentTemplateSkillImportStatus: "importable" | "imported" | "unavailable";
-    AgentTemplateSkillImport: {
-      /** @description The Skill reference exactly as the template carries it. */
-      source: components["schemas"]["AgentSkillRegistration"];
-      status: components["schemas"]["AgentTemplateSkillImportStatus"];
-      /** @description The caller-visible private copy to bind. Present only when status is imported. */
-      skill?: components["schemas"]["AgentSkillRegistration"];
-    };
-    /** @description Template Skill references the caller cannot bind from this Tenant catalog. References the catalog already resolves, including platform Skills, are not listed. */
-    AgentTemplateSkillImportPage: {
-      items: components["schemas"]["AgentTemplateSkillImport"][];
     };
     /**
      * @description Personal Room participation; leaving preserves membership and its role.
@@ -6052,6 +5928,42 @@ export interface components {
       name?: string;
       description?: string;
     };
+    /** @enum {string} */
+    RoutineCadenceKind:
+      | "daily"
+      | "weekly"
+      | "every_n_hours"
+      | "every_n_minutes"
+      | "once";
+    /** @enum {string} */
+    RoutineWeekday:
+      | "monday"
+      | "tuesday"
+      | "wednesday"
+      | "thursday"
+      | "friday"
+      | "saturday"
+      | "sunday";
+    RoutineCadence: {
+      kind: components["schemas"]["RoutineCadenceKind"];
+      /** @description IANA timezone used to evaluate the cadence. */
+      timezone: string;
+      /** @description Local hour for daily and weekly cadences. */
+      hour?: number;
+      /** @description Local minute for daily and weekly cadences. */
+      minute?: number;
+      /** @description Selected local weekdays for weekly cadences, ordered Monday through Sunday in responses. Required for weekly cadences. */
+      weekdays?: components["schemas"]["RoutineWeekday"][];
+      /** @description Repeat interval for every_n_hours cadences. */
+      interval_hours?: number;
+      /** @description Repeat interval in minutes for every_n_minutes cadences, in 10-minute increments. */
+      interval_minutes?: number;
+      /**
+       * Format: date-time
+       * @description The one moment a once cadence fires; the Routine is done (disabled) afterwards.
+       */
+      run_at?: string;
+    };
     RoutineListener: {
       /**
        * @description Connected app whose new events the Routine hands to proactive judgement.
@@ -6603,11 +6515,11 @@ export interface components {
       /** @constant */
       type: "status.changed";
       /** @enum {string} */
-      status: "queued" | "working" | "thinking";
-      /** @description Optional public queue label for queued, or the full provider-visible reasoning summary title for thinking. Omit for working; raw reasoning is never allowed. */
+      status: "queued" | "working" | "thinking" | "waiting_background";
+      /** @description Optional public queue label for queued, or the full provider-visible reasoning summary title for thinking. Omit for working and waiting_background; raw reasoning is never allowed. */
       title?: string;
     };
-    /** @description Public classified failure; contains no native error text, paths, credentials, or task input. Each code is set where the failure is observed, from structured signals only. model_unavailable means the model service refused the selected model for the Runtime's account, so the Agent needs another model or another sign-in. model_not_offered means the Agent's Computer does not offer the selected model for its Runtime, or the model does not support the selected reasoning effort, so the Runtime could not start; the Agent needs a model and reasoning effort that Computer offers. local_model_unavailable means the Agent's Computer could not load the Agent's local model (not enough free memory, not fully downloaded, or loading took too long), so the Runtime did not start; the person can manage it on the Computer's Models page or choose another model. context_too_long means the conversation no longer fits the model's context window. model_service_error means the model service reported a server-side error. timeout means the Runtime hit its local execution deadline. execution_outcome_unknown means a command was dispatched but no validated exit was observed before unexpected transport or Runtime failure. Intentional cancellation, authorization loss or unavailability, and normal retirement do not create this classification. Authorization loss or unavailability includes explicit revocation, authorization checks that fail or time out, and authorization expiry. This code does not currently cover unknown effects caused by control-plane disconnection. It remains a failed Run and must not be automatically replayed; verify its effects before starting another Run. reply_undelivered means a Room Run finished, but every message the Agent tried to post failed, so the Room received no reply from it. reply_not_sent means a Room Run finished without trying to post anything while a Human who mentioned the Agent waited for its reply; the Runtime ended the turn in text nobody sees, which is not posted for it. interrupted means the Run stopped before it finished for a reason other than a user cancellation, such as a restart or a Runner stopped on its Computer; part of its work may have taken effect and it is not replayed. computer_unavailable means the Agent's Computer could not run it: the Computer is unreachable, the Agent's Runner is stopped there, or the Runtime is not enabled. cleanup_unconfirmed means the Runtime process could not be confirmed stopped. response_too_large means the reply exceeded the Room's size limit. unclassified means no structured signal identified the cause. runtime_type is present when the failure belongs to a selected Runtime; it is absent for failures the Agent Service or TeamHub observes without one. */
+    /** @description Public classified failure; contains no credentials, raw secrets, or task input. Each code is set where the failure is observed, from structured signals only. detail is an optional redacted, single-line diagnostic summary for Activity display. model_unavailable means the model service refused the selected model for the Runtime's account, so the Agent needs another model or another sign-in. model_not_offered means the Agent's Computer does not offer the selected model for its Runtime, or the model does not support the selected reasoning effort, so the Runtime could not start; the Agent needs a model and reasoning effort that Computer offers. local_model_unavailable means the Agent's Computer could not load the Agent's local model (not enough free memory, not fully downloaded, or loading took too long), so the Runtime did not start; the person can manage it on the Computer's Models page or choose another model. model_gateway_unavailable means the Agent's Computer could not start or reach its local model gateway (such as Bifrost for BYOK), so the Runtime did not start; the person can check the Computer's Models page or Local Computer diagnostics before retrying. context_too_long means the conversation no longer fits the model's context window. model_service_error means the model service reported a server-side error. timeout means the Runtime hit its local execution deadline. execution_outcome_unknown means a command was dispatched but no validated exit was observed before unexpected transport or Runtime failure. Intentional cancellation, authorization loss or unavailability, and normal retirement do not create this classification. Authorization loss or unavailability includes explicit revocation, authorization checks that fail or time out, and authorization expiry. This code does not currently cover unknown effects caused by control-plane disconnection. It remains a failed Run and must not be automatically replayed; verify its effects before starting another Run. reply_undelivered means a Room Run finished while a Human who mentioned the Agent waited for its reply, every message write the Agent tried to post failed, and no reply reached the Room. reply_not_sent means a Room Run finished while a Human who mentioned the Agent waited for its reply and no reply reached the Room without any failed message write attempt (for instance, the Runtime ended the turn in text nobody sees, which is not posted for it). interrupted means the Run stopped before it finished for a reason other than a user cancellation, such as a restart or a Runner stopped on its Computer; part of its work may have taken effect and it is not replayed. computer_unavailable means the Agent's Computer could not run it: the Computer is unreachable, the Agent's Runner is stopped there, or the Runtime is not enabled. cleanup_unconfirmed means the Runtime process could not be confirmed stopped. response_too_large means the reply exceeded the Room's size limit. unclassified means no structured signal identified the cause. runtime_type is present when the failure belongs to a selected Runtime; it is absent for failures the Agent Service or TeamHub observes without one. */
     AgentRuntimeExecutionFailure: {
       /** @enum {string} */
       code:
@@ -6619,6 +6531,7 @@ export interface components {
         | "model_unavailable"
         | "model_not_offered"
         | "local_model_unavailable"
+        | "model_gateway_unavailable"
         | "context_too_long"
         | "model_service_error"
         | "timeout"
@@ -6633,6 +6546,8 @@ export interface components {
         | "unclassified";
       runtime_type?: components["schemas"]["LocalRuntimeType"];
       runtime_version?: string;
+      /** @description Optional redacted, single-line diagnostic detail explaining why the Run failed, for display in the Activity log. Must contain no credentials or control characters. */
+      detail?: string;
     };
     AgentRuntimeStoppedStatusChangedEvent: {
       /** @constant */
@@ -7092,6 +7007,8 @@ export interface components {
       items: components["schemas"]["MemoryEntryListItem"][];
       next_cursor?: components["schemas"]["Cursor"];
     };
+    /** @description Stable catalog key. TeamHub validates app availability and capabilities. */
+    ExternalAppKey: string;
     /** @enum {string} */
     ExternalConnectionStatus:
       | "pending"
@@ -7132,6 +7049,7 @@ export interface components {
         | "connect_link_expired"
         | "identity_mismatch"
         | "duplicate_remote_principal"
+        | "provider_auth_failed"
         | "stale_revision"
         | "internal_error";
       /**
@@ -7535,6 +7453,13 @@ export interface components {
       media_type?: string;
       /** Format: binary */
       content: string;
+    };
+    UrlPreviewFraming: {
+      /**
+       * @description refused: the final response forbids framing by another site (X-Frame-Options DENY or SAMEORIGIN, or a CSP frame-ancestors that allows no page of the Linger page's scheme), so the panel offers a new tab instead of a frame. allowed: it does not. unknown: TeamHub did not read the page, because it was unreachable, slow or redirected too often, TeamHub was busy with other probes, or it is on a non-public address or a port other than 80 and 443, which TeamHub never requests; the panel frames it and lets the browser decide.
+       * @enum {string}
+       */
+      framing: "allowed" | "refused" | "unknown";
     };
     /**
      * @description A backend that runs searches.
@@ -8575,6 +8500,20 @@ export interface components {
       calendars: components["schemas"]["GoogleCalendar"][];
       next_page_token?: string;
     };
+    /** @description WebRTC audio statistics the browser observed since its previous audio_stats report, as deltas rather than cumulative totals. Reply fields come from the reply track's inbound-rtp stats and packets_sent from the microphone's outbound-rtp stats; a field is absent when the browser does not report it, a replaced reply or microphone track counts from zero, and a counter that went down (packets_lost after late packets) reports 0. No audio or text. */
+    VoiceLiveAudioStats: {
+      interval_ms: number;
+      samples_received?: number;
+      concealed_samples?: number;
+      silent_concealed_samples?: number;
+      concealment_events?: number;
+      inserted_samples_for_deceleration?: number;
+      removed_samples_for_acceleration?: number;
+      /** @description Average jitter buffer delay of the samples emitted in the interval. */
+      jitter_buffer_delay_ms?: number;
+      packets_lost?: number;
+      packets_sent?: number;
+    };
   };
   responses: {
     /** @description The request is malformed or fails validation. */
@@ -8737,7 +8676,6 @@ export interface components {
     TenantId: components["schemas"]["Id"];
     ActorId: components["schemas"]["Id"];
     AgentId: components["schemas"]["Id"];
-    AgentTemplateId: components["schemas"]["Id"];
     WorkItemId: components["schemas"]["Id"];
     RoutineId: components["schemas"]["Id"];
     WorkItemCommentId: components["schemas"]["Id"];
@@ -9159,7 +9097,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
-      /** @description The Another Me, or an empty object before it exists. */
+      /** @description The Another Me, or an empty/diagnostic object before it exists. */
       200: {
         headers: {
           [name: string]: unknown;
@@ -9972,136 +9910,6 @@ export interface operations {
         };
         content?: never;
       };
-    };
-  };
-  listAgentTemplates: {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        tenantId: components["parameters"]["TenantId"];
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description Built-in and published Agent templates in stable order. */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AgentTemplatePage"];
-        };
-      };
-      401: components["responses"]["Unauthenticated"];
-      404: components["responses"]["NotFound"];
-    };
-  };
-  publishAgentTemplate: {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        tenantId: components["parameters"]["TenantId"];
-      };
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["AgentTemplatePublishRequest"];
-      };
-    };
-    responses: {
-      /** @description Agent template published. */
-      201: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AgentTemplate"];
-        };
-      };
-      400: components["responses"]["BadRequest"];
-      401: components["responses"]["Unauthenticated"];
-      404: components["responses"]["NotFound"];
-      409: components["responses"]["Conflict"];
-    };
-  };
-  deleteAgentTemplate: {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        tenantId: components["parameters"]["TenantId"];
-        templateId: components["parameters"]["AgentTemplateId"];
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description Published template removed, or it was already absent. */
-      204: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
-      401: components["responses"]["Unauthenticated"];
-      403: components["responses"]["Forbidden"];
-      404: components["responses"]["NotFound"];
-    };
-  };
-  listAgentTemplateSkillImports: {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        tenantId: components["parameters"]["TenantId"];
-        templateId: components["parameters"]["AgentTemplateId"];
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description Unresolvable template Skill references with importable or unavailable status. */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AgentTemplateSkillImportPage"];
-        };
-      };
-      401: components["responses"]["Unauthenticated"];
-      404: components["responses"]["NotFound"];
-    };
-  };
-  importAgentTemplateSkills: {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        tenantId: components["parameters"]["TenantId"];
-        templateId: components["parameters"]["AgentTemplateId"];
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      /** @description Imported copies and references that stay unavailable. */
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["AgentTemplateSkillImportPage"];
-        };
-      };
-      400: components["responses"]["BadRequest"];
-      401: components["responses"]["Unauthenticated"];
-      404: components["responses"]["NotFound"];
-      409: components["responses"]["Conflict"];
     };
   };
   listRooms: {
@@ -12847,6 +12655,33 @@ export interface operations {
       409: components["responses"]["Conflict"];
       413: components["responses"]["PayloadTooLarge"];
       503: components["responses"]["ServiceUnavailable"];
+    };
+  };
+  getUrlPreviewFraming: {
+    parameters: {
+      query: {
+        /** @description The http or https page to preview. */
+        url: string;
+        /** @description The scheme of the Linger page that frames the site; frame-ancestors scheme sources are matched against it. Without it, http and https sources both allow the frame. */
+        page_scheme?: "http" | "https";
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Whether the page may be framed. */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["UrlPreviewFraming"];
+        };
+      };
+      400: components["responses"]["BadRequest"];
+      401: components["responses"]["Unauthenticated"];
     };
   };
   listWebSearchBackends: {
@@ -15656,6 +15491,27 @@ export interface operations {
         };
       };
       401: components["responses"]["Unauthenticated"];
+    };
+  };
+  checkFeishuMailSetup: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description The Computer can start authorization. */
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      401: components["responses"]["Unauthenticated"];
+      409: components["responses"]["Conflict"];
+      503: components["responses"]["ServiceUnavailable"];
     };
   };
   saveExternalProviderKey: {

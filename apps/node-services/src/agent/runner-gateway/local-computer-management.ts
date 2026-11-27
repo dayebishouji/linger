@@ -1,4 +1,7 @@
-import type { RuntimeExecutionFailure } from "../executor/provider.js";
+import {
+  formatRuntimeFailureDetail,
+  type RuntimeExecutionFailure,
+} from "../executor/provider.js";
 import type {
   LocalModelActionAck,
   LocalModelActionCommand,
@@ -66,6 +69,36 @@ export const FIRST_MODEL_INVOKE_OUTCOMES_COMPUTER_VERSION = "0.60.0";
 // fields behind it.
 export const FIRST_LOCAL_MODELS_ENGINE_COMPUTER_VERSION = "0.61.0";
 
+// The first release that decodes an explicit `model` on `execute`
+// `model_invoke`. An older Computer rejects the unknown field and closes the
+// connection, so the field is omitted for it.
+export const FIRST_MODEL_INVOKE_MODEL_COMPUTER_VERSION = "0.62.0";
+
+// The first release that decodes `previous_session` on `operation.start` and
+// exports the superseded native session transcript to `./playground/.previous-context.md`.
+// Older Computers reject unknown envelope fields and close the connection, so
+// the field is omitted for them.
+export const FIRST_PREVIOUS_SESSION_COMPUTER_VERSION = "0.63.0";
+
+// The first release that understands the `local_models_concurrency_probe`
+// welcome feature and gates per-model `concurrency_probing` behind it.
+export const FIRST_LOCAL_MODELS_CONCURRENCY_PROBE_COMPUTER_VERSION = "0.64.0";
+
+// The first release that decodes `"pi"` in `SessionCompact.runtime_type`.
+// Older Computers reject `"pi"` in `SessionCompact.runtime_type` and close the
+// connection, so Pi session compaction is gated to this release and later.
+export const FIRST_PI_SESSION_COMPACTION_COMPUTER_VERSION = "0.65.0";
+
+// The first release that decodes `"antigravity"` in `SessionCompact.runtime_type`.
+// Computers on 0.65.0 and earlier reject `"antigravity"` and close the connection.
+export const FIRST_ANTIGRAVITY_SESSION_COMPACTION_COMPUTER_VERSION = "0.66.0";
+
+// The first release that serves Antigravity native transcript history.
+export const FIRST_ANTIGRAVITY_HISTORY_COMPUTER_VERSION = "0.67.0";
+
+// The first release that decodes Antigravity as a `model_invoke` Runtime.
+export const FIRST_ANTIGRAVITY_MODEL_INVOKE_COMPUTER_VERSION = "0.67.0";
+
 const COMPUTER_RELEASE_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 /** Source builds report `dev` and follow the current wire contract. */
@@ -102,16 +135,13 @@ export interface LocalComputerModel {
   /** How the Runtime reaches the model: through a configured gateway (api)
    * or the signed-in account (subscription). */
   readonly link?: "api" | "subscription";
+  /** Verified effective concurrency reported by the Computer when known. */
+  readonly concurrency?: number;
 }
 
-export type LocalReasoningEffort =
-  | "none"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "max"
-  | "ultra";
+export type LocalReasoningEffort = string;
+
+export const MAX_RUNTIME_MODEL_REASONING_EFFORTS = 32;
 
 export interface LocalRuntimeModelDefinition extends LocalComputerModel {
   /** Exact provider model sent over the Gateway; omitted selects the host Runtime default. */
@@ -328,7 +358,12 @@ export class LocalComputerModelError extends LocalComputerPlacementError {
   ) {
     super(message);
     this.name = "LocalComputerModelError";
-    this.failure = { code: "model_not_offered", runtime_type: runtimeType };
+    const detail = formatRuntimeFailureDetail(message);
+    this.failure = {
+      code: "model_not_offered",
+      runtime_type: runtimeType,
+      ...(detail ? { detail } : {}),
+    };
   }
 }
 
@@ -470,15 +505,13 @@ export function resolveDefaultReasoningEffort(
 
 /**
  * Resolves the reasoning effort to run on a connected Computer's model.
- * Omitted efforts, fallback default "medium" when the model omits "medium",
- * and Pi local models whose advertised effort list does not contain the stored
- * value fall back to the model's default effort instead of failing with
- * `model_not_offered`.
+ * Models without advertised effort levels run without one; an omitted or
+ * unsupported effort falls back to the model's default effort instead of
+ * failing with `model_not_offered`.
  */
 export function resolveSupportedReasoningEffort(
   model: LocalRuntimeModelDefinition,
   reasoningEffort: LocalReasoningEffort | undefined,
-  runtimeType?: LocalRuntimeType,
 ): LocalReasoningEffort | undefined {
   const allowed = model.allowedReasoningEffort ?? [];
   // A model without effort levels runs without one.
@@ -486,17 +519,7 @@ export function resolveSupportedReasoningEffort(
   if (reasoningEffort !== undefined && allowed.includes(reasoningEffort)) {
     return reasoningEffort;
   }
-  if (
-    reasoningEffort === undefined ||
-    reasoningEffort === "medium" ||
-    runtimeType === "pi"
-  ) {
-    return resolveDefaultReasoningEffort(allowed, model.defaultReasoningEffort);
-  }
-  throw new LocalComputerModelError(
-    runtimeType ?? "codex",
-    "Local Computer model reasoning effort is unavailable",
-  );
+  return resolveDefaultReasoningEffort(allowed, model.defaultReasoningEffort);
 }
 
 export const resolveRuntimeModel = (
@@ -530,7 +553,6 @@ export const withSupportedReasoningEffort = <
   const resolved = resolveSupportedReasoningEffort(
     model,
     runtime.reasoning_effort,
-    runtime.type,
   );
   if (resolved === runtime.reasoning_effort) {
     return runtime;
@@ -561,8 +583,15 @@ export const findRuntimeModel = (
   catalog: LocalRuntimeModelCatalog,
   runtimeType: LocalRuntimeType,
   modelId: string,
-): LocalRuntimeModelDefinition | undefined =>
-  catalog[runtimeType].find(({ id }) => id === modelId);
+): LocalRuntimeModelDefinition | undefined => {
+  const models = catalog[runtimeType];
+  const exact = models.find(({ id }) => id === modelId);
+  if (exact) return exact;
+  if (modelId === `${runtimeType}-default` && models.length > 0) {
+    return models.find(({ isDefault }) => isDefault === true) ?? models[0];
+  }
+  return undefined;
+};
 
 /** Claude reports no context window. On the signed-in account a model runs
  * with Anthropic's standard window unless its id selects the 1M one. */
@@ -587,15 +616,29 @@ export const runtimeModelCatalogForComputer = (
     );
     const legacyDefaultIds = new Set(legacyDefaults.map(({ id }) => id));
     const discovered = (diagnostic?.models ?? []).map((model) => {
+      const seenEfforts = new Set<string>();
+      const allowedReasoningEffort: LocalReasoningEffort[] = [];
+      for (const effort of model.allowed_reasoning_effort ?? []) {
+        if (!isLocalReasoningEffort(effort) || seenEfforts.has(effort)) {
+          continue;
+        }
+        seenEfforts.add(effort);
+        allowedReasoningEffort.push(effort);
+        if (
+          allowedReasoningEffort.length >= MAX_RUNTIME_MODEL_REASONING_EFFORTS
+        ) {
+          break;
+        }
+      }
       const defaultReasoningEffort = resolveDefaultReasoningEffort(
-        model.allowed_reasoning_effort,
+        allowedReasoningEffort,
         model.default_reasoning_effort,
       );
       return {
         id: model.id,
         label: model.label,
         ...(legacyDefaultIds.has(model.id) ? {} : { runtimeModel: model.id }),
-        allowedReasoningEffort: model.allowed_reasoning_effort,
+        allowedReasoningEffort,
         ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
         ...(model.context_window !== undefined
           ? { contextWindow: model.context_window }
@@ -606,7 +649,11 @@ export const runtimeModelCatalogForComputer = (
         ...(model.link ? { link: model.link } : {}),
       };
     });
-    catalog[runtimeType] = diagnostic?.model_catalog_error ? [] : discovered;
+    catalog[runtimeType] = diagnostic?.model_catalog_error
+      ? []
+      : diagnostic && diagnostic.models === undefined
+        ? legacyDefaults
+        : discovered;
   }
   validateRuntimeModelCatalog(catalog);
 
@@ -666,6 +713,7 @@ export const validateRuntimeModelCatalog = (
       const allowedReasoningEffort = model.allowedReasoningEffort ?? [];
       if (
         !Array.isArray(allowedReasoningEffort) ||
+        allowedReasoningEffort.length > MAX_RUNTIME_MODEL_REASONING_EFFORTS ||
         allowedReasoningEffort.some(
           (effort, index) =>
             !isLocalReasoningEffort(effort) ||
@@ -687,8 +735,7 @@ export const validateRuntimeModelCatalog = (
 export const isLocalReasoningEffort = (
   value: unknown,
 ): value is LocalReasoningEffort =>
-  typeof value === "string" &&
-  ["none", "low", "medium", "high", "xhigh", "max", "ultra"].includes(value);
+  typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$/.test(value);
 
 export const parseLocalPlacement = (
   value: unknown,

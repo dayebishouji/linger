@@ -1,4 +1,4 @@
-import { lstat, readFile, readdir, realpath } from "node:fs/promises";
+import { lstat, readFile, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { parseEnv } from "node:util";
 import {
@@ -13,6 +13,7 @@ import {
   liveKitEnvironment,
   prepareLiveKitSettings,
   readLiveKitSettings,
+  type LiveKitSettings,
 } from "./native-livekit.js";
 import { readUserEnvironment } from "./user-environment.js";
 import { localAccountProvisioned } from "./account.js";
@@ -22,12 +23,27 @@ import {
   reclaimNativeOrphans,
   type NativeService,
 } from "./native-process.js";
-import { freePort, portFree } from "./ports.js";
+import { PortAllocationError, freePort, portFree } from "./ports.js";
 import type { SetupChoice } from "./setup-plan.js";
 import type { ByokConfiguration } from "./byok-source.js";
 import type { RuntimeDescriptor } from "./managed-runtimes.js";
 import type { InstallerEvent } from "./events.js";
 
+// Loopback WebSocket URL for a native source instance's Runner Gateway; shared
+// between the installer environment and Desktop so both derive the same URL.
+export function localRunnerGatewayUrl(port: number): string {
+  return `ws://127.0.0.1:${port}/v1/runner-gateway`;
+}
+
+export interface BackgroundVoiceToolsHandle {
+  commit(): void;
+  abort(): void;
+}
+export interface BackgroundVoiceToolsLaunchOptions {
+  home: string;
+  instanceName: string;
+  env: NodeJS.ProcessEnv;
+}
 // A Native installation of one Linger source checkout: the desktop client's
 // unpacked source package, or a developer's clone.
 export interface SourceInstallOptions {
@@ -53,9 +69,21 @@ export interface SourceInstallOptions {
   // Cold-resume restarts of an existing checkout reuse an installed runtime
   // after one inspection and overlap runtime preparation with service startup.
   resume?: boolean;
+  // A start from the saved setup (a resume, including the first one after an
+  // app update onto a new checkout) reports local models that do not come
+  // back instead of failing, so the person still reaches the workspace and
+  // the Models page.
+  degradeLocalModels?: boolean;
   // Passes runtime descriptors inspected during startup so callers avoid a
   // second runtime status probe.
   onRuntimeDescriptors?: (descriptors: RuntimeDescriptor[]) => void;
+  // Launches the detached background voice-tools worker on cold first installs;
+  // omit or set to false to keep voice-tools preparation synchronous.
+  launchVoiceToolsBackground?:
+    | ((
+        options: BackgroundVoiceToolsLaunchOptions,
+      ) => BackgroundVoiceToolsHandle | undefined)
+    | false;
 }
 export interface EnvironmentReport {
   platform: string;
@@ -89,6 +117,68 @@ export async function validateSourceRepository(
     );
   }
   return repo;
+}
+async function isExistingFile(file: string): Promise<boolean> {
+  try {
+    return (await stat(file)).isFile();
+  } catch {
+    return false;
+  }
+}
+async function isExistingDirectory(directory: string): Promise<boolean> {
+  try {
+    return (await stat(directory)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+// Unpacked desktop release skeletons carry these markers, whereas synthetic
+// unit-test checkouts only create package.json and scripts/source-native.mjs.
+async function hasReleaseSkeletonMarkers(repo: string): Promise<boolean> {
+  const [goMod, envInventory] = await Promise.all([
+    isExistingFile(path.join(repo, "apps/teamhub/go.mod")),
+    isExistingFile(path.join(repo, "scripts/env-inventory.json")),
+  ]);
+  return goMod && envInventory;
+}
+/**
+ * Reports whether `repo` holds Go sources to compile TeamHub if prebuilt
+ * binaries are unavailable. A minimal offline release skeleton carries
+ * `apps/teamhub/go.mod` and `scripts/env-inventory.json` without
+ * `apps/teamhub/cmd`.
+ */
+export async function canCompileTeamhubFromSource(
+  repo: string,
+): Promise<boolean> {
+  if (!(await hasReleaseSkeletonMarkers(repo))) return true;
+  return isExistingDirectory(path.join(repo, "apps/teamhub/cmd"));
+}
+/**
+ * Reports whether `repo` holds workspace sources to build Native services if
+ * the prebuilt offline runtime is unavailable.
+ */
+export async function canBuildNativeServicesFromSource(
+  repo: string,
+): Promise<boolean> {
+  if (!(await hasReleaseSkeletonMarkers(repo))) return true;
+  const [lockfile, nodeServices, web] = await Promise.all([
+    isExistingFile(path.join(repo, "pnpm-lock.yaml")),
+    isExistingFile(path.join(repo, "apps/node-services/package.json")),
+    isExistingFile(path.join(repo, "apps/web/package.json")),
+  ]);
+  return lockfile && nodeServices && web;
+}
+/**
+ * Reports whether `repo` is a minimal offline release skeleton lacking full
+ * Go or Node workspace compilation sources.
+ */
+export async function isMinimalSourceSkeleton(repo: string): Promise<boolean> {
+  if (!(await hasReleaseSkeletonMarkers(repo))) return false;
+  const [canCompile, canBuild] = await Promise.all([
+    canCompileTeamhubFromSource(repo),
+    canBuildNativeServicesFromSource(repo),
+  ]);
+  return !canCompile || !canBuild;
 }
 // Points an instance at another checkout of the same source; its data and
 // ports stay.
@@ -148,6 +238,7 @@ export async function prepareSourceConfiguration(
   instance: Instance;
   env: NodeJS.ProcessEnv;
   warnings: string[];
+  liveKit?: LiveKitSettings;
 }> {
   const repo = await validateSourceRepository(repository);
   const instance = await initializeInstance({ ...options, releaseDir: repo });
@@ -305,6 +396,19 @@ export async function prepareSourceConfiguration(
       (await readPrivate(path.join(instance.root, "services.env")))!,
     );
     const ports = instance.source.ports;
+    let liveKit: LiveKitSettings | undefined;
+    try {
+      liveKit = await prepareLiveKitSettings(
+        instance.root,
+        await reservedPorts(),
+        (message) => warnings.push(message),
+      );
+    } catch (error) {
+      if (!(error instanceof PortAllocationError)) throw error;
+      warnings.push(
+        `Voice stays off: LiveKit could not reserve a local port (${error.message}).\n`,
+      );
+    }
     const generated = {
       ...supplied,
       ...user,
@@ -316,7 +420,9 @@ export async function prepareSourceConfiguration(
       DOCUMENT_RUNTIME_HTTP_PORT: String(ports.document),
       POSTGRES_PORT: String(ports.postgres),
       WEB_PUBLIC_ORIGIN: instance.origin,
-      AGENT_RUNNER_PUBLIC_GATEWAY_URL: `ws://127.0.0.1:${ports.nodeServices}/v1/runner-gateway`,
+      AGENT_RUNNER_PUBLIC_GATEWAY_URL: localRunnerGatewayUrl(
+        ports.nodeServices,
+      ),
       LINGER_SECRET_SEED: secrets.LINGER_SECRET_SEED!,
       TEAMHUB_SECRET_ENCRYPTION_KEY: secrets.TEAMHUB_SECRET_ENCRYPTION_KEY!,
       TEAMHUB_DATABASE_URL: `postgres://simplexai:${encodeURIComponent(secrets.LINGER_POSTGRES_PASSWORD!)}@127.0.0.1:${ports.postgres}/simplexai?sslmode=disable`,
@@ -334,14 +440,8 @@ export async function prepareSourceConfiguration(
       // Both loopback addresses, so no other program answers for the origin.
       HOST: "127.0.0.1,::1",
       // Native runs its own LiveKit on loopback with this instance's ports
-      // and keys.
-      ...liveKitEnvironment(
-        await prepareLiveKitSettings(
-          instance.root,
-          await reservedPorts(),
-          (message) => warnings.push(message),
-        ),
-      ),
+      // and keys when port reservation succeeds.
+      ...(liveKit ? liveKitEnvironment(liveKit) : {}),
     };
     const quote = (value: string) => {
       if (!/[\r\n\0]/.test(value)) {
@@ -372,6 +472,6 @@ export async function prepareSourceConfiguration(
     if (entries.some(([key, value]) => parsed[key] !== value))
       throw new Error("Source environment contains unsupported characters.");
     await atomicPrivate(envFile, text);
-    return { instance, env: generated, warnings };
+    return { instance, env: generated, warnings, liveKit };
   });
 }

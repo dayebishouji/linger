@@ -291,75 +291,62 @@ type shutdownBackend struct {
 	cleanupUnconfirmed bool
 }
 
-func TestDaemonEnforcesCapacityAndOneOperationPerContext(t *testing.T) {
-	tests := []struct {
-		name        string
-		capacity    *int
-		secondAgent string
-		message     string
-	}{
-		{name: "computer capacity", capacity: intPointer(1), secondAgent: "agent-2", message: "capacity is exhausted"},
-		{name: "context serial execution", secondAgent: "agent-1", message: "already has an active Operation"},
+func TestDaemonEnforcesOneOperationPerContext(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 2)
+	d, err := newTestDaemon(t, Options{
+		ComputerID:   "computer-1",
+		ControlPlane: fakeControlPlane{stream: &fakeStream{}}, IdentityStore: fakeStore{},
+		OperationResolver: fakeOperationResolver{},
+		Executor: provider.Executor{NewBackend: func(string, native.Profile) (native.Runtime, error) {
+			started <- struct{}{}
+			return heldBackend{release: release}, nil
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			release := make(chan struct{})
-			started := make(chan struct{}, 2)
-			d, err := newTestDaemon(t, Options{
-				ComputerID: "computer-1", Capacity: test.capacity,
-				ControlPlane: fakeControlPlane{stream: &fakeStream{}}, IdentityStore: fakeStore{},
-				OperationResolver: fakeOperationResolver{},
-				Executor: provider.Executor{NewBackend: func(string, native.Profile) (native.Runtime, error) {
-					started <- struct{}{}
-					return heldBackend{release: release}, nil
-				}},
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			stream := &fakeStream{}
-			first := daemonOperationStart("operation-1", "agent-1")
-			if err := d.handleOperationStart(context.Background(), stream, first); err != nil {
-				t.Fatal(err)
-			}
-			second := daemonOperationStart("operation-2", test.secondAgent)
-			if err := d.handleOperationStart(context.Background(), stream, second); err != nil {
-				t.Fatal(err)
-			}
-			// Start is asynchronous: the first Operation starts after acceptance, and
-			// the second was rejected synchronously, so no second start may follow.
-			awaitProviderStarts(t, started, 1)
-			if len(started) != 0 {
-				t.Fatalf("backend starts=%d, want 1", 1+len(started))
-			}
-			failed := false
-			for _, event := range stream.snapshotEvents() {
-				if event.OperationID == second.OperationID && event.Type == protocol.EventOperationFailed && strings.Contains(string(event.Payload), test.message) {
-					failed = true
-					// The Remote Provider retries only on this exact wire contract.
-					var payload struct {
-						Code      string `json:"code"`
-						Retryable bool   `json:"retryable"`
-					}
-					if err := json.Unmarshal(event.Payload, &payload); err != nil || payload.Code != "OPERATION_CAPACITY_BUSY" || !payload.Retryable || event.Stage != "operation_admission" {
-						t.Fatalf("admission busy contract = %s stage=%q err=%v", event.Payload, event.Stage, err)
-					}
-				}
-			}
-			if !failed {
-				t.Fatalf("second Operation was not rejected: %+v", stream.snapshotEvents())
-			}
-			close(release)
-			d.WaitForOperations()
-		})
+	stream := &fakeStream{}
+	first := daemonOperationStart("operation-1", "agent-1")
+	if err := d.handleOperationStart(context.Background(), stream, first); err != nil {
+		t.Fatal(err)
 	}
+	second := daemonOperationStart("operation-2", "agent-1")
+	if err := d.handleOperationStart(context.Background(), stream, second); err != nil {
+		t.Fatal(err)
+	}
+	// Start is asynchronous: the first Operation starts after acceptance, and
+	// the second was rejected synchronously, so no second start may follow.
+	awaitProviderStarts(t, started, 1)
+	if len(started) != 0 {
+		t.Fatalf("backend starts=%d, want 1", 1+len(started))
+	}
+	failed := false
+	for _, event := range stream.snapshotEvents() {
+		if event.OperationID == second.OperationID && event.Type == protocol.EventOperationFailed && strings.Contains(string(event.Payload), "already has an active Operation") {
+			failed = true
+			// The Remote Provider retries only on this exact wire contract.
+			var payload struct {
+				Code      string `json:"code"`
+				Retryable bool   `json:"retryable"`
+			}
+			if err := json.Unmarshal(event.Payload, &payload); err != nil || payload.Code != "OPERATION_CAPACITY_BUSY" || !payload.Retryable || event.Stage != "operation_admission" {
+				t.Fatalf("admission busy contract = %s stage=%q err=%v", event.Payload, event.Stage, err)
+			}
+		}
+	}
+	if !failed {
+		t.Fatalf("second Operation was not rejected: %+v", stream.snapshotEvents())
+	}
+	close(release)
+	d.WaitForOperations()
 }
 
 func TestDaemonAllowsSameAgentAcrossContexts(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{}, 2)
 	d, err := newTestDaemon(t, Options{
-		ComputerID: "computer-1", Capacity: intPointer(2),
+		ComputerID:   "computer-1",
 		ControlPlane: fakeControlPlane{stream: &fakeStream{}}, IdentityStore: fakeStore{},
 		OperationResolver: fakeOperationResolver{},
 		Executor: provider.Executor{NewBackend: func(string, native.Profile) (native.Runtime, error) {
@@ -386,7 +373,7 @@ func TestDaemonDoesNotFenceNextAdmissionAfterPriorTerminalCommit(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{}, 1)
 	d, err := newTestDaemon(t, Options{
-		ComputerID: "computer-1", Capacity: intPointer(1),
+		ComputerID:   "computer-1",
 		ControlPlane: fakeControlPlane{stream: &fakeStream{}}, IdentityStore: fakeStore{},
 		OperationResolver: fakeOperationResolver{},
 		Executor: provider.Executor{NewBackend: func(string, native.Profile) (native.Runtime, error) {
@@ -416,64 +403,31 @@ func TestDaemonDoesNotReportCancelledWhenProviderCleanupIsUnconfirmed(t *testing
 	testDaemonDrainCleanup(t, true)
 }
 
-func TestSchedulerYieldIsDeclinedAfterTheSessionMoved(t *testing.T) {
-	d, err := newTestDaemon(t, Options{ComputerID: "computer-1", ControlPlane: fakeControlPlane{stream: &fakeStream{}}, IdentityStore: fakeStore{}, OperationResolver: fakeOperationResolver{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	start := daemonOperationStart("moved", "agent-1")
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	active := &activeOperation{identity: operationIdentity(start), cancel: cancel}
-	active.sessionMoved.Store(true)
-	d.activeOperations[start.OperationID] = active
-	yield := operationCancelCommand(start)
-	yield.Payload = mustJSON(map[string]string{"reason": schedulerYield})
-	if err := d.handleOperationCancel(yield); err != nil {
-		t.Fatal(err)
-	}
-	if ctx.Err() != nil || active.reason != "" {
-		t.Fatalf("the yield cancelled the Run: reason %q", active.reason)
-	}
-	// Agent Service resends the retained yield after a reconnect.
-	if err := d.handleOperationCancel(yield); err != nil {
-		t.Fatal(err)
-	}
-	if ctx.Err() != nil || active.reason != "" {
-		t.Fatalf("a resent yield cancelled the Run: reason %q", active.reason)
-	}
-	stop := operationCancelCommand(start)
-	stop.Payload = mustJSON(map[string]string{"reason": "Stopped by user"})
-	if err := d.handleOperationCancel(stop); err != nil {
-		t.Fatal(err)
-	}
-	if ctx.Err() == nil || active.reason != "Stopped by user" {
-		t.Fatalf("Stop did not cancel the Run: reason %q", active.reason)
-	}
-}
-
 func TestSchedulerYieldRequiresConfirmedCleanup(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		result  provider.Result
-		want    string
-		blocked bool
+		name, runtime, requestReason string
+		result                       provider.Result
+		want, terminalReason         string
+		blocked                      bool
 	}{
-		{"confirmed interrupt", provider.Result{Status: "aborted", CleanupConfirmed: true}, protocol.EventOperationCancelled, false},
-		{"confirmed Pi interrupt", provider.Result{Status: "cancelled", CleanupConfirmed: true}, protocol.EventOperationCancelled, false},
-		{"missing confirmation", provider.Result{Status: "aborted"}, protocol.EventOperationFailed, true},
-		{"unconfirmed interrupt", provider.Result{Status: "failed", CleanupUnconfirmed: true}, protocol.EventOperationFailed, true},
-		{"already finished", provider.Result{Status: "completed", Output: "done"}, protocol.EventOperationCompleted, false},
-		{"failed before interrupt", provider.Result{Status: "failed", CleanupConfirmed: true}, protocol.EventOperationFailed, false},
+		{"confirmed interrupt", "codex", schedulerYield, provider.Result{Status: "aborted", CleanupConfirmed: true}, protocol.EventOperationCancelled, schedulerYield, false},
+		{"confirmed Pi interrupt", "pi", schedulerYield, provider.Result{Status: "cancelled", CleanupConfirmed: true}, protocol.EventOperationCancelled, schedulerYield, false},
+		{"Pi model aborted", "pi", "", provider.Result{Status: "aborted", CleanupConfirmed: true}, protocol.EventOperationCancelled, "runtime_aborted", false},
+		{"Pi model aborted before yield", "pi", schedulerYield, provider.Result{Status: "aborted", CleanupConfirmed: true}, protocol.EventOperationCancelled, "runtime_aborted", false},
+		{"missing confirmation", "codex", schedulerYield, provider.Result{Status: "aborted"}, protocol.EventOperationFailed, "", true},
+		{"unconfirmed interrupt", "codex", schedulerYield, provider.Result{Status: "failed", CleanupUnconfirmed: true}, protocol.EventOperationFailed, "", true},
+		{"already finished", "codex", schedulerYield, provider.Result{Status: "completed", Output: "done"}, protocol.EventOperationCompleted, "", false},
+		{"failed before interrupt", "codex", schedulerYield, provider.Result{Status: "failed", CleanupConfirmed: true}, protocol.EventOperationFailed, "", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stream := &fakeStream{}
-			d, err := newTestDaemon(t, Options{ComputerID: "computer-1", Capacity: intPointer(1), ControlPlane: fakeControlPlane{stream: stream}, IdentityStore: fakeStore{}, OperationResolver: fakeOperationResolver{}})
+			d, err := newTestDaemon(t, Options{ComputerID: "computer-1", ControlPlane: fakeControlPlane{stream: stream}, IdentityStore: fakeStore{}, OperationResolver: fakeOperationResolver{}})
 			if err != nil {
 				t.Fatal(err)
 			}
 			d.operationStream = stream
 			start := daemonOperationStart("yield", "agent-1")
+			start.RuntimeType = tc.runtime
 			_, err = d.ledger.Begin(t.Context(), operationIdentity(start))
 			if err != nil {
 				t.Fatal(err)
@@ -481,15 +435,23 @@ func TestSchedulerYieldRequiresConfirmedCleanup(t *testing.T) {
 			_, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			d.activeOperations[start.OperationID] = &activeOperation{identity: operationIdentity(start), cancel: cancel}
-			stop := operationCancelCommand(start)
-			stop.Payload = mustJSON(map[string]string{"reason": schedulerYield})
-			if err := d.handleOperationCancel(stop); err != nil {
-				t.Fatal(err)
+			if tc.requestReason != "" {
+				stop := operationCancelCommand(start)
+				stop.Payload = mustJSON(map[string]string{"reason": tc.requestReason})
+				if err := d.handleOperationCancel(stop); err != nil {
+					t.Fatal(err)
+				}
 			}
 			d.finishOperation(t.Context(), start, provider.OperationSpec{OperationKind: "run.start", Provider: start.RuntimeType}, tc.result)
 			events := stream.snapshotEvents()
 			if len(events) != 1 || events[0].Type != tc.want {
 				t.Fatalf("terminal=%+v, want %s", events, tc.want)
+			}
+			if tc.terminalReason != "" {
+				var terminal struct{ Reason string }
+				if err := json.Unmarshal(events[0].Payload, &terminal); err != nil || terminal.Reason != tc.terminalReason {
+					t.Fatalf("payload=%s, want reason %q", events[0].Payload, tc.terminalReason)
+				}
 			}
 			if d.runtimeCleanupUnconfirmed(start.RuntimeType) != tc.blocked {
 				t.Fatal("incorrect Runtime availability")
@@ -812,8 +774,6 @@ func daemonAgentRunnerCommand(commandType string, revision uint64) protocol.Comm
 	}
 }
 
-func intPointer(value int) *int { return &value }
-
 func (b shutdownBackend) Start(ctx context.Context, _ string, _ native.RunSpec) (*native.Run, error) {
 	messages := make(chan native.Event)
 	results := make(chan native.Outcome, 1)
@@ -1098,7 +1058,7 @@ func TestTerminalPayloadUsesProviderCompatibleSessionShapes(t *testing.T) {
 	decode := func(spec provider.OperationSpec, result provider.Result) map[string]any {
 		t.Helper()
 		var value map[string]any
-		if err := json.Unmarshal(terminalPayload(spec, result), &value); err != nil {
+		if err := json.Unmarshal(terminalPayloadFor(spec, result, false, false), &value); err != nil {
 			t.Fatal(err)
 		}
 		return value["session"].(map[string]any)
@@ -1675,6 +1635,162 @@ func TestDaemonPublishesMonotonicRuntimeDiagnosticUpdates(t *testing.T) {
 	}
 }
 
+func TestDaemonKeepsDiagnosticsRevisionAboveSeededAndSnapshotObservations(t *testing.T) {
+	device, err := transport.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const seededRevision = uint64(1_760_000_000_000)
+	registrations := newTestRegistrations(t)
+	release := make(chan struct{})
+	initialSnapshot := protocol.Command{
+		Type:            protocol.CommandRegistrationSnapshot,
+		CommandID:       "snapshot-initial",
+		ConnectionEpoch: 7,
+		Payload: mustJSON([]transport.RuntimeRegistration{{
+			RegistrationID: "reg-pi",
+			Observation: transport.RegistrationObservation{
+				TenantID:           "tenant-1",
+				OwnerActorID:       "owner-1",
+				ProviderType:       "pi",
+				Status:             "unavailable",
+				Revision:           seededRevision,
+				Capabilities:       []string{},
+				RuntimeDiagnostics: json.RawMessage(`{"status":"not_installed"}`),
+			},
+		}}),
+	}
+	stream := &fakeStream{
+		commands: []protocol.Command{
+			{Type: "runner.welcome", ConnectionEpoch: 7},
+			initialSnapshot,
+		},
+		wait: release,
+	}
+	d, err := newTestDaemon(t, Options{
+		ComputerID:        "computer-1",
+		ControlPlane:      fakeControlPlane{stream: stream},
+		IdentityStore:     fakeStore{value: device},
+		OperationResolver: fakeOperationResolver{},
+		Registrations:     registrations,
+		Runtimes:          []string{"codex"},
+		RuntimeDiagnostics: json.RawMessage(
+			`[{"type":"codex","status":"ready","protocol":"app-server","checked_at":"2026-09-01T00:00:00Z"},{"type":"pi","status":"not_installed","protocol":"rpc","checked_at":"2026-09-01T00:00:00Z"}]`,
+		),
+		RuntimeObservations: []transport.RegistrationObservation{
+			{
+				TenantID:     "tenant-1",
+				OwnerActorID: "owner-1",
+				ProviderType: "codex",
+				Status:       "online",
+				Revision:     seededRevision,
+				Capabilities: []string{"turn"},
+			},
+			{
+				TenantID:     "tenant-1",
+				OwnerActorID: "owner-1",
+				ProviderType: "pi",
+				Status:       "unavailable",
+				Revision:     seededRevision,
+				Capabilities: []string{},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.daemonID = device.DaemonID
+	done := make(chan error, 1)
+	go func() { done <- d.runConnection(context.Background(), device) }()
+	// Wait for EventRuntimeObserved from initialSnapshot as well as EventDaemonHello.
+	waitForEvents(t, stream, 2)
+
+	nextObs := []transport.RegistrationObservation{{
+		TenantID:     "tenant-1",
+		OwnerActorID: "owner-1",
+		ProviderType: "pi",
+		Status:       "online",
+		Revision:     seededRevision + 1,
+		Capabilities: []string{"turn"},
+	}}
+	if err := d.UpdateRuntimeInventory(
+		context.Background(),
+		[]string{"codex", "pi"},
+		json.RawMessage(`[{"type":"codex","status":"ready","protocol":"app-server","checked_at":"2026-09-01T00:00:15Z"},{"type":"pi","status":"ready","protocol":"rpc","checked_at":"2026-09-01T00:00:15Z"}]`),
+		nextObs,
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitForEvents(t, stream, 3)
+	diagEvent := stream.snapshotEvents()[2]
+	if diagEvent.Type != protocol.EventRuntimeDiagnostics || diagEvent.Revision <= seededRevision+1 {
+		t.Fatalf("diagnostics event revision = %d, want > %d (%+v)", diagEvent.Revision, seededRevision+1, diagEvent)
+	}
+
+	// Applying a snapshot at the emitted revision transitions Pi to online in the registration store.
+	if err := d.applyRegistrationSnapshot(context.Background(), stream, protocol.Command{
+		Type:            protocol.CommandRegistrationSnapshot,
+		CommandID:       "snapshot-pi-online",
+		ConnectionEpoch: 7,
+		Payload: mustJSON([]transport.RuntimeRegistration{{
+			RegistrationID: "reg-pi",
+			Observation: transport.RegistrationObservation{
+				TenantID:     "tenant-1",
+				OwnerActorID: "owner-1",
+				ProviderType: "pi",
+				Status:       "online",
+				Revision:     diagEvent.Revision,
+				Capabilities: []string{"turn"},
+			},
+		}}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := registrations.List(context.Background())
+	if err != nil || len(stored) != 1 || stored[0].Status != registration.StatusOnline || stored[0].Revision != diagEvent.Revision {
+		t.Fatalf("stored registrations after snapshot = %+v, err=%v", stored, err)
+	}
+
+	// A snapshot with a still-higher revision also advances diagnosticsRevision for later updates.
+	const jumpedRevision = seededRevision + 500
+	if err := d.applyRegistrationSnapshot(context.Background(), stream, protocol.Command{
+		Type:            protocol.CommandRegistrationSnapshot,
+		CommandID:       "snapshot-jumped",
+		ConnectionEpoch: 7,
+		Payload: mustJSON([]transport.RuntimeRegistration{{
+			RegistrationID: "reg-pi",
+			Observation: transport.RegistrationObservation{
+				TenantID:     "tenant-1",
+				OwnerActorID: "owner-1",
+				ProviderType: "pi",
+				Status:       "online",
+				Revision:     jumpedRevision,
+				Capabilities: []string{"turn"},
+			},
+		}}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateRuntimeInventory(
+		context.Background(),
+		[]string{"codex", "pi"},
+		json.RawMessage(`[{"type":"codex","status":"ready","protocol":"app-server","checked_at":"2026-09-01T00:00:30Z"},{"type":"pi","status":"ready","protocol":"rpc","checked_at":"2026-09-01T00:00:30Z"}]`),
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	events := stream.snapshotEvents()
+	lastDiag := events[len(events)-1]
+	if lastDiag.Type != protocol.EventRuntimeDiagnostics || lastDiag.Revision <= jumpedRevision {
+		t.Fatalf("post-snapshot diagnostics event revision = %d, want > %d (%+v)", lastDiag.Revision, jumpedRevision, lastDiag)
+	}
+
+	close(release)
+	if err := <-done; !errors.Is(err, io.EOF) {
+		t.Fatalf("runConnection() error = %v", err)
+	}
+}
+
 func TestDaemonDoesNotRetryAuthenticationFailure(t *testing.T) {
 	device, err := transport.GenerateIdentity()
 	if err != nil {
@@ -2138,6 +2254,26 @@ func awaitOperationStarted(t *testing.T, d *Daemon) {
 	}
 }
 
+// awaitOperationIDStarted waits until operationID is registered as active and
+// has started its Provider, without returning early on an empty map.
+func awaitOperationIDStarted(t *testing.T, d *Daemon, operationID string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		d.activeMu.Lock()
+		active := d.activeOperations[operationID]
+		started := active != nil && active.execution != nil
+		d.activeMu.Unlock()
+		if started {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Operation %q did not start its Provider", operationID)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // gateInputUntilStarted holds operation.input and operation.cancel until the
 // queued start was admitted and its Provider has started, as a real Agent sends
 // them only after run.started.
@@ -2224,7 +2360,7 @@ func TestTerminalPayloadFailureDiagnostics(t *testing.T) {
 		t.Fatal(err)
 	}
 	var payload map[string]any
-	if err := json.Unmarshal(terminalPayload(spec, result), &payload); err != nil {
+	if err := json.Unmarshal(terminalPayloadFor(spec, result, false, false), &payload); err != nil {
 		t.Fatal(err)
 	}
 	diagnostics, ok := payload["diagnostics"].(map[string]any)
@@ -2245,7 +2381,7 @@ func TestTerminalPayloadFailureDiagnostics(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var value map[string]any
-			if err := json.Unmarshal(terminalPayload(spec, tc.result), &value); err != nil {
+			if err := json.Unmarshal(terminalPayloadFor(spec, tc.result, false, false), &value); err != nil {
 				t.Fatal(err)
 			}
 			if _, exists := value["diagnostics"]; exists {
@@ -2257,7 +2393,7 @@ func TestTerminalPayloadFailureDiagnostics(t *testing.T) {
 		t.Fatal(err)
 	}
 	var invalid map[string]any
-	if err := json.Unmarshal(terminalPayload(spec, result), &invalid); err != nil {
+	if err := json.Unmarshal(terminalPayloadFor(spec, result, false, false), &invalid); err != nil {
 		t.Fatal(err)
 	}
 	if _, exists := invalid["diagnostics"]; exists {
@@ -2272,7 +2408,7 @@ func TestTerminalPayloadExternalCodexSignal(t *testing.T) {
 	for _, unconfirmed := range []bool{false, true} {
 		result.CleanupUnconfirmed = unconfirmed
 		var payload map[string]any
-		if err := json.Unmarshal(terminalPayload(spec, result), &payload); err != nil {
+		if err := json.Unmarshal(terminalPayloadFor(spec, result, false, false), &payload); err != nil {
 			t.Fatal(err)
 		}
 		if unconfirmed {
@@ -2292,5 +2428,123 @@ func TestTerminalPayloadExternalCodexSignal(t *testing.T) {
 		if len(failure) != 2 || failure["code"] != "execution_failed" {
 			t.Fatalf("public classification: %+v", failure)
 		}
+	}
+}
+
+func TestTerminalPayloadFailureDetailOptIn(t *testing.T) {
+	spec := provider.OperationSpec{Provider: "antigravity", CodexVersion: "1.5.16", OperationKind: "run.start"}
+	result := provider.Result{
+		Status:       "failed",
+		Error:        "raw stderr with /srv/app/secret.txt",
+		PublicDetail: "\n\u26a0 FAILED_PRECONDITION (code 400): User location is not supported for the API use. Authorization: Bearer sk-secret1234567890abcdefghij\n",
+	}
+	var without map[string]any
+	if err := json.Unmarshal(terminalPayloadFor(spec, result, false, false), &without); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := without["failure"].(map[string]any)["detail"]; exists {
+		t.Fatalf("detail must stay omitted without feature gate: %+v", without)
+	}
+	var with map[string]any
+	if err := json.Unmarshal(terminalPayloadFor(spec, result, true, false), &with); err != nil {
+		t.Fatal(err)
+	}
+	detail, _ := with["failure"].(map[string]any)["detail"].(string)
+	if !strings.Contains(detail, "FAILED_PRECONDITION (code 400): User location is not supported for the API use.") ||
+		strings.Contains(detail, "sk-secret1234567890") || strings.Contains(detail, "/srv/app/secret.txt") || strings.Contains(detail, "\n") {
+		t.Fatalf("detail=%q", detail)
+	}
+	// Raw Error without PublicDetail (e.g. CLI stderr) must never leak into failure.detail.
+	stderrOnly := provider.Result{
+		Status: "failed",
+		Error:  "codex exited; codex stderr: stack trace under /srv/app/private.go",
+	}
+	stderrOnly.Diagnostics.Signal = "SIGTERM"
+	var stderrPayload map[string]any
+	if err := json.Unmarshal(terminalPayloadFor(provider.OperationSpec{Provider: "codex", OperationKind: "run.start"}, stderrOnly, true, false), &stderrPayload); err != nil {
+		t.Fatal(err)
+	}
+	if got := stderrPayload["failure"].(map[string]any)["detail"]; got != "signal SIGTERM" {
+		t.Fatalf("stderr leaked into detail: %v", got)
+	}
+}
+
+func TestDaemonFlushesRuntimeInventoryUpdatedBeforeWelcome(t *testing.T) {
+	initialDiag := json.RawMessage(`[{"type":"pi","status":"ready","protocol":"rpc","checked_at":"2026-09-01T00:00:00Z"}]`)
+	backfillDiag := json.RawMessage(`[{"type":"codex","status":"ready","protocol":"app-server","checked_at":"2026-09-01T00:00:05Z"},{"type":"pi","status":"ready","protocol":"rpc","checked_at":"2026-09-01T00:00:00Z"}]`)
+	laterDiag := json.RawMessage(`[{"type":"codex","status":"authentication_required","protocol":"app-server","checked_at":"2026-09-01T00:00:10Z"},{"type":"pi","status":"ready","protocol":"rpc","checked_at":"2026-09-01T00:00:00Z"}]`)
+
+	for _, phase := range []string{"during_connect", "before_welcome"} {
+		t.Run(phase, func(t *testing.T) {
+			device, err := transport.GenerateIdentity()
+			if err != nil {
+				t.Fatal(err)
+			}
+			release := make(chan struct{})
+			stream := &fakeStream{
+				commands: []protocol.Command{{Type: protocol.CommandRunnerWelcome, ConnectionEpoch: 7}},
+				wait:     release,
+			}
+			controlPlane := &sequenceControlPlane{streams: []*fakeStream{stream}}
+			d, err := newTestDaemon(t, Options{
+				ComputerID:         "computer-1",
+				ControlPlane:       controlPlane,
+				IdentityStore:      fakeStore{value: device},
+				OperationResolver:  fakeOperationResolver{},
+				Runtimes:           []string{"pi"},
+				RuntimeDiagnostics: initialDiag,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			d.daemonID = device.DaemonID
+
+			updateErrCh := make(chan error, 1)
+			triggerUpdate := func() {
+				updateErrCh <- d.UpdateRuntimeInventory(context.Background(), []string{"codex", "pi"}, backfillDiag, nil)
+			}
+			if phase == "during_connect" {
+				controlPlane.onConnect = func(int) { triggerUpdate() }
+			} else {
+				stream.beforeCommand = func(cmd protocol.Command) error {
+					if cmd.Type == protocol.CommandRunnerWelcome {
+						triggerUpdate()
+					}
+					return nil
+				}
+			}
+
+			done := make(chan error, 1)
+			go func() { done <- d.runConnection(context.Background(), device) }()
+
+			waitForEvents(t, stream, 2)
+			if updateErr := <-updateErrCh; updateErr != nil {
+				t.Fatalf("UpdateRuntimeInventory() error = %v", updateErr)
+			}
+			if len(controlPlane.hellos) != 1 || string(controlPlane.hellos[0].RuntimeDiagnostics) != string(initialDiag) {
+				t.Fatalf("hello diagnostics = %s, want %s", string(controlPlane.hellos[0].RuntimeDiagnostics), string(initialDiag))
+			}
+			events := stream.snapshotEvents()
+			if events[0].Type != protocol.EventDaemonHello {
+				t.Fatalf("event[0] = %+v, want %s", events[0], protocol.EventDaemonHello)
+			}
+			if events[1].Type != protocol.EventRuntimeDiagnostics || events[1].Revision != 2 || string(events[1].Payload) != string(backfillDiag) {
+				t.Fatalf("flushed diagnostics event = %+v, want revision 2 payload %s", events[1], string(backfillDiag))
+			}
+
+			if err := d.UpdateRuntimeInventory(context.Background(), []string{"codex", "pi"}, laterDiag, nil); err != nil {
+				t.Fatalf("post-welcome UpdateRuntimeInventory() error = %v", err)
+			}
+			waitForEvents(t, stream, 3)
+			events = stream.snapshotEvents()
+			if events[2].Type != protocol.EventRuntimeDiagnostics || events[2].Revision != 3 || string(events[2].Payload) != string(laterDiag) {
+				t.Fatalf("post-welcome diagnostics event = %+v, want revision 3 payload %s", events[2], string(laterDiag))
+			}
+
+			close(release)
+			if err := <-done; !errors.Is(err, io.EOF) {
+				t.Fatalf("runConnection() error = %v", err)
+			}
+		})
 	}
 }

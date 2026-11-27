@@ -61,17 +61,17 @@ func CreateAgentRegistration(ctx context.Context, queries *store.Queries, spec A
 // it was not removed, and that the workspace grant is one of its writable
 // grants. A concurrent removal of the Computer waits behind this lock and then
 // finds the Agent there. The Computer may be offline.
-func requireAgentPlacementTarget(ctx context.Context, queries *store.Queries, tenantID, sponsorActorID, computerID, workspaceGrantID string) (store.LocalComputer, error) {
+func requireAgentPlacementTarget(ctx context.Context, queries *store.Queries, tenantID, sponsorActorID, computerID, workspaceGrantID string) (store.RuntimeLocalComputer, error) {
 	target, err := queries.LockAgentRuntimeLocalComputer(ctx, computerID)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && target.Status == "removed") {
-		return store.LocalComputer{}, ErrAgentPlacementTargetUnavailable
+		return store.RuntimeLocalComputer{}, ErrAgentPlacementTargetUnavailable
 	}
 	if err != nil {
-		return store.LocalComputer{}, err
+		return store.RuntimeLocalComputer{}, err
 	}
 	if target.OwnerTenantID != tenantID || target.OwnerActorID != sponsorActorID ||
 		!writableWorkspaceGrantExists(target.WorkspaceGrants, workspaceGrantID) {
-		return store.LocalComputer{}, ErrAgentPlacementTargetUnavailable
+		return store.RuntimeLocalComputer{}, ErrAgentPlacementTargetUnavailable
 	}
 	return target, nil
 }
@@ -108,7 +108,7 @@ func (s *Service) NotifyAgentRegistrationChanged(ctx context.Context, agentManag
 }
 
 // AgentRegistrationFromRecord copies a generic registration read, which names
-// every column except the avatar image and template installation, into the
+// every column except the avatar image, into the
 // registration value the Agent flows pass around.
 func AgentRegistrationFromRecord(row store.GetAgentRegistrationRow) store.AgentRegistration {
 	return store.AgentRegistration{

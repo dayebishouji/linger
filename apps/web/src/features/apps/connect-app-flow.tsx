@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { ModalDialog } from "@/components/ui/modal-dialog";
+import { DialogCloseButton, ModalDialog } from "@/components/ui/modal-dialog";
 import { cn } from "@/lib/cn";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
 import type {
@@ -15,12 +15,11 @@ import { AppLogoTile } from "./app-logo";
 import { externalAppsQueryOptions } from "./connected-apps-queries";
 import { connectorMessages as m } from "./connectors.messages";
 import {
-  FeishuScopesGuide,
-  isFeishuScopesNotEnabled,
-} from "./feishu-scopes-guide";
+  FeishuConnectGuide,
+  isFeishuConnectError,
+} from "./feishu-connect-guide";
 import { openOAuthUrl } from "./oauth-popup";
-import { ComposioKeyForm } from "./provider-key-form";
-import { ComposioKeyGuide } from "./provider-key-guide";
+import { useComposioKeyForm } from "./provider-key-form";
 import {
   isComposioKeyRejected,
   useCreateExternalConnection,
@@ -100,8 +99,8 @@ export function ConnectAppStatus({
   const t = useT();
   return (
     <>
-      {isFeishuScopesNotEnabled(connection.error) ? (
-        <FeishuScopesGuide className={className} error={connection.error} />
+      {isFeishuConnectError(connection.error) ? (
+        <FeishuConnectGuide className={className} error={connection.error} />
       ) : connection.error && !isComposioKeyRejected(connection.error) ? (
         <p className={cn("text-xs text-app-danger", className)} role="alert">
           {connection.error instanceof Error
@@ -127,58 +126,101 @@ export function ConnectAppStatus({
         </div>
       ) : null}
       {setupApp ? (
-        <ModalDialog
-          className="app-key-dialog"
-          closeOnBackdrop
-          description={
-            flow.configured && !flow.keyRejected
-              ? undefined
-              : flow.keyRejected
-                ? t(flow.canSaveKey ? m.keyNoLongerAccepted : m.keyRejected)
-                : flow.canSaveKey
-                  ? t(m.connectThroughComposio, { app: setupApp.display_name })
-                  : undefined
-          }
-          onClose={flow.closeSetup}
-          size="md"
-          title={
-            <span className="flex items-center gap-2.5">
-              <AppLogoTile
-                name={setupApp.display_name}
-                small
-                url={setupApp.logo_url}
-              />
-              {t(m.connectApp, { app: setupApp.display_name })}
-            </span>
-          }
-        >
-          <div className="space-y-4 px-5 py-5 text-sm text-app-body">
-            {flow.configured && !flow.keyRejected ? (
-              <Button
-                onClick={() => {
-                  flow.closeSetup();
-                  connection.connect(setupApp.key);
-                }}
-                tone="primary"
-              >
-                {t(m.connectApp, { app: setupApp.display_name })}
-              </Button>
-            ) : flow.canSaveKey ? (
-              <>
-                <ComposioKeyGuide />
-                <ComposioKeyForm onSaved={flow.keySaved} />
-              </>
-            ) : flow.keyRejected ? (
-              <p className="text-app-muted">
-                <RichMessage message={m.updateServerKey} tags={CODE_TAGS} />
-              </p>
-            ) : (
-              <ConnectorsNotConfiguredMessage />
-            )}
-          </div>
-        </ModalDialog>
+        <ConnectAppSetupDialog flow={flow} setupApp={setupApp} />
       ) : null}
     </>
+  );
+}
+
+function ConnectAppSetupDialog({
+  flow,
+  setupApp,
+}: {
+  flow: ConnectAppFlow;
+  setupApp: TeamHubExternalApp;
+}) {
+  const t = useT();
+  const appTitle = t(m.connectApp, { app: setupApp.display_name });
+  const keyForm = useComposioKeyForm({
+    onCancel: flow.closeSetup,
+    onSaved: flow.keySaved,
+  });
+
+  // Both states render the same ModalDialog, so a saved key turns the dialog
+  // into the Connect confirmation in place instead of reopening it.
+  if (flow.configured && !flow.keyRejected) {
+    return (
+      <ModalDialog
+        ariaLabel={appTitle}
+        className="p-0"
+        closeOnBackdrop
+        onClose={flow.closeSetup}
+        size="md"
+      >
+        <div className="flex items-center justify-between gap-4 px-5 py-4">
+          <span className="flex min-w-0 items-center gap-2.5">
+            <AppLogoTile
+              name={setupApp.display_name}
+              small
+              url={setupApp.logo_url}
+            />
+            <h2 className="truncate text-base font-semibold text-foreground">
+              {appTitle}
+            </h2>
+          </span>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              // eslint-disable-next-line jsx-a11y/no-autofocus -- the Connect button is focused on purpose after the key form transitions in place
+              autoFocus
+              onClick={() => {
+                flow.closeSetup();
+                flow.connection.connect(setupApp.key);
+              }}
+              tone="primary"
+            >
+              {appTitle}
+            </Button>
+            <DialogCloseButton onClick={flow.closeSetup} />
+          </div>
+        </div>
+      </ModalDialog>
+    );
+  }
+
+  return (
+    <ModalDialog
+      closeOnBackdrop
+      description={
+        flow.keyRejected
+          ? t(flow.canSaveKey ? m.keyNoLongerAccepted : m.keyRejected)
+          : undefined
+      }
+      footer={flow.canSaveKey ? keyForm.actions : undefined}
+      onClose={flow.closeSetup}
+      size="sm"
+      title={
+        <span className="flex items-center gap-2.5">
+          <AppLogoTile
+            name={setupApp.display_name}
+            small
+            url={setupApp.logo_url}
+          />
+          {appTitle}
+        </span>
+      }
+    >
+      <div className="px-5 py-4 text-sm text-app-body">
+        {flow.canSaveKey ? (
+          keyForm.fields
+        ) : flow.keyRejected ? (
+          <p className="text-app-muted">
+            <RichMessage message={m.updateServerKey} tags={CODE_TAGS} />
+          </p>
+        ) : (
+          <ConnectorsNotConfiguredMessage />
+        )}
+      </div>
+    </ModalDialog>
   );
 }
 

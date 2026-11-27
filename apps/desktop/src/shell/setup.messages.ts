@@ -10,15 +10,17 @@ export const setupMessages = defineMessages("setup", {
   welcomeTitle: "Set up Linger",
   welcomeLeadLocal: "Runs on this computer, just for you. Takes a few minutes.",
   welcomeLeadTeam: "Connect this computer to your team's Linger.",
-  modelSource: "Model source",
-  modelSourceHint: "Where your agents get their models.",
+  modelSource: "How to run",
+  modelSourceHint: "Choose how Linger connects to an AI model.",
   localModel: "Local model",
-  subscription: "Subscription",
+  subscription: "Account",
+  apiKeySource: "API Key",
   byokTooltip:
-    "Bring Your Own Key — Connect your own OpenAI-compatible or Anthropic API endpoint, key, and model through Linger's local Bifrost gateway.",
+    "Connect OpenRouter, DeepSeek, OpenAI, Anthropic, or any compatible API using your own key.",
   localModelToggle: "Run tasks on a local model",
-  aiRuntime: "AI runtime",
-  runtimeHint: "Runs your tasks.",
+  accountChoice: "Choose account",
+  aiRuntime: "AI engine",
+  runtimeHint: "Choose which account to sign in with.",
   auto: "Auto",
   appIntegrations: "App integrations (optional)",
   appIntegrationsHint:
@@ -30,6 +32,8 @@ export const setupMessages = defineMessages("setup", {
   keep: "Keep",
   installLocation: "Install location",
   changeLocation: "Change…",
+  resetLocation: "Reset",
+  locationSpaceLow: "Needs {needed} GB free; this disk has {free} GB.",
   quickInstall: "Quick Install",
   install: "Install",
   getStarted: "Get Started",
@@ -42,7 +46,7 @@ export const setupMessages = defineMessages("setup", {
   checkingComputer: "Checking this computer…",
   findingSetup: "Finding the best setup for this computer",
   recommendedPlan: "Recommended for this computer: {plan}",
-  bestRuntime: "Best AI runtime",
+  bestRuntime: "Best Harness",
   localModelPi: "Local model + Pi",
   cannotCheck: "Couldn't check this computer for a local model.",
   fitsGpu: "fits {gpu}",
@@ -51,27 +55,23 @@ export const setupMessages = defineMessages("setup", {
   downloadAmount: "{size} download",
   diskAmount: "{size} disk",
   memoryWithServices: "{size} memory with its services",
-  heldWhy:
-    "Local model on hold. {reasons} Quick Install sets up {plan} now, or choose Check again once memory is free.",
-  heldWhyGeneric:
-    "Local model on hold. {reasons} Quick Install sets up {plan} now, or choose Check again once the issue is resolved.",
-  heldWhyCudaDriver:
-    "Local model on hold. {reasons} Quick Install sets up {plan} now.",
+  heldWhy: "Local model on hold: {reasons}",
   keyRemovedOnInstall: "Removed when you install",
   keySaved: "Saved · type to replace",
   apiKey: "API key",
   keysNote: "Applies when the installation runs.",
   recommendedLocal: "Recommended: Local model on this computer.",
-  recommendedSubscription: "Recommended: Subscription ({runtime}).",
-  chooseSource: "Choose how your agents run.",
+  recommendedSubscription: "Recommended: Sign in with {runtime}.",
+  chooseSource: "Choose how your agents connect to a model.",
   localRecommended: "Recommended for this computer · Runs on Pi via Bifrost",
   localRuns: "Runs your tasks on this computer via Pi",
   localOnHold: "Local model on hold",
   localNotAvailable: "Not available on this computer",
   recommendedRuntime: "Recommended: {runtime}.",
-  subscriptionHint: "Sign in with your ChatGPT or Claude subscription.",
-  locationHint:
-    "Go back and set the install location to the drive itself (Linger installs into {folder}) or an empty folder directly on the drive.",
+  detectedAndRecommendedRuntime:
+    "Detected: {detected} · Recommended: {runtime}.",
+  listSep: ", ",
+  subscriptionHint: "Sign in with your Claude Code or Codex account.",
 
   // Featured partner model spotlight (Inkling 2 Mini by Thinking Machines).
   featuredModelName: "Inkling 2 Mini",
@@ -79,8 +79,6 @@ export const setupMessages = defineMessages("setup", {
   featuredModelSpecs:
     "26.4B Looped MoE · 3.4B active · Vision & Agentic Coding · Apache 2.0",
   featuredModelSelected: "Selected for Quick Install on this computer.",
-  featuredModelLibraryNote:
-    "Featured in Linger's local model library · Switchable anytime in Settings → Models",
   featuredModelCustomizeNote:
     "Featured: Inkling 2 Mini by Thinking Machines · Switchable anytime in Settings → Models",
   featuredModelAriaLabel:
@@ -103,37 +101,60 @@ export const setupMessages = defineMessages("setup", {
   // code of the localmodels tool.
   memoryCounts: " ({free} free, {needed} needed)",
   reasonGpuMemory:
-    "Other programs are using the GPU's memory{counts}. Close programs that use the GPU, such as games, video or other AI apps.",
+    "Other programs are using GPU memory{counts}. Close apps using the GPU.",
   reasonGpuMemoryOf:
-    "Other programs are using GPU {gpu}'s memory{counts}. Close programs that use the GPU, such as games, video or other AI apps.",
-  reasonFreeMemory:
-    "Other programs are using the memory it needs{counts}. Close other programs.",
-  reasonGpuSharing: "Other work is running on the GPU. Close it.",
+    "Other programs are using GPU {gpu}'s memory{counts}. Close apps using the GPU.",
+  reasonFreeMemory: "Not enough free memory{counts}. Close other apps.",
+  reasonGpuSharing: "Another app is using the GPU.",
   reasonGpuOwnership:
-    "Linger couldn't tell which programs are using the GPU, so it can't share it. Close programs that use the GPU.",
+    "Couldn't check which apps are using the GPU. Close GPU apps.",
   reasonGatewayPortInUse:
-    "Another program is using the port Linger's local model gateway needs. Close the program using that port.",
+    "Another program is using the local model gateway port.",
   reasonHarnessUnavailable:
     "The Pi runtime required for local models isn't ready right now. Check your connection or permissions.",
   reasonFacts: "Linger couldn't read this computer's memory, disk or GPU.",
   reasonCudaUpdate:
-    "Your NVIDIA driver supports CUDA {has}, but local models require CUDA {needs} or newer. Update your NVIDIA driver, then choose Check again.",
+    "Your NVIDIA driver supports CUDA {has}, but local models require CUDA {needs} or newer. Update your NVIDIA graphics driver (no CUDA Toolkit needed), then choose Check again.",
+  reasonCudaUpdateDriver:
+    "Your NVIDIA driver supports CUDA {has}, but local models require NVIDIA driver {driver}+ (CUDA {needs}). Update your NVIDIA graphics driver (no CUDA Toolkit needed), then choose Check again.",
   reasonCudaTooOldNeeds:
-    "Your NVIDIA driver is too old for local models (requires CUDA {needs} or newer). Update your NVIDIA driver, then choose Check again.",
+    "Your NVIDIA driver is too old for local models (requires CUDA {needs} or newer). Update your NVIDIA graphics driver (no CUDA Toolkit needed), then choose Check again.",
+  reasonCudaTooOldDriver:
+    "Your NVIDIA driver is too old for local models (requires NVIDIA driver {driver}+ / CUDA {needs}). Update your NVIDIA graphics driver (no CUDA Toolkit needed), then choose Check again.",
   reasonCudaTooOld:
-    "Your NVIDIA driver is too old for local models. Update your NVIDIA driver, then choose Check again.",
+    "Your NVIDIA driver is too old for local models. Update your NVIDIA graphics driver, then choose Check again.",
+  installDriverUpdate: "Install driver update",
+  openNvidiaApp: "Open NVIDIA App",
+  openGeForceExperience: "Open GeForce Experience",
+  downloadNvidiaDriver: "Download NVIDIA driver",
+  driverUpdateGuide: "Upgrade guide",
+  driverDownloading: "Downloading NVIDIA driver {version}…",
+  driverDownloadingSize:
+    "Downloading NVIDIA driver {version}… {done} of {total}",
+  driverVerifying: "Verifying NVIDIA digital signature for {version}…",
+  driverInstalling:
+    "Installing NVIDIA driver {version}… Your screen may blink briefly.",
+  driverRebootRequired:
+    "NVIDIA driver {version} installed. Restart Windows to finish, then reopen Linger.",
+  driverInstallComplete:
+    "NVIDIA driver {version} installed. Rechecking your computer…",
+  driverUacCancelled:
+    "Administrator permission was cancelled. Try again or update through NVIDIA App.",
+  driverSignatureInvalid:
+    "Downloaded installer failed NVIDIA signature verification and was deleted.",
+  driverUnsupportedGpu:
+    "Automatic install supports GeForce RTX cards. Use NVIDIA App or the official NVIDIA download instead.",
+  driverInstallFailed:
+    "Automatic driver update didn't finish. Use NVIDIA App or download directly from NVIDIA.",
   reasonCudaUnknownNeeds:
     "Linger couldn't read the CUDA version from your NVIDIA driver (requires CUDA {needs} or newer). Update or reinstall your NVIDIA driver, then choose Check again.",
   reasonCudaUnknown:
     "Linger couldn't read the CUDA version from your NVIDIA driver. Update or reinstall your NVIDIA driver, then choose Check again.",
   reasonUnsupported: "Local models don't run on this system.",
-  reasonPlanHeld:
-    "Another app is holding the memory it needs, such as another AI app. Quit it.",
+  reasonPlanHeld: "Another app is using the memory it needs. Quit it.",
   reasonPlanUnavailable: "No local model fits this computer.",
-  reasonHeld:
-    "Other programs are using the memory it needs. Close other programs.",
-  reasonHeldGeneric:
-    "Something on this computer is temporarily blocking the local model.",
+  reasonHeld: "Not enough free memory. Close other apps.",
+  reasonHeldGeneric: "Temporarily blocked on this computer.",
   reasonUnavailable: "This computer can't run a local model now.",
   heldGpu: "On hold: The GPU has {free} free, needs {needed}",
   heldGpuOf: "On hold: GPU {gpu} has {free} free, needs {needed}",
@@ -145,6 +166,11 @@ export const setupMessages = defineMessages("setup", {
   heldResolve: "On hold: resolve the issue, then Check again.",
 
   // BYOK fields.
+  provider: "Provider",
+  providerZhipu: "Zhipu GLM",
+  providerVolcano: "Volcano Engine Ark",
+  providerCustom: "Custom compatible endpoint…",
+  advancedOptions: "Advanced options",
   pathMostProviders: "Most providers",
   pathZhipu: "Zhipu GLM (base https://open.bigmodel.cn)",
   pathVolcano: "Volcano Engine Ark",
@@ -197,10 +223,16 @@ export const setupMessages = defineMessages("setup", {
   stepServices: "Setting up AI and local services",
   stepWorkspace: "Setting up your account",
   stepSignIn: "Sign in to {runtime}",
-  stepSignInRuntime: "Sign in to your AI runtime",
+  stepSignInRuntime: "Sign in to your Harness",
   stepConnect: "Connecting this computer",
   stepAgents: "Preparing your agents",
   stepRunning: "{step}…",
+  waitingRuntime:
+    "Checking the AI runtime on this computer. On some computers this takes a few minutes; the bar moves on once it finishes.",
+  runtimeLookupTimedOut:
+    "Checking the AI runtime did not finish in 10 minutes. Try Again picks up the same check; if it stops again, save diagnostics and send them to Linger support.",
+  runtimeLookupUnreachable:
+    "Lost the connection to the installer while checking the AI runtime. Try Again to reconnect; your data is kept.",
   showDetails: "Show Details",
   hideDetails: "Hide Details",
   showLogs: "Show Logs",
@@ -238,12 +270,12 @@ export const setupMessages = defineMessages("setup", {
   signInEnded:
     "Sign-in stopped before it finished. Retry, or choose another way below.",
   signInUnavailable:
-    "This runtime can't be signed in to from here. Use a different runtime or BYOK.",
+    "This Harness can't be signed in to from here. Use a different Harness or BYOK.",
   authorize: "Authorize",
   retry: "Retry",
-  otherRuntime: "Use a different runtime",
-  byokInstead: "Use BYOK instead",
-  continueWithByok: "Continue with BYOK",
+  otherRuntime: "Use a different Harness",
+  byokInstead: "Use API Key instead",
+  continueWithByok: "Continue with API Key",
   cancel: "Cancel",
   havingTrouble: "Having trouble?",
   signInHelpCode: "If the sign-in page shows a code, paste it here.",

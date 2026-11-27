@@ -81,6 +81,10 @@ func (d *Daemon) finishOperation(ctx context.Context, command protocol.Command, 
 		d.activeMu.Unlock()
 		d.admissionMu.Unlock()
 	}
+	// Pi reports "cancelled" for our abort RPC and "aborted" for its own interruption.
+	if spec.Provider == "pi" && result.Status == "aborted" && result.CleanupConfirmed && (reason == "" || yieldRequested) {
+		reason = "runtime_aborted"
+	}
 	terminalType := protocol.EventOperationCompleted
 	if reason != "" && !result.CleanupUnconfirmed {
 		terminalType = protocol.EventOperationCancelled
@@ -91,11 +95,14 @@ func (d *Daemon) finishOperation(ctx context.Context, command protocol.Command, 
 		}
 	}
 	slog.Info("runner.operation.finished", "operation_id", command.OperationID, "kind", spec.OperationKind,
-		"provider", spec.Provider, "status", terminalType, "failure_code", result.FailureCode,
+		"provider", spec.Provider, "status", terminalType, "provider_status", result.Status,
+		"scheduler_yield_requested", yieldRequested, "failure_code", result.FailureCode,
 		"error", receiptReason(redact.Text(result.Error)))
-	payload := terminalPayload(spec, result)
+	includeDetail := d.runtimeFailureDetail.Load()
+	antigravityProvider := d.antigravityUsageProvider.Load()
+	payload := terminalPayloadFor(spec, result, includeDetail, antigravityProvider)
 	if terminalType == protocol.EventOperationCancelled {
-		payload = terminalWithUsage(map[string]any{"reason": reason}, spec, result)
+		payload = terminalWithUsage(map[string]any{"reason": reason}, spec, result, antigravityProvider)
 	}
 	terminal := withOperationIdentity(protocol.Event{
 		Type:    terminalType,
@@ -108,7 +115,7 @@ func (d *Daemon) finishOperation(ctx context.Context, command protocol.Command, 
 	}
 	terminal, err := d.ledger.Complete(context.WithoutCancel(ctx), operationIdentity(command), terminal)
 	if errors.Is(err, ErrLedgerCapacity) {
-		terminal = withOperationIdentity(protocol.Event{Type: protocol.EventOperationFailed, SentAt: time.Now().UTC(), Payload: terminalPayload(spec, provider.Result{Status: "failed", Error: "Operation terminal result exceeds its reserved capacity"})}, command)
+		terminal = withOperationIdentity(protocol.Event{Type: protocol.EventOperationFailed, SentAt: time.Now().UTC(), Payload: terminalPayloadFor(spec, provider.Result{Status: "failed", Error: "Operation terminal result exceeds its reserved capacity"}, includeDetail, antigravityProvider)}, command)
 		terminal, err = d.ledger.Complete(context.WithoutCancel(ctx), operationIdentity(command), terminal)
 	}
 	if err != nil {
@@ -146,14 +153,6 @@ func (d *Daemon) handleOperationCancel(command protocol.Command) error {
 		_ = json.Unmarshal(command.Payload, &payload)
 		if payload.Reason == "" {
 			payload.Reason = "Operation cancelled"
-		}
-		if payload.Reason == schedulerYield && active.sessionMoved.Load() {
-			// The Run finishes instead; Agent Service accepts a natural
-			// terminal after it asked for a yield. Agent Service resends the
-			// same yield on every reconnect, so each one is declined; the
-			// user's Stop arrives as a cancel with its own reason.
-			slog.Info("runner.operation.yield_declined", "operation_id", command.OperationID, "reason", "session_moved")
-			return nil
 		}
 		active.reason = payload.Reason
 		active.cancel()
@@ -295,12 +294,15 @@ func operationIdentity(command protocol.Command) OperationIdentity {
 	return identity
 }
 
-func terminalPayload(spec provider.OperationSpec, result provider.Result) json.RawMessage {
+func terminalPayloadFor(spec provider.OperationSpec, result provider.Result, includeDetail, antigravityProvider bool) json.RawMessage {
 	if result.CleanupUnconfirmed {
-		return terminalWithUsage(map[string]any{"code": cleanupUnconfirmedCode, "message": cleanupUnconfirmedMessage, "retryable": false}, spec, result)
+		return terminalWithUsage(map[string]any{"code": cleanupUnconfirmedCode, "message": cleanupUnconfirmedMessage, "retryable": false}, spec, result, antigravityProvider)
 	}
 	if result.Status != "completed" {
 		failure := provider.ClassifyExecutionFailure(spec.Provider, spec.CodexVersion, result.Status, result.FailureCode, result.Diagnostics)
+		if includeDetail {
+			failure.Detail = provider.FormatFailureDetail(result.PublicDetail, result.Diagnostics)
+		}
 		payload := map[string]any{"code": "RUNTIME_EXECUTION_FAILED", "message": "Runtime execution failed", "retryable": false, "failure": failure}
 		if diagnostics := result.Diagnostics.Sanitized(); diagnostics != nil {
 			payload["diagnostics"] = diagnostics
@@ -308,7 +310,7 @@ func terminalPayload(spec provider.OperationSpec, result provider.Result) json.R
 				payload["message"] = "codex process exited"
 			}
 		}
-		return terminalWithUsage(payload, spec, result)
+		return terminalWithUsage(payload, spec, result, antigravityProvider)
 	}
 	sessionID := result.SessionID
 	if sessionID == "" {
@@ -323,5 +325,5 @@ func terminalPayload(spec provider.OperationSpec, result provider.Result) json.R
 	default:
 		session = map[string]any{"thread_id": sessionID}
 	}
-	return terminalWithUsage(map[string]any{"type": "run", "final_response": result.Output, "session": session}, spec, result)
+	return terminalWithUsage(map[string]any{"type": "run", "final_response": result.Output, "session": session}, spec, result, antigravityProvider)
 }

@@ -9,11 +9,9 @@ import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Icon, type IconSvgElement } from "@/components/ui/icon";
-import { ModalDialog } from "@/components/ui/modal-dialog";
 import { ConnectorsNotConfiguredMessage } from "@/features/apps/connect-app-flow";
 import { externalAppsQueryOptions } from "@/features/apps/connected-apps-queries";
-import { ComposioKeyForm } from "@/features/apps/provider-key-form";
-import { ComposioKeyGuide } from "@/features/apps/provider-key-guide";
+import { ComposioKeyDialog } from "@/features/apps/provider-key-form";
 import { useTeamHubRuntime } from "@/features/teamhub/teamhub-runtime";
 import { translate } from "@/i18n/language";
 import type { Message } from "@/i18n/messages";
@@ -23,7 +21,6 @@ import { decisionCardHeading } from "./card-prompts";
 import { CardActions, CardError, CardRow } from "./approval-card-parts";
 import { CardBox, CardDone, type ReceiptTone } from "./card-shell";
 import { cardsMessages } from "./cards.messages";
-import { connectedAppDisplayName } from "./connected-app-names";
 import type { DecisionMessageCard } from "./decision-card";
 import type { RoomCardDecision } from "./room-message-card-contract";
 
@@ -78,6 +75,7 @@ export function ProviderKeyDecision({
   }
 
   const result = card.status === "pending" ? null : keyResult(card);
+  const canSave = catalog.data?.provider_key.can_save !== false;
   return (
     <>
       <CardBox
@@ -85,13 +83,6 @@ export function ProviderKeyDecision({
         label={t(cardsMessages.labelComposioKey)}
       >
         <CardRow
-          detail={
-            appKey
-              ? t(cardsMessages.neededToConnect, {
-                  app: connectedAppDisplayName(appKey),
-                })
-              : t(cardsMessages.everyAppNeedsIt)
-          }
           icon={<Icon icon={Key01Icon} size={16} />}
           title={t(cardsMessages.composioApiKey)}
         />
@@ -124,27 +115,13 @@ export function ProviderKeyDecision({
         {error ? <CardError>{error}</CardError> : null}
       </CardBox>
       {open && owner && !result ? (
-        <ModalDialog
-          className="app-key-dialog"
-          closeOnBackdrop
-          description={t(cardsMessages.continuesOnceKeySaved, {
-            agent: card.requester.display_name,
-          })}
+        <ComposioKeyDialog
+          canSave={canSave}
+          fallback={<ConnectorsNotConfiguredMessage />}
           onClose={() => setOpen(false)}
-          size="md"
+          onSaved={() => setOpen(false)}
           title={t(cardsMessages.addComposioKeyTitle)}
-        >
-          <div className="space-y-4 px-5 py-5 text-sm text-app-body">
-            {catalog.data?.provider_key.can_save === false ? (
-              <ConnectorsNotConfiguredMessage />
-            ) : (
-              <>
-                <ComposioKeyGuide />
-                <ComposioKeyForm onSaved={() => setOpen(false)} />
-              </>
-            )}
-          </div>
-        </ModalDialog>
+        />
       ) : null}
     </>
   );
